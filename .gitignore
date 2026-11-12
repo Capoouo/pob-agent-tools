@@ -1,0 +1,22 @@
+# Reference repositories and local binaries (not tracked in this repo)
+PobTools\[20261102\]/
+PobTools*/
+POEMCP/
+pob-mcp/
+exports/
+
+# Runtime state, logs, caches, advisor scratch
+.runtime/
+.hc/
+.pit/
+
+# Python build & test artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.coverage
