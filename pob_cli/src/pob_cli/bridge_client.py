@@ -2,23 +2,28 @@
 
 from __future__ import annotations
 
+import base64
 import collections
 import json
 import os
 import queue
+import re
 import subprocess
 import threading
 import time
+import zlib
 from pathlib import Path
 from typing import Any
 
+from .updater import resolve_engine_root
+
 DEFAULT_PROJECT_ROOT = Path(os.environ.get("POB_HOME", str(Path(__file__).resolve().parents[3])))
-DEFAULT_POB_ROOT = Path(os.environ.get("POB_ROOT", str(DEFAULT_PROJECT_ROOT / "PobTools[20261102]")))
+DEFAULT_POB_ROOT = resolve_engine_root()
 DEFAULT_POB_DIR = DEFAULT_POB_ROOT
 RUNTIME_DIR = Path(os.environ.get("POB_RUNTIME_DIR", str(DEFAULT_PROJECT_ROOT / ".runtime")))
 MAX_UNDO_STEPS = 30
 
-# Hardcoded red-line RPC blocklist (R1, R2, R3, R4, R7, R11)
+# Hardcoded red-line RPC blocklist (R1, R3, R4, R7, R11; R2 sidebar_breakdown is checked dynamically via caps)
 FORBIDDEN_METHODS: dict[str, str] = {
     "compare_load": "R1: Build.compareTab is unavailable on 2.67.2 master; use dual-slot comparator.",
     "compare_state": "R1: Build.compareTab is unavailable on 2.67.2 master; use dual-slot comparator.",
@@ -30,7 +35,6 @@ FORBIDDEN_METHODS: dict[str, str] = {
     "compare_skills": "R1: Build.compareTab is unavailable on 2.67.2 master; use dual-slot comparator.",
     "compare_config": "R1: Build.compareTab is unavailable on 2.67.2 master; use dual-slot comparator.",
     "compare_use": "R1: Build.compareTab is unavailable on 2.67.2 master; use dual-slot comparator.",
-    "sidebar_breakdown": "R2: sidebarBreakdown is false on 2.67.2; use get_calcs + calcs_breakdown.",
     "config_mod_search": "R3: configModBrowser is false on 2.67.2; use list_config/set_config/set_custom_mods.",
     "config_mod_add": "R3: configModBrowser is false on 2.67.2; use list_config/set_config/set_custom_mods.",
     "set_pob_options": "R4: Writing Settings.xml at runtime is forbidden across workers.",
@@ -38,6 +42,61 @@ FORBIDDEN_METHODS: dict[str, str] = {
     "import_from_uri": "R7: import_from_uri rejects non-ASCII/parentheses; use poe.ninja raw/overview/code + import_code.",
     "save_build_as": "R11: Direct disk writes in engine are restricted to buildPath; use save_xml and write locally in CLI.",
 }
+
+_TREE_VERSION_ATTR_RE = re.compile(r'treeVersion=["\']([^"\']+)["\']')
+_TREE_VERSION_NUM_RE = re.compile(r"^(\d+)_(\d+)")
+
+
+def _decode_share_code_xml(code: str) -> str | None:
+    """Best-effort decode of a PoB share code (or raw XML string) to XML text."""
+    text = (code or "").strip()
+    if not text:
+        return None
+    if text.startswith("<"):
+        return text
+    try:
+        cleaned = text.replace("-", "+").replace("_", "/")
+        pad = (-len(cleaned)) % 4
+        if pad:
+            cleaned += "=" * pad
+        raw = base64.b64decode(cleaned)
+        try:
+            xml_bytes = zlib.decompress(raw)
+        except zlib.error:
+            xml_bytes = zlib.decompress(raw, -15)
+        return xml_bytes.decode("utf-8", errors="replace")
+    except Exception:
+        return None
+
+
+def _extract_xml_tree_versions(xml_text: str) -> list[str]:
+    return _TREE_VERSION_ATTR_RE.findall(xml_text)
+
+
+def _parse_tree_version_tuple(tv: str) -> tuple[int, int] | None:
+    m = _TREE_VERSION_NUM_RE.match(tv.strip())
+    if not m:
+        return None
+    return (int(m.group(1)), int(m.group(2)))
+
+
+def _get_local_tree_versions(game_dir: Path) -> tuple[set[str], tuple[int, int] | None, str | None]:
+    tree_data_dir = Path(game_dir) / "TreeData"
+    if not tree_data_dir.is_dir():
+        return set(), None, None
+    names: set[str] = set()
+    max_tuple: tuple[int, int] | None = None
+    max_str: str | None = None
+    for entry in tree_data_dir.iterdir():
+        if not entry.is_dir():
+            continue
+        names.add(entry.name)
+        parsed = _parse_tree_version_tuple(entry.name)
+        if parsed is not None:
+            if max_tuple is None or parsed > max_tuple:
+                max_tuple = parsed
+                max_str = f"{parsed[0]}_{parsed[1]}"
+    return names, max_tuple, max_str
 
 
 class BridgeError(RuntimeError):
@@ -54,11 +113,17 @@ class BridgeWorker:
     def __init__(
         self,
         slot_name: str = "main",
-        pob_root: Path = DEFAULT_POB_ROOT,
+        pob_root: Path | None = None,
         pob_dir: Path | None = None,
     ) -> None:
         self.slot_name = slot_name
-        self.pob_root = Path(pob_dir or pob_root)
+        if pob_dir is not None:
+            resolved_root = Path(pob_dir)
+        elif pob_root is not None:
+            resolved_root = Path(pob_root)
+        else:
+            resolved_root = resolve_engine_root()
+        self.pob_root = resolved_root
         self.exe_path = self.pob_root / "pob-zh.exe"
         self.game_dir = self.pob_root / "PoE1"
 
@@ -195,19 +260,25 @@ class BridgeWorker:
                 try:
                     self._raw_call_unlocked("import_code", {"code": self.last_good_code, "mode": "replace"}, timeout=15.0)
                 except Exception:
-                    pass
+                    try:
+                        self._raw_call_unlocked("new_build", {}, timeout=10.0)
+                    except Exception:
+                        pass
             self.last_used = time.time()
 
     @property
     def slot_state_path(self) -> Path:
-        return RUNTIME_DIR / f"slot_{self.slot_name}.json"
+        env_rt = os.environ.get("POB_RUNTIME_DIR", "").strip()
+        rt = Path(env_rt) if env_rt else RUNTIME_DIR
+        return rt / f"slot_{self.slot_name}.json"
 
     def save_slot_state(self) -> None:
         """Persist slot build code and undo/redo stacks so daemon restarts never lose state."""
         if self.slot_name == "test":
             return
         try:
-            RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+            state_path = self.slot_state_path
+            state_path.parent.mkdir(parents=True, exist_ok=True)
             payload = {
                 "slot": self.slot_name,
                 "last_good_code": self.last_good_code,
@@ -216,7 +287,7 @@ class BridgeWorker:
                 "source_label": self.source_label,
                 "updated_at": time.time(),
             }
-            self.slot_state_path.write_text(json.dumps(payload), encoding="utf-8")
+            state_path.write_text(json.dumps(payload), encoding="utf-8")
         except Exception:
             pass
 
@@ -290,6 +361,12 @@ class BridgeWorker:
         if not self.is_running:
             self.start()
 
+        # Dynamic R2: allow sidebar_breakdown iff runtime caps.sidebarBreakdown is True
+        if method == "sidebar_breakdown" and not bool(self.caps.get("sidebarBreakdown")):
+            raise BridgeError(
+                "R2: sidebarBreakdown is false on this engine version; use get_calcs + calcs_breakdown."
+            )
+
         assert self._proc is not None and self._proc.stdin is not None
         self._req_counter += 1
         req_id = self._req_counter
@@ -344,18 +421,72 @@ class BridgeWorker:
         except Exception:  # noqa: BLE001
             pass
 
+    def _check_tree_version_mismatch(self, code: str) -> str | None:
+        """Return an actionable mismatch message if code declares a treeVersion newer than local TreeData."""
+        xml_text = _decode_share_code_xml(code)
+        if not xml_text:
+            return None
+        requested_versions = _extract_xml_tree_versions(xml_text)
+        if not requested_versions:
+            return None
+        local_names, max_tuple, max_str = _get_local_tree_versions(self.game_dir)
+        if max_tuple is None or not max_str:
+            return None
+        for tv in requested_versions:
+            if tv in local_names:
+                continue
+            parsed = _parse_tree_version_tuple(tv)
+            if parsed is not None and parsed > max_tuple:
+                pob_ver = self.pob_version or "unknown"
+                return (
+                    f"Build requires treeVersion='{tv}', which is newer than local engine max "
+                    f"TreeData='{max_str}' (PoB {pob_ver}). "
+                    "Run `pob update` (or set HTTPS_PROXY / POB_PROXY and run "
+                    "`pob update --proxy http://127.0.0.1:<port>`) to update the local engine."
+                )
+        return None
+
+    def _restore_after_failed_import_unlocked(self) -> None:
+        """Heal the slot after a failed import_code (which may leave b:Shutdown() active / no build loaded)."""
+        try:
+            # Must call new_build{} first because b:Shutdown() breaks ensure_build() for import_code
+            self._raw_call_unlocked("new_build", {}, timeout=10.0)
+            if self.last_good_code:
+                try:
+                    self._raw_call_unlocked(
+                        "import_code",
+                        {"code": self.last_good_code, "mode": "replace"},
+                        timeout=15.0,
+                    )
+                except Exception:  # noqa: BLE001
+                    self._raw_call_unlocked("new_build", {}, timeout=10.0)
+        except Exception:  # noqa: BLE001
+            self._recover_after_crash_unlocked()
+
     def call(
         self,
         method: str,
         params: dict[str, Any] | None = None,
         timeout: float | None = None,
     ) -> dict[str, Any]:
-        """Thread-safe RPC call with automatic timeout selection and lossless return."""
+        """Thread-safe RPC call with automatic timeout selection, dynamic R2, and import_code deadlock healing."""
         if timeout is None:
             timeout = 30.0 if method in {"import_from_url", "node_power", "gem_search"} else 15.0
         with self._lock:
-            res = self._raw_call_unlocked(method, params, timeout=timeout)
-            return res
+            if method == "import_code":
+                code = str((params or {}).get("code") or "")
+                tv_mismatch = self._check_tree_version_mismatch(code)
+                if tv_mismatch:
+                    raise BridgeError(f"RPC 'import_code' failed: {tv_mismatch}")
+                try:
+                    return self._raw_call_unlocked(method, params, timeout=timeout)
+                except BridgeError as exc:
+                    self._restore_after_failed_import_unlocked()
+                    tv_hint = self._check_tree_version_mismatch(code)
+                    if tv_hint and tv_hint not in str(exc):
+                        raise BridgeError(f"{exc} | {tv_hint}") from exc
+                    raise
+            return self._raw_call_unlocked(method, params, timeout=timeout)
 
     def update_checkpoint(self) -> str:
         """Export current build code into last_good_code for crash recovery."""

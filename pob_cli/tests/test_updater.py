@@ -1,0 +1,599 @@
+"""Unit and headless integration tests for updater.py and bridge_client.py (v0.2 engine-updater)."""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import io
+import json
+import time
+import zipfile
+import zlib
+from pathlib import Path
+from typing import Any
+
+import httpx
+import pytest
+
+from pob_cli.bridge_client import (
+    FORBIDDEN_METHODS,
+    BridgeError,
+    BridgeWorker,
+)
+from pob_cli.updater import (
+    POB_MANIFEST_URL,
+    POBTOOLS_DOWNLOAD_BASE,
+    POBTOOLS_LATEST_URL,
+    STATE_BOOTSTRAP_MISSING,
+    STATE_DEGRADED_NETWORK,
+    STATE_DEGRADED_ROLLBACK,
+    STATE_UP_TO_DATE,
+    STATE_UPDATED,
+    bootstrap_engine,
+    build_manifest_file_url,
+    check_and_apply_updates,
+    diff_pob_manifest,
+    find_local_manifest_mismatches,
+    format_stderr_update_alert,
+    get_update_warning,
+    load_update_state,
+    parse_pob_manifest,
+    probe_engine_gate,
+    resolve_engine_root,
+    resolve_proxy,
+    rewrite_github_url,
+    seed_from_legacy_dir,
+    verify_pob_sha1,
+)
+
+REAL_LEGACY_DIR = Path("F:/poe/PobTools[20261102]")
+
+
+def _encode_xml(xml_text: str) -> str:
+    return base64.urlsafe_b64encode(zlib.compress(xml_text.encode("utf-8"), level=9)).decode("ascii")
+
+
+def _make_fake_engine(root: Path, version: str = "2.67.2", files: dict[str, bytes] | None = None) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "pob-zh.exe").write_bytes(b"MZ-fake-exe")
+    (root / "pob-zh.ini").write_text("[PobTools]\nGame=poe1\n", encoding="utf-8")
+    (root / "engine").mkdir(exist_ok=True)
+    (root / "engine" / "lua51.dll").write_bytes(b"fake-dll")
+    (root / "Data").mkdir(exist_ok=True)
+    (root / "Data" / "translations_version.json").write_text(
+        json.dumps({"dataVersion": "data-19"}), encoding="utf-8"
+    )
+    (root / "Fonts").mkdir(exist_ok=True)
+    poe1 = root / "PoE1"
+    poe1.mkdir(exist_ok=True)
+
+    payloads = files or {
+        "UpdateCheck.lua": b"return 'official'\n",
+        "Modules/Main.lua": b"local x = 1\n",
+    }
+    file_lines: list[str] = []
+    for rel, content in payloads.items():
+        fp = poe1 / rel.replace("{space}", " ")
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        fp.write_bytes(content)
+        sha = hashlib.sha1(content).hexdigest()
+        file_lines.append(f'\t<File name="{rel}" part="program" sha1="{sha}" />')
+
+    manifest_xml = (
+        "<?xml version='1.0' encoding='utf-8'?>\n"
+        "<PoBVersion>\n"
+        f'\t<Version number="{version}" platform="win32" branch="master" />\n'
+        '\t<Source part="default" url="https://raw.githubusercontent.com/PathOfBuildingCommunity/PathOfBuilding/{branch}/" />\n'
+        '\t<Source part="runtime" platform="win32" url="https://raw.githubusercontent.com/PathOfBuildingCommunity/PathOfBuilding/{branch}/runtime/" />\n'
+        '\t<Source part="program" url="https://raw.githubusercontent.com/PathOfBuildingCommunity/PathOfBuilding/{branch}/src/" />\n'
+        '\t<Source part="tree" url="https://raw.githubusercontent.com/PathOfBuildingCommunity/PathOfBuilding/{branch}/src/" />\n'
+        + "\n".join(file_lines)
+        + "\n</PoBVersion>\n"
+    )
+    (poe1 / "manifest.xml").write_text(manifest_xml, encoding="utf-8")
+    return root
+
+
+def _make_zip_bytes(entries: dict[str, bytes]) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for name, data in entries.items():
+            zf.writestr(name, data)
+    return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# 1. Resolution, legacy seeding, proxy & mirror helpers
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_engine_root_priority_and_seed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    rt = tmp_path / "runtime"
+    env_eng = _make_fake_engine(tmp_path / "env_engine")
+    managed_eng = rt / "engine"
+    legacy_eng = _make_fake_engine(tmp_path / "legacy_engine")
+
+    monkeypatch.setenv("POB_RUNTIME_DIR", str(rt))
+    monkeypatch.delenv("POB_ROOT", raising=False)
+
+    # Priority 3: legacy fallback when neither POB_ROOT nor managed exists
+    assert resolve_engine_root(runtime_dir=rt, legacy_dir=legacy_eng) == legacy_eng
+
+    # Seed from legacy -> copies clean assets without modifying legacy
+    assert seed_from_legacy_dir(legacy_eng, managed_eng) is True
+    assert (managed_eng / "pob-zh.exe").is_file()
+    assert (managed_eng / "PoE1" / "UpdateCheck.lua").is_file()
+    # Second call is a no-op
+    assert seed_from_legacy_dir(legacy_eng, managed_eng) is False
+
+    # Priority 2: managed runtime beats legacy
+    assert resolve_engine_root(runtime_dir=rt, legacy_dir=legacy_eng) == managed_eng
+
+    # Priority 1: explicit POB_ROOT beats managed
+    monkeypatch.setenv("POB_ROOT", str(env_eng))
+    assert resolve_engine_root(runtime_dir=rt, legacy_dir=legacy_eng) == env_eng
+
+
+def test_proxy_and_mirror_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
+    for k in ("POB_PROXY", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.delenv("POB_GITHUB_MIRROR", raising=False)
+
+    assert resolve_proxy() is None
+    monkeypatch.setenv("ALL_PROXY", "socks5://127.0.0.1:1080")
+    assert resolve_proxy() == "socks5://127.0.0.1:1080"
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:7890")
+    assert resolve_proxy() == "http://127.0.0.1:7890"
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:7891")
+    assert resolve_proxy() == "http://127.0.0.1:7891"
+    monkeypatch.setenv("POB_PROXY", "http://127.0.0.1:7892")
+    assert resolve_proxy() == "http://127.0.0.1:7892"
+    assert resolve_proxy("http://127.0.0.1:9999") == "http://127.0.0.1:9999"
+
+    rewritten = rewrite_github_url(POB_MANIFEST_URL, mirror="https://mirror.example.com/")
+    assert rewritten == f"https://mirror.example.com/{POB_MANIFEST_URL}"
+    assert rewrite_github_url("https://poe.ninja/api", mirror="https://mirror.example.com") == "https://poe.ninja/api"
+
+
+# ---------------------------------------------------------------------------
+# 2. Invalid proxy fast degradation (< 4s) & dual-channel alerts
+# ---------------------------------------------------------------------------
+
+
+def test_invalid_proxy_fast_degradation_under_4s(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    rt = tmp_path / "runtime"
+    eng = _make_fake_engine(rt / "engine", version="2.67.2")
+    monkeypatch.setenv("POB_RUNTIME_DIR", str(rt))
+    monkeypatch.setenv("POB_PROXY", "http://127.0.0.1:9")
+    monkeypatch.delenv("POB_ROOT", raising=False)
+
+    t0 = time.monotonic()
+    state = check_and_apply_updates(engine_dir=eng, runtime_dir=rt)
+    elapsed = time.monotonic() - t0
+
+    assert elapsed < 4.0, f"Invalid proxy check took too long: {elapsed:.2f}s"
+    assert state["state"] == STATE_DEGRADED_NETWORK
+    assert state["localPobVersion"] == "2.67.2"
+    assert state["networkError"]
+    assert state["userHint"]
+    assert "--proxy" in state["userHint"]
+    assert "HTTPS_PROXY" in state["userHint"]
+
+    warning = get_update_warning(state)
+    assert warning == state["userHint"]
+    stderr_alert = format_stderr_update_alert(state)
+    assert stderr_alert is not None
+    assert "2.67.2" in stderr_alert
+    assert "--proxy" in stderr_alert
+
+    persisted = load_update_state(rt)
+    assert persisted["state"] == STATE_DEGRADED_NETWORK
+    assert persisted["localPobVersion"] == "2.67.2"
+
+
+def test_bootstrap_missing_offline_when_no_engine(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    rt = tmp_path / "runtime"
+    monkeypatch.setenv("POB_RUNTIME_DIR", str(rt))
+    monkeypatch.setenv("POB_LEGACY_DIR", "")
+    monkeypatch.delenv("POB_ROOT", raising=False)
+
+    state = check_and_apply_updates(runtime_dir=rt, offline=True)
+    assert state["state"] == STATE_BOOTSTRAP_MISSING
+    assert get_update_warning(state) is not None
+    assert "pob bootstrap" in (state["userHint"] or "")
+
+
+# ---------------------------------------------------------------------------
+# 3. Real manifest.xml SHA1 verification & tampered UpdateCheck.lua detection
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not REAL_LEGACY_DIR.is_dir(), reason="Legacy F:/poe/PobTools[20261102] not present")
+def test_real_manifest_sha1_detects_exact_tampered_update_check() -> None:
+    poe1 = REAL_LEGACY_DIR / "PoE1"
+    manifest = parse_pob_manifest((poe1 / "manifest.xml").read_text(encoding="utf-8"))
+    assert manifest.version == "2.67.2"
+    assert len(manifest.files) > 1300
+
+    # Verify {space} URL escaping preserves literal `{space}` for GitHub raw while local_rel uses space
+    exe_entry = manifest.files["Path{space}of{space}Building.exe"]
+    assert exe_entry.local_rel == "Path of Building.exe"
+    exe_url = build_manifest_file_url(manifest, exe_entry)
+    assert exe_url.endswith("/runtime/Path%7Bspace%7Dof%7Bspace%7DBuilding.exe")
+
+    # Across all 1,389 manifest files, ONLY tampered UpdateCheck.lua should fail SHA1!
+    mismatches = find_local_manifest_mismatches(poe1)
+    mismatch_names = [m.local_rel for m in mismatches]
+    assert mismatch_names == ["UpdateCheck.lua"]
+
+
+def test_verify_pob_sha1_raw_and_crlf_tolerance() -> None:
+    lf_bytes = b"line1\nline2\n"
+    crlf_bytes = b"line1\r\nline2\r\n"
+    sha_crlf = hashlib.sha1(crlf_bytes).hexdigest()
+    sha_lf = hashlib.sha1(lf_bytes).hexdigest()
+    assert verify_pob_sha1(crlf_bytes, sha_crlf) is True
+    assert verify_pob_sha1(lf_bytes, sha_crlf) is True
+    assert verify_pob_sha1(crlf_bytes, sha_lf) is True
+    assert verify_pob_sha1(b"tampered\n", sha_crlf) is False
+
+
+# ---------------------------------------------------------------------------
+# 4. Atomic staging + .bak/ swap + gate_result failure rollback & 304 repair
+# ---------------------------------------------------------------------------
+
+
+def _patch_updater_http(monkeypatch: pytest.MonkeyPatch, handler: Any) -> None:
+    import pob_cli.updater as upd
+
+    transport = httpx.MockTransport(handler)
+
+    def _fake_client(
+        *,
+        timeout: httpx.Timeout,
+        proxy: str | None = None,
+        follow_redirects: bool = True,
+        max_connections: int = 16,
+    ) -> httpx.Client:
+        return httpx.Client(transport=transport, follow_redirects=follow_redirects, timeout=timeout)
+
+    monkeypatch.setattr(upd, "_make_http_client", _fake_client)
+
+
+def test_atomic_swap_and_gate_rollback_restores_all_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rt = tmp_path / "runtime"
+    monkeypatch.setenv("POB_RUNTIME_DIR", str(rt))
+
+    orig_update_lua = b"-- tampered local version\n"
+    orig_main_lua = b"-- v2.67.2 main\n"
+    orig_obsolete = b"-- to be deleted in 2.68.1\n"
+    eng = _make_fake_engine(
+        rt / "engine",
+        version="2.67.2",
+        files={
+            "UpdateCheck.lua": orig_update_lua,
+            "Modules/Main.lua": orig_main_lua,
+            "Modules/OldFile.lua": orig_obsolete,
+        },
+    )
+
+    new_update_lua = b"-- official 2.68.1 UpdateCheck\n"
+    new_main_lua = b"-- official 2.68.1 Main with count += 1\n"
+    new_added_lua = b"-- new 3_30 module\n"
+
+    remote_manifest_xml = (
+        "<?xml version='1.0' encoding='UTF-8'?>\n"
+        "<PoBVersion>\n"
+        '\t<Version number="2.68.1" />\n'
+        '\t<Source part="program" url="https://raw.githubusercontent.com/PathOfBuildingCommunity/PathOfBuilding/{branch}/src/" />\n'
+        f'\t<File name="UpdateCheck.lua" part="program" sha1="{hashlib.sha1(new_update_lua).hexdigest()}" />\n'
+        f'\t<File name="Modules/Main.lua" part="program" sha1="{hashlib.sha1(new_main_lua).hexdigest()}" />\n'
+        f'\t<File name="Modules/New330.lua" part="program" sha1="{hashlib.sha1(new_added_lua).hexdigest()}" />\n'
+        "</PoBVersion>\n"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url == POBTOOLS_LATEST_URL:
+            return httpx.Response(302, headers={"Location": "https://github.com/Hsiung-Shao/PobTools-zh/releases/tag/v1.8.12"})
+        if url == f"{POBTOOLS_DOWNLOAD_BASE}/v1.8.12/PobTools-manifest-v1.8.12.json":
+            return httpx.Response(
+                200,
+                json={"version": "1.8.12", "tag": "v1.8.12", "dataTag": "data-19", "assets": []},
+            )
+        if url == f"{POBTOOLS_DOWNLOAD_BASE}/data-19/PobTools-manifest-data-19.json":
+            return httpx.Response(200, json={"tag": "data-19", "minApp": "1.8.0", "assets": []})
+        if url == POB_MANIFEST_URL:
+            return httpx.Response(200, text=remote_manifest_xml, headers={"ETag": 'W/"etag-2681"'})
+        if url.endswith("/src/UpdateCheck.lua"):
+            return httpx.Response(200, content=new_update_lua)
+        if url.endswith("/src/Modules/Main.lua"):
+            return httpx.Response(200, content=new_main_lua)
+        if url.endswith("/src/Modules/New330.lua"):
+            return httpx.Response(200, content=new_added_lua)
+        return httpx.Response(404)
+
+    _patch_updater_http(monkeypatch, handler)
+
+    # First attempt: broken gate_result -> must roll back EVERY modified, added, and deleted file!
+    def failing_probe(_path: Path) -> dict[str, Any]:
+        return {"ok": False, "error": "gate_result failed: ['Build.Init']", "failed": ["Build.Init"]}
+
+    res_fail = check_and_apply_updates(
+        engine_dir=eng,
+        runtime_dir=rt,
+        include_zh=False,
+        probe_fn=failing_probe,
+    )
+    assert res_fail["state"] == STATE_DEGRADED_ROLLBACK
+    assert res_fail.get("rolledBack") is True
+    assert get_update_warning(res_fail) is not None
+    assert (eng / "PoE1" / "UpdateCheck.lua").read_bytes() == orig_update_lua
+    assert (eng / "PoE1" / "Modules" / "Main.lua").read_bytes() == orig_main_lua
+    assert (eng / "PoE1" / "Modules" / "OldFile.lua").read_bytes() == orig_obsolete
+    assert not (eng / "PoE1" / "Modules" / "New330.lua").exists()
+    assert not (eng / ".staging").exists()
+    assert not (eng / ".bak").exists()
+
+    # Second attempt: passing gate_result -> must apply cleanly & persist ETag
+    def passing_probe(_path: Path) -> dict[str, Any]:
+        return {"ok": True, "pobVersion": "2.68.1", "bridgeVersion": "0.2.0", "caps": {"sidebarBreakdown": True}}
+
+    res_ok = check_and_apply_updates(
+        engine_dir=eng,
+        runtime_dir=rt,
+        include_zh=False,
+        probe_fn=passing_probe,
+    )
+    assert res_ok["state"] == STATE_UPDATED
+    assert res_ok["localPobVersion"] == "2.68.1"
+    assert res_ok["pobManifestEtag"] == 'W/"etag-2681"'
+    assert get_update_warning(res_ok) is None
+    assert format_stderr_update_alert(res_ok) is None
+    assert (eng / "PoE1" / "UpdateCheck.lua").read_bytes() == new_update_lua
+    assert (eng / "PoE1" / "Modules" / "New330.lua").read_bytes() == new_added_lua
+    assert not (eng / "PoE1" / "Modules" / "OldFile.lua").exists()
+
+
+def test_tampered_file_repaired_even_when_etag_returns_304(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rt = tmp_path / "runtime"
+    monkeypatch.setenv("POB_RUNTIME_DIR", str(rt))
+
+    clean_lua = b"return 'clean'\n"
+    eng = _make_fake_engine(rt / "engine", version="2.68.1", files={"UpdateCheck.lua": clean_lua})
+    (eng / ".pobtools_version.json").write_text(
+        json.dumps({"pobToolsVersion": "1.8.12", "pobToolsTag": "v1.8.12", "dataVersion": "data-19"}),
+        encoding="utf-8",
+    )
+    # Tamper local UpdateCheck.lua after manifest was written
+    (eng / "PoE1" / "UpdateCheck.lua").write_bytes(b"if true then return 'none' end\n")
+
+    remote_manifest_xml = (eng / "PoE1" / "manifest.xml").read_text(encoding="utf-8")
+    etag_seen: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url == POBTOOLS_LATEST_URL:
+            return httpx.Response(302, headers={"Location": "https://github.com/Hsiung-Shao/PobTools-zh/releases/tag/v1.8.12"})
+        if url == POB_MANIFEST_URL:
+            inm = request.headers.get("if-none-match")
+            etag_seen.append(inm)
+            if inm == 'W/"etag-same"':
+                return httpx.Response(304, headers={"ETag": 'W/"etag-same"'})
+            return httpx.Response(200, text=remote_manifest_xml, headers={"ETag": 'W/"etag-same"'})
+        if url.endswith("/src/UpdateCheck.lua"):
+            return httpx.Response(200, content=clean_lua)
+        return httpx.Response(404)
+
+    _patch_updater_http(monkeypatch, handler)
+
+    # Seed update_state.json with persisted ETag
+    (rt / "update_state.json").write_text(
+        json.dumps(
+            {
+                "state": STATE_UP_TO_DATE,
+                "localPobVersion": "2.68.1",
+                "pobToolsVersion": "1.8.12",
+                "pobToolsTag": "v1.8.12",
+                "dataVersion": "data-19",
+                "pobManifestEtag": 'W/"etag-same"',
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    res = check_and_apply_updates(
+        engine_dir=eng,
+        runtime_dir=rt,
+        include_zh=False,
+        probe_fn=lambda _p: {"ok": True, "pobVersion": "2.68.1", "caps": {}},
+    )
+    assert etag_seen == ['W/"etag-same"', None]
+    assert res["state"] == STATE_UPDATED
+    assert (eng / "PoE1" / "UpdateCheck.lua").read_bytes() == clean_lua
+
+
+def test_clean_bootstrap_from_github_dual_upstream(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    rt = tmp_path / "runtime"
+    target = rt / "engine"
+    monkeypatch.setenv("POB_RUNTIME_DIR", str(rt))
+
+    app_zip = _make_zip_bytes(
+        {
+            "PobTools-1.8.12/pob-zh.exe": b"MZ-new-host",
+            "PobTools-1.8.12/engine/lua51.dll": b"host-lua51",
+            "PobTools-1.8.12/Data/bridge/bridge.lua": b"-- bridge",
+        }
+    )
+    data_zip = _make_zip_bytes(
+        {
+            "Data/translations_version.json": json.dumps({"dataVersion": "data-24"}).encode("utf-8"),
+            "Data/poe1/zh-rCN/gems.json": b"{}",
+        }
+    )
+    pob_main = b"-- official PoB 2.68.1\n"
+    remote_manifest_xml = (
+        "<?xml version='1.0' encoding='UTF-8'?>\n"
+        "<PoBVersion>\n"
+        '\t<Version number="2.68.1" />\n'
+        '\t<Source part="program" url="https://raw.githubusercontent.com/PathOfBuildingCommunity/PathOfBuilding/{branch}/src/" />\n'
+        f'\t<File name="Modules/Main.lua" part="program" sha1="{hashlib.sha1(pob_main).hexdigest()}" />\n'
+        "</PoBVersion>\n"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        assert "api.github.com" not in url, "Must NEVER call api.github.com!"
+        if url == POBTOOLS_LATEST_URL:
+            return httpx.Response(302, headers={"Location": "https://github.com/Hsiung-Shao/PobTools-zh/releases/tag/v1.8.12"})
+        if url == f"{POBTOOLS_DOWNLOAD_BASE}/v1.8.12/PobTools-manifest-v1.8.12.json":
+            return httpx.Response(
+                200,
+                json={
+                    "version": "1.8.12",
+                    "tag": "v1.8.12",
+                    "dataTag": "data-24",
+                    "assets": [
+                        {"name": "PobTools-1.8.12.zip", "sha256": hashlib.sha256(app_zip).hexdigest()},
+                    ],
+                },
+            )
+        if url == f"{POBTOOLS_DOWNLOAD_BASE}/data-24/PobTools-manifest-data-24.json":
+            return httpx.Response(
+                200,
+                json={
+                    "tag": "data-24",
+                    "minApp": "1.8.9",
+                    "assets": [
+                        {"name": "PobTools-DataV2-24.zip", "sha256": hashlib.sha256(data_zip).hexdigest()},
+                    ],
+                },
+            )
+        if url == f"{POBTOOLS_DOWNLOAD_BASE}/v1.8.12/PobTools-1.8.12.zip":
+            return httpx.Response(200, content=app_zip)
+        if url == f"{POBTOOLS_DOWNLOAD_BASE}/data-24/PobTools-DataV2-24.zip":
+            return httpx.Response(200, content=data_zip)
+        if url == POB_MANIFEST_URL:
+            return httpx.Response(200, text=remote_manifest_xml, headers={"ETag": 'W/"boot-2681"'})
+        if url.endswith("/src/Modules/Main.lua"):
+            return httpx.Response(200, content=pob_main)
+        return httpx.Response(404)
+
+    _patch_updater_http(monkeypatch, handler)
+
+    res = bootstrap_engine(
+        target_dir=target,
+        runtime_dir=rt,
+        include_zh=True,
+        probe_fn=lambda _p: {"ok": True, "pobVersion": "2.68.1", "bridgeVersion": "0.2.0", "caps": {}},
+    )
+    assert res["state"] == STATE_UPDATED
+    assert res["localPobVersion"] == "2.68.1"
+    assert res["pobToolsVersion"] == "1.8.12"
+    assert res["dataVersion"] == "data-24"
+    assert (target / "pob-zh.exe").read_bytes() == b"MZ-new-host"
+    assert (target / "Data" / "poe1" / "zh-rCN" / "gems.json").is_file()
+    assert (target / "PoE1" / "Modules" / "Main.lua").read_bytes() == pob_main
+
+
+# ---------------------------------------------------------------------------
+# 5. Real headless engine integration: probe_engine_gate, dynamic R2, import_code deadlock heal
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not REAL_LEGACY_DIR.is_dir(), reason="Legacy F:/poe/PobTools[20261102] not present")
+def test_real_probe_engine_gate() -> None:
+    res = probe_engine_gate(REAL_LEGACY_DIR, timeout_sec=20.0)
+    assert res["ok"] is True
+    assert res["pobVersion"] == "2.67.2"
+    assert res["bridgeVersion"]
+    assert isinstance(res["caps"], dict)
+
+
+@pytest.mark.skipif(not REAL_LEGACY_DIR.is_dir(), reason="Legacy F:/poe/PobTools[20261102] not present")
+def test_bridge_worker_dynamic_r2_and_import_code_deadlock_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("POB_RUNTIME_DIR", str(tmp_path / "runtime"))
+
+    # Dynamic R2: sidebar_breakdown must NOT be in static FORBIDDEN_METHODS
+    assert "sidebar_breakdown" not in FORBIDDEN_METHODS
+
+    worker = BridgeWorker(slot_name="test", pob_dir=REAL_LEGACY_DIR)
+    try:
+        worker.start()
+
+        # On 2.67.2, caps.sidebarBreakdown is False -> dynamic R2 must reject it
+        assert not worker.caps.get("sidebarBreakdown")
+        with pytest.raises(BridgeError, match="R2"):
+            worker.call("sidebar_breakdown", {})
+
+        # Verify dynamic R2 ALLOWS sidebar_breakdown when caps.sidebarBreakdown is True
+        worker.caps["sidebarBreakdown"] = True
+        try:
+            # 2.67.2 bridge doesn't implement sidebar_breakdown, so it reaches bridge (NOT blocked by R2)
+            with pytest.raises(BridgeError) as exc_sb:
+                worker.call("sidebar_breakdown", {})
+            assert "R2:" not in str(exc_sb.value)
+        finally:
+            worker.caps["sidebarBreakdown"] = False
+
+        # Build a genuine PoB XML with level=77 (disable auto-level) and checkpoint last_good_code
+        import re as _re
+
+        base_xml = worker.call("save_xml", {})["xml"]
+        valid_xml = _re.sub(r'(<Build\b[^>]*\blevel=")[^"]+(")', r"\g<1>77\g<2>", base_xml, count=1)
+        valid_xml = valid_xml.replace('characterLevelAutoMode="true"', 'characterLevelAutoMode="false"')
+        assert 'level="77"' in valid_xml
+        worker.call("import_code", {"code": _encode_xml(valid_xml), "mode": "replace"})
+        checkpoint = worker.update_checkpoint()
+        assert checkpoint
+        info_before = worker.call("get_build_info", {})
+        assert info_before["level"] == 77
+
+        # Case A: Future treeVersion="9_99" -> clear error citing 9_99, 3_29, and `pob update`; slot remains intact
+        future_xml = _re.sub(r'treeVersion="[^"]+"', 'treeVersion="9_99"', valid_xml)
+        if 'treeVersion="9_99"' not in future_xml:
+            future_xml = valid_xml.replace("<Spec ", '<Spec treeVersion="9_99" ', 1)
+        assert 'treeVersion="9_99"' in future_xml
+        with pytest.raises(BridgeError) as exc_999:
+            worker.call("import_code", {"code": _encode_xml(future_xml), "mode": "replace"})
+        msg_999 = str(exc_999.value)
+        assert "9_99" in msg_999
+        assert "3_29" in msg_999
+        assert "pob update" in msg_999
+
+        # Slot must still be alive with the original level 77 build
+        assert worker.call("get_build_info", {})["level"] == 77
+        assert worker.call("get_stats", {})["count"] > 100
+
+        # Case B: Corrupt XML -> raises BridgeError AND preserves/restores original level 77 build
+        corrupt_code = _encode_xml("<PathOfBuilding><Broken")
+        with pytest.raises(BridgeError):
+            worker.call("import_code", {"code": corrupt_code, "mode": "replace"})
+        assert worker.call("get_build_info", {})["level"] == 77
+        assert worker.call("get_stats", {})["count"] > 100
+
+        # Case C: Real post-b:Shutdown() Lua crash inside b:Init() (genuine XML with treeVersion="9_99"
+        # and allocated nodes bypassing pre-check triggers PoB's exact `no build is loaded` deadlock!)
+        deadlock_xml = _re.sub(
+            r"<Spec\b[^>]*>",
+            '<Spec classId="3" ascendClassId="1" treeVersion="9_99" nodes="54447,12345" masteryEffects="{40196,50906}">',
+            valid_xml,
+            count=1,
+        )
+        monkeypatch.setattr(worker, "_check_tree_version_mismatch", lambda _code: None)
+        with pytest.raises(BridgeError):
+            worker.call("import_code", {"code": _encode_xml(deadlock_xml), "mode": "replace"})
+
+        # Without healing, PoB would permanently error with `no build is loaded`; verify full restoration!
+        info_after = worker.call("get_build_info", {})
+        assert info_after["level"] == 77
+        stats_after = worker.call("get_stats", {})
+        assert stats_after["count"] > 100
+    finally:
+        worker.stop()
