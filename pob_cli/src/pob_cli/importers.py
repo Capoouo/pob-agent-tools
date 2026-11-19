@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import re
 import time
 import urllib.parse
@@ -15,7 +16,7 @@ import httpx
 
 from .bridge_client import RUNTIME_DIR, BridgeError, BridgeWorker
 
-USER_AGENT = "pob-cli/0.1.0 (+https://github.com/PathOfBuildingCommunity/PathOfBuilding)"
+USER_AGENT = "pob-cli/0.2.0 (+https://github.com/PathOfBuildingCommunity/PathOfBuilding)"
 
 POE_NINJA_CHAR_RE = re.compile(
     r"^https?://poe\.ninja/poe1/builds/(?P<league>[^/?#]+)/character/(?P<account>[^/?#]+)/(?P<name>[^/?#]+)",
@@ -57,7 +58,9 @@ def share_code_to_xml(code: str) -> str:
 
 
 def _get_cache_dir() -> Path:
-    cache_dir = RUNTIME_DIR / "cache"
+    env_runtime = os.environ.get("POB_RUNTIME_DIR")
+    base_dir = Path(env_runtime) if env_runtime else RUNTIME_DIR
+    cache_dir = base_dir / "cache"
     try:
         cache_dir.mkdir(parents=True, exist_ok=True)
         return cache_dir
@@ -65,6 +68,46 @@ def _get_cache_dir() -> Path:
         fallback = Path.home() / ".cache" / "pob-cli"
         fallback.mkdir(parents=True, exist_ok=True)
         return fallback
+
+
+def _resolve_proxy(proxy: str | None = None) -> str | None:
+    """Resolve proxy URL from explicit arg or POB_PROXY/HTTPS_PROXY/HTTP_PROXY/ALL_PROXY."""
+    if proxy and proxy.strip():
+        return proxy.strip()
+    for key in (
+        "POB_PROXY",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ):
+        val = os.environ.get(key)
+        if val and val.strip():
+            return val.strip()
+    return None
+
+
+def _make_httpx_client(
+    *,
+    timeout: float = 20.0,
+    proxy: str | None = None,
+    headers: dict[str, str] | None = None,
+) -> httpx.Client:
+    """Create an httpx.Client honoring proxy configuration and standard User-Agent."""
+    merged_headers = {"User-Agent": USER_AGENT}
+    if headers:
+        merged_headers.update(headers)
+    resolved_proxy = _resolve_proxy(proxy)
+    kwargs: dict[str, Any] = {
+        "timeout": timeout,
+        "follow_redirects": True,
+        "headers": merged_headers,
+    }
+    if resolved_proxy:
+        kwargs["proxy"] = resolved_proxy
+    return httpx.Client(**kwargs)
 
 
 def _fetch_poe_ninja_index_state(ttl_sec: int = 900) -> dict[str, Any]:
@@ -79,7 +122,7 @@ def _fetch_poe_ninja_index_state(ttl_sec: int = 900) -> dict[str, Any]:
             pass
 
     url = "https://poe.ninja/poe1/api/data/index-state"
-    with httpx.Client(timeout=20.0, follow_redirects=True, headers={"User-Agent": USER_AGENT}) as client:
+    with _make_httpx_client(timeout=20.0) as client:
         resp = client.get(url)
         resp.raise_for_status()
         data = resp.json()
@@ -91,6 +134,95 @@ def _fetch_poe_ninja_index_state(ttl_sec: int = 900) -> dict[str, Any]:
     return data
 
 
+def _fetch_poe_ninja_build_index_state(ttl_sec: int = 900) -> dict[str, Any]:
+    """Fetch poe.ninja build-index-state (leagueBuilds + meta statistics) with 15m disk cache."""
+    cache_file = _get_cache_dir() / "poe_ninja_build_index_state.json"
+    now = time.time()
+    if cache_file.exists():
+        try:
+            cached = json.loads(cache_file.read_text(encoding="utf-8"))
+            if now - cached.get("_ts", 0) < ttl_sec and "data" in cached:
+                return cached["data"]
+        except Exception:
+            pass
+
+    url = "https://poe.ninja/poe1/api/data/build-index-state"
+    with _make_httpx_client(timeout=20.0) as client:
+        resp = client.get(url)
+        resp.raise_for_status()
+        data = resp.json()
+
+    try:
+        cache_file.write_text(json.dumps({"_ts": now, "data": data}), encoding="utf-8")
+    except Exception:
+        pass
+    return data
+
+
+def _resolve_poe_ninja_overviews(
+    league_slug: str,
+    build_index_state: dict[str, Any] | None,
+    index_state: dict[str, Any] | None,
+    prefer_delve: bool,
+) -> list[tuple[str, str]]:
+    """Build ordered, deduplicated `(overview, type)` candidates for a poe.ninja league slug."""
+    target = league_slug.strip().lower()
+    raw_overviews: list[str] = []
+    legacy_pairs: list[tuple[str, str]] = []
+
+    def _matches_entry(entry: dict[str, Any]) -> bool:
+        for k in ("leagueUrl", "url", "leagueName", "name", "snapshotName"):
+            val = entry.get(k)
+            if isinstance(val, str) and val.strip().lower() == target:
+                return True
+        return False
+
+    if isinstance(build_index_state, dict):
+        for entry in build_index_state.get("leagueBuilds", []) or []:
+            if isinstance(entry, dict) and _matches_entry(entry):
+                ov = entry.get("leagueUrl") or entry.get("url") or entry.get("leagueName")
+                if isinstance(ov, str) and ov.strip():
+                    raw_overviews.append(ov.strip())
+
+    if isinstance(index_state, dict):
+        for key in ("buildLeagues", "oldBuildLeagues"):
+            for entry in index_state.get(key, []) or []:
+                if isinstance(entry, dict) and _matches_entry(entry):
+                    ov = entry.get("url") or entry.get("name")
+                    if isinstance(ov, str) and ov.strip():
+                        raw_overviews.append(ov.strip())
+
+        for sv in index_state.get("snapshotVersions", []) or []:
+            if isinstance(sv, dict) and _matches_entry(sv):
+                ov = sv.get("snapshotName") or sv.get("url")
+                snap_type = sv.get("type") or "exp"
+                if isinstance(ov, str) and ov.strip():
+                    legacy_pairs.append((ov.strip(), str(snap_type)))
+
+    type_order = ("depthsolo", "exp") if prefer_delve else ("exp", "depthsolo")
+    seen: set[tuple[str, str]] = set()
+    candidates: list[tuple[str, str]] = []
+
+    if prefer_delve:
+        legacy_pairs.sort(key=lambda p: 0 if p[1] == "depthsolo" else 1)
+    else:
+        legacy_pairs.sort(key=lambda p: 0 if p[1] == "exp" else 1)
+
+    for ov in raw_overviews:
+        for snap_type in type_order:
+            pair = (ov, snap_type)
+            if pair not in seen:
+                seen.add(pair)
+                candidates.append(pair)
+
+    for pair in legacy_pairs:
+        if pair not in seen:
+            seen.add(pair)
+            candidates.append(pair)
+
+    return candidates
+
+
 def fetch_poe_ninja_character_code(url: str) -> str:
     """Resolve a poe.ninja character URL into a raw PoB share code."""
     m = POE_NINJA_CHAR_RE.match(url.strip())
@@ -100,55 +232,67 @@ def fetch_poe_ninja_character_code(url: str) -> str:
     league_slug = urllib.parse.unquote(m.group("league"))
     raw_account = urllib.parse.unquote(m.group("account"))
     char_name = urllib.parse.unquote(m.group("name"))
-
-    # Convert poe.ninja account discriminator suffix `-1234` back to `#1234`
-    account = re.sub(r"-(\d{4})$", r"#\1", raw_account)
+    hash_account = re.sub(r"-(\d{4})$", r"#\1", raw_account)
 
     parsed_url = urllib.parse.urlparse(url)
     qs = urllib.parse.parse_qs(parsed_url.query)
-    time_machine = qs.get("timemachine", [None])[0]
+    time_machine = qs.get("timemachine", [None])[0] or qs.get("timeMachine", [None])[0]
+    url_type = (qs.get("type", [""])[0] or "").lower()
+    prefer_delve = "delve" in league_slug.lower() or url_type == "depthsolo"
 
-    index_state = _fetch_poe_ninja_index_state()
-    snapshot_versions = index_state.get("snapshotVersions", [])
+    build_index_state: dict[str, Any] | None = None
+    index_state: dict[str, Any] | None = None
+    fetch_errs: list[str] = []
 
-    # Determine snapshot type ("depthsolo" if league_slug ends with "delve" or similar, else "exp")
-    candidates = [
-        sv
-        for sv in snapshot_versions
-        if sv.get("url", "").lower() == league_slug.lower()
-    ]
+    try:
+        build_index_state = _fetch_poe_ninja_build_index_state()
+    except Exception as exc:
+        fetch_errs.append(f"build-index-state: {exc}")
+
+    candidates = _resolve_poe_ninja_overviews(league_slug, build_index_state, None, prefer_delve)
     if not candidates:
+        try:
+            index_state = _fetch_poe_ninja_index_state()
+        except Exception as exc:
+            fetch_errs.append(f"index-state: {exc}")
+        candidates = _resolve_poe_ninja_overviews(league_slug, build_index_state, index_state, prefer_delve)
+
+    if not candidates:
+        err_note = f" ({'; '.join(fetch_errs)})" if fetch_errs else ""
         raise RuntimeError(
-            f"Could not find league slug '{league_slug}' in poe.ninja index-state snapshotVersions."
+            f"Could not find league slug '{league_slug}' in poe.ninja build-index-state or index-state{err_note}."
         )
 
-    # Prefer type == "exp" first, then fallback to others (e.g. "depthsolo")
-    candidates.sort(key=lambda sv: 0 if sv.get("type") == "exp" else 1)
+    account_attempts = [raw_account]
+    if hash_account != raw_account:
+        account_attempts.append(hash_account)
 
     last_err: Exception | None = None
-    with httpx.Client(timeout=20.0, follow_redirects=True, headers={"User-Agent": USER_AGENT}) as client:
-        for sv in candidates:
-            overview = sv.get("snapshotName")
-            snap_type = sv.get("type", "exp")
-            params: dict[str, str] = {
-                "overview": overview,
-                "type": snap_type,
-                "account": account,
-                "name": char_name,
-            }
-            if time_machine:
-                params["timeMachine"] = time_machine
-            try:
-                resp = client.get("https://poe.ninja/poe1/pob/raw/overview/code", params=params)
-                if resp.status_code == 200 and resp.text.strip():
-                    code = resp.text.strip().strip('"')
-                    # Validate it decodes cleanly
-                    share_code_to_xml(code)
-                    return code
-            except Exception as exc:
-                last_err = exc
+    with _make_httpx_client(timeout=20.0) as client:
+        for overview, snap_type in candidates:
+            for acc_idx, acc in enumerate(account_attempts):
+                params: dict[str, str] = {
+                    "overview": overview,
+                    "type": snap_type,
+                    "account": acc,
+                    "name": char_name,
+                }
+                if time_machine:
+                    params["timeMachine"] = time_machine
+                try:
+                    resp = client.get("https://poe.ninja/poe1/pob/raw/overview/code", params=params)
+                    if resp.status_code == 200 and resp.text.strip():
+                        code = resp.text.strip().strip('"')
+                        share_code_to_xml(code)
+                        return code
+                    last_err = RuntimeError(f"HTTP {resp.status_code} for overview={overview}, type={snap_type}")
+                    if resp.status_code != 404 and acc_idx == 0:
+                        break
+                except Exception as exc:
+                    last_err = exc
+                    break
 
-    raise RuntimeError(f"Failed to fetch PoB code for poe.ninja character '{account}/{char_name}': {last_err}")
+    raise RuntimeError(f"Failed to fetch PoB code for poe.ninja character '{raw_account}/{char_name}': {last_err}")
 
 
 def fetch_share_url_code_fallback(url: str) -> str:
@@ -157,7 +301,7 @@ def fetch_share_url_code_fallback(url: str) -> str:
     if POE_NINJA_CHAR_RE.match(clean_url):
         return fetch_poe_ninja_character_code(clean_url)
 
-    with httpx.Client(timeout=20.0, follow_redirects=True, headers={"User-Agent": USER_AGENT}) as client:
+    with _make_httpx_client(timeout=20.0) as client:
         for pattern, template in SHARE_RAW_PATTERNS:
             m = pattern.match(clean_url)
             if m:
