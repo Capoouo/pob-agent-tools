@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from typing import Any
 
@@ -15,6 +16,8 @@ POB_ESCAPE_RE = re.compile(r"\^x[0-9A-Fa-f]{6}|\^\d")
 
 RAW_PRESERVE_KEYS = frozenset({
     "raw",
+    "beforeRaw",
+    "afterRaw",
     "xml",
     "code",
     "notes",
@@ -22,6 +25,8 @@ RAW_PRESERVE_KEYS = frozenset({
     "lhsRaw",
     "rhsRaw",
     "last_good_code",
+    "updateWarning",
+    "customModsText",
 })
 
 
@@ -49,23 +54,87 @@ def sanitize_for_output(obj: Any, *, preserve_raw: bool = True) -> Any:
     return obj
 
 
-def fmt_num(val: float | int | None, decimals: int = 1) -> str:
-    """Format a number concisely for human/LLM tables."""
+def _parse_numeric_or_none(val: Any) -> float | None:
+    """Parse numeric values and PoB string sentinels ('inf', '-inf', 'nan') to float, or None."""
+    if val is None:
+        return 0.0
+    if isinstance(val, bool):
+        return float(int(val))
+    if isinstance(val, (int, float)):
+        return float(val)
+    if isinstance(val, str):
+        s = val.strip()
+        if not s:
+            return 0.0
+        s_low = s.lower()
+        if s_low in ("inf", "+inf", "infinity", "+infinity"):
+            return math.inf
+        if s_low in ("-inf", "-infinity"):
+            return -math.inf
+        if s_low == "nan":
+            return math.nan
+        try:
+            return float(s.replace(",", ""))
+        except ValueError:
+            return None
+    return None
+
+
+def fmt_num(val: float | int | str | None, decimals: int = 1) -> str:
+    """Format a number concisely for human/LLM tables, safely handling PoB sentinels ('inf', '-inf', 'nan')."""
     if val is None:
         return "-"
     if isinstance(val, bool):
         return "Yes" if val else "No"
-    if isinstance(val, int) or (isinstance(val, float) and val.is_integer()):
-        return f"{int(val):,}"
-    if abs(val) >= 100:
-        return f"{val:,.0f}"
-    return f"{val:,.{decimals}f}"
+    if isinstance(val, str):
+        s = val.strip()
+        if not s:
+            return "-"
+        s_low = s.lower()
+        if s_low in ("inf", "+inf", "infinity", "+infinity"):
+            return "inf"
+        if s_low in ("-inf", "-infinity"):
+            return "-inf"
+        if s_low == "nan":
+            return "nan"
+        # Preserve non-numeric sentinel strings (or pre-formatted text) verbatim
+        return val
+    if isinstance(val, float):
+        if math.isnan(val):
+            return "nan"
+        if math.isinf(val):
+            return "inf" if val > 0 else "-inf"
+        if val.is_integer():
+            return f"{int(val):,}"
+        if abs(val) >= 100:
+            return f"{val:,.0f}"
+        return f"{val:,.{decimals}f}"
+    if isinstance(val, int):
+        return f"{val:,}"
+    return str(val)
 
 
-def fmt_delta(before: float | int | None, after: float | int | None, unit: str = "") -> str:
-    """Format a before -> after delta with absolute and percentage change."""
-    b = float(before or 0.0)
-    a = float(after or 0.0)
+def fmt_delta(before: float | int | str | None, after: float | int | str | None, unit: str = "") -> str:
+    """Format a before -> after delta with absolute and percentage change, hardened against inf/nan/strings."""
+    b = _parse_numeric_or_none(before)
+    a = _parse_numeric_or_none(after)
+    if b is None or a is None:
+        b_disp = fmt_num(before)
+        a_disp = fmt_num(after)
+        if b_disp == a_disp:
+            return "0"
+        return f"{b_disp}{unit} -> {a_disp}{unit}"
+
+    if math.isnan(b) or math.isnan(a):
+        if math.isnan(b) and math.isnan(a):
+            return "0"
+        return f"{fmt_num(b)}{unit} -> {fmt_num(a)}{unit}"
+
+    if math.isinf(b) or math.isinf(a):
+        if b == a:
+            return "0"
+        return f"{fmt_num(b)}{unit} -> {fmt_num(a)}{unit}"
+
     diff = a - b
     if abs(diff) < 1e-6:
         return "0"
@@ -76,6 +145,13 @@ def fmt_delta(before: float | int | None, after: float | int | None, unit: str =
         pct_sign = "+" if pct > 0 else ""
         return f"{sign}{diff_str}{unit} ({pct_sign}{pct:.1f}%)"
     return f"{sign}{diff_str}{unit}"
+
+
+def render_update_warning(warning: str | None) -> str:
+    """Render a top-level Markdown warning banner for degraded engine update states."""
+    if not warning or not str(warning).strip():
+        return ""
+    return f"> [WARN] {str(warning).strip()}\n\n"
 
 
 def render_table(headers: list[str], rows: list[list[Any]]) -> str:

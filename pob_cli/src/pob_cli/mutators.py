@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from .analyzer import resolve_skill_group_index, resolve_slot_name
@@ -577,6 +578,508 @@ def change_tree(
         return run_mutation(worker, _do_tree_changes, apply=apply)
 
 
+_MOD_TAG_RE = re.compile(r"\{[^}]*\}")
+_IMPLICITS_HDR_RE = re.compile(r"^Implicits:\s*(\d+)\s*$", re.IGNORECASE)
+_ITEM_TRAILER_RE = re.compile(
+    r"^(?:Split|Mirrored|Fractured Item|Corrupted|Unidentified|Synthesised Item|Foil Unique(?:\s*\(.*\))?)$",
+    re.IGNORECASE,
+)
+_ITEM_HEADER_KEY_RE = re.compile(
+    r"^(?:Rarity|Armour|Evasion|Energy Shield|Ward|ArmourBasePercentile|EvasionBasePercentile|"
+    r"EnergyShieldBasePercentile|WardBasePercentile|Intangibility|Unique ID|League|Unreleased|"
+    r"Crafted|Prefix|Suffix|Catalyst|CatalystQuality|Cluster Jewel Skill|Cluster Jewel Node Count|"
+    r"Talisman Tier|Item Level|Memory Strands|Version|Selected Version|Variant|Selected Variant|"
+    r"Selected Variant Group|Has Alt Variant.*|Selected Alt Variant.*|Allow Duplicate Variants|"
+    r"Quality|Sockets|LevelReq|Radius|Limited to|Requires Class|Shaper Item|Elder Item|"
+    r"Crusader Item|Redeemer Item|Hunter Item|Warlord Item|Searing Exarch Item|Eater of Worlds Item|"
+    r"Synthesised Item)\b",
+    re.IGNORECASE,
+)
+
+
+def _mod_line_matches(line: str, pattern: str) -> bool:
+    pat = pattern.strip()
+    if not pat:
+        return False
+    clean = strip_pob_escapes(_MOD_TAG_RE.sub("", line)).strip()
+    pat_low = pat.lower()
+    if pat_low in clean.lower() or pat_low in line.lower():
+        return True
+    try:
+        if re.search(pat, clean, re.IGNORECASE) or re.search(pat, line, re.IGNORECASE):
+            return True
+    except re.error:
+        return False
+    return False
+
+
+def _edit_raw_item_mods(
+    raw_text: str,
+    *,
+    replace_mods: list[tuple[str, str]] | None = None,
+    add_mods: list[str] | None = None,
+    remove_mods: list[str] | None = None,
+) -> tuple[str, list[dict[str, Any]]]:
+    """Safely edit only the mod lines of a PoB item raw string without mangling headers or trailers."""
+    rep_list = list(replace_mods or [])
+    add_list = [m.strip() for m in (add_mods or []) if str(m).strip()]
+    rem_list = [p.strip() for p in (remove_mods or []) if str(p).strip()]
+    if not rep_list and not add_list and not rem_list:
+        raise ValueError("Specify at least one of replace_mods, add_mods, or remove_mods.")
+
+    lines = raw_text.splitlines()
+    has_implicits_hdr = False
+    header_lines: list[str] = []
+    implicit_lines: list[str] = []
+    after_implicit: list[str] = []
+
+    imp_idx: int | None = None
+    imp_count = 0
+    for idx, line in enumerate(lines):
+        m = _IMPLICITS_HDR_RE.match(line.strip())
+        if m:
+            imp_idx = idx
+            imp_count = int(m.group(1))
+            break
+
+    if imp_idx is not None:
+        has_implicits_hdr = True
+        header_lines = lines[:imp_idx]
+        implicit_lines = lines[imp_idx + 1 : imp_idx + 1 + imp_count]
+        after_implicit = lines[imp_idx + 1 + imp_count :]
+    else:
+        sep_indices = [i for i, l in enumerate(lines) if l.strip() == "--------"]
+        if sep_indices:
+            last_sep = sep_indices[-1]
+            header_lines = lines[: last_sep + 1]
+            after_implicit = lines[last_sep + 1 :]
+        else:
+            # Minimal raw text without Implicits: or --------
+            # Keep Rarity + item name/base + leading metadata lines untouched
+            split_at = 0
+            if lines and lines[0].strip().lower().startswith("rarity:"):
+                rarity_val = lines[0].split(":", 1)[1].strip().upper()
+                split_at = 3 if rarity_val in ("RARE", "UNIQUE") else 2
+            while split_at < len(lines) and _ITEM_HEADER_KEY_RE.match(lines[split_at].strip()):
+                split_at += 1
+            header_lines = lines[:split_at]
+            after_implicit = lines[split_at:]
+
+    # Separate trailing item status lines (Corrupted, Split, Mirrored, etc.)
+    trailer_rev: list[str] = []
+    explicit_lines = list(after_implicit)
+    while explicit_lines:
+        tail = explicit_lines[-1].strip()
+        if not tail or _ITEM_TRAILER_RE.match(tail):
+            trailer_rev.append(explicit_lines.pop())
+        else:
+            break
+    trailer_lines = list(reversed(trailer_rev))
+
+    changes: list[dict[str, Any]] = []
+
+    for pattern, new_line in rep_list:
+        pat = str(pattern).strip()
+        repl = str(new_line).strip()
+        if not pat:
+            raise ValueError("replace_mods pattern cannot be empty.")
+        matched = False
+        for i, line in enumerate(explicit_lines):
+            if _mod_line_matches(line, pat):
+                changes.append({"action": "replace", "section": "explicit", "before": line, "after": repl})
+                explicit_lines[i] = repl
+                matched = True
+        if not matched:
+            for i, line in enumerate(implicit_lines):
+                if _mod_line_matches(line, pat):
+                    changes.append({"action": "replace", "section": "implicit", "before": line, "after": repl})
+                    implicit_lines[i] = repl
+                    matched = True
+        if not matched:
+            raise ValueError(f"Pattern '{pat}' did not match any mod line on the item.")
+
+    for pat in rem_list:
+        kept_explicit: list[str] = []
+        removed_any = False
+        for line in explicit_lines:
+            if _mod_line_matches(line, pat):
+                changes.append({"action": "remove", "section": "explicit", "before": line})
+                removed_any = True
+            else:
+                kept_explicit.append(line)
+        explicit_lines = kept_explicit
+
+        if not removed_any:
+            kept_implicit: list[str] = []
+            for line in implicit_lines:
+                if _mod_line_matches(line, pat):
+                    changes.append({"action": "remove", "section": "implicit", "before": line})
+                    removed_any = True
+                else:
+                    kept_implicit.append(line)
+            implicit_lines = kept_implicit
+
+        if not removed_any:
+            raise ValueError(f"Pattern '{pat}' did not match any mod line to remove.")
+
+    for new_mod in add_list:
+        for sub_line in new_mod.splitlines():
+            s = sub_line.strip()
+            if s:
+                explicit_lines.append(s)
+                changes.append({"action": "add", "section": "explicit", "after": s})
+
+    out_lines: list[str] = list(header_lines)
+    if has_implicits_hdr:
+        out_lines.append(f"Implicits: {len(implicit_lines)}")
+    out_lines.extend(implicit_lines)
+    out_lines.extend(explicit_lines)
+    out_lines.extend(trailer_lines)
+
+    return "\n".join(out_lines), changes
+
+
+def edit_item_mods(
+    worker: BridgeWorker,
+    *,
+    slot_name: str,
+    replace_mods: list[tuple[str, str]] | None = None,
+    add_mods: list[str] | None = None,
+    remove_mods: list[str] | None = None,
+    apply: bool = False,
+) -> dict[str, Any]:
+    """Edit mod lines on an equipped item in place (replace/add/remove) with 0-residue what-if or --apply."""
+    with worker.lock:
+        resolved_slot = resolve_slot_name(worker, slot_name)
+        items_res = worker.call("list_items", {})
+        slot_obj = next((s for s in items_res.get("slots", []) if s["name"] == resolved_slot), None)
+        if not slot_obj or not slot_obj.get("selItemId"):
+            raise RuntimeError(f"Slot '{resolved_slot}' has no equipped item to edit.")
+
+        item_id = int(slot_obj["selItemId"])
+        before_raw = worker.call("item_raw", {"id": item_id}).get("raw") or ""
+        after_raw, changes = _edit_raw_item_mods(
+            before_raw,
+            replace_mods=replace_mods,
+            add_mods=add_mods,
+            remove_mods=remove_mods,
+        )
+
+        def _do_edit(w: BridgeWorker) -> dict[str, Any]:
+            res = w.call("add_item", {"raw": after_raw, "slotName": resolved_slot, "equip": True})
+            return {
+                "slotName": resolved_slot,
+                "item": res.get("item"),
+                "changes": changes,
+            }
+
+        mutation_res = run_mutation(worker, _do_edit, apply=apply)
+        return {
+            "applied": apply,
+            "mode": mutation_res["mode"],
+            "slotName": resolved_slot,
+            "beforeRaw": before_raw,
+            "afterRaw": after_raw,
+            "changes": changes,
+            "mutation": mutation_res,
+        }
+
+
+def search_and_try_item_db(
+    worker: BridgeWorker,
+    *,
+    query: str,
+    db_type: str = "UNIQUE",
+    slot_name: str | None = None,
+    item_index: int | None = None,
+    equip: bool = False,
+    apply: bool = False,
+    limit: int = 15,
+) -> dict[str, Any]:
+    """Search PoB's built-in Unique/Rare item DB (EN or ZH) and optionally try/equip a match."""
+    q = (query or "").strip()
+    if not q:
+        raise ValueError("Item DB search query cannot be empty.")
+    kind = "rare" if str(db_type or "UNIQUE").strip().lower() == "rare" else "unique"
+    limit = max(1, min(200, int(limit)))
+
+    with worker.lock:
+        res = worker.call(
+            "item_db",
+            {"kind": kind, "query": q, "size": min(200, max(limit, 50)), "page": 1},
+            timeout=30.0,
+        )
+        items = list(res.get("items", []))
+        total_hits = int(res.get("total", len(items)))
+
+        # Fallback client-side scan when query (e.g. ZH mod text or alias) got 0 hits from Lua filter
+        if not items:
+            q_low = q.lower()
+            fallback_hits: list[dict[str, Any]] = []
+            page = 1
+            while page <= 12:
+                page_res = worker.call("item_db", {"kind": kind, "query": "", "size": 200, "page": page}, timeout=30.0)
+                page_items = page_res.get("items", [])
+                if not page_items:
+                    break
+                for it in page_items:
+                    hay = " ".join(
+                        str(it.get(k) or "")
+                        for k in ("title", "titleZh", "name", "nameZh", "baseName", "baseNameZh", "type", "raw")
+                    ).lower()
+                    if q_low in hay:
+                        fallback_hits.append(it)
+                if len(page_items) < 200 or len(fallback_hits) >= max(limit, 50):
+                    break
+                page += 1
+            items = fallback_hits
+            total_hits = len(fallback_hits)
+
+        # Rank exact EN/ZH title/name matches first
+        q_low = q.lower()
+
+        def _rank_db_item(it: dict[str, Any]) -> tuple[int, str]:
+            titles = [
+                strip_pob_escapes(str(it.get(k) or "")).strip().lower()
+                for k in ("title", "titleZh", "name", "nameZh")
+                if it.get(k)
+            ]
+            if any(t == q_low for t in titles):
+                return (0, titles[0] if titles else "")
+            if any(t.startswith(q_low) for t in titles):
+                return (1, titles[0] if titles else "")
+            if any(q_low in t for t in titles):
+                return (2, titles[0] if titles else "")
+            return (3, titles[0] if titles else "")
+
+        items.sort(key=_rank_db_item)
+
+        indexed_items: list[dict[str, Any]] = []
+        for idx, it in enumerate(items[:limit], start=1):
+            entry = {**it, "index": idx}
+            indexed_items.append(entry)
+
+        if not equip and not apply:
+            for entry in indexed_items[: min(limit, 10)]:
+                raw_txt = entry.get("raw")
+                if raw_txt:
+                    try:
+                        tip = worker.call("item_tooltip", {"raw": raw_txt, "compare": False})
+                        entry["tooltipLines"] = tip.get("lines", [])
+                    except Exception:
+                        pass
+            return {
+                "query": query,
+                "dbType": kind.upper(),
+                "total": total_hits,
+                "matches": indexed_items,
+                "equipped": False,
+                "applied": False,
+                "selectedItem": None,
+                "tooltip": None,
+                "mutation": None,
+            }
+
+        if not items:
+            raise ValueError(f"No {kind} database items matched query '{query}'.")
+
+        if item_index is not None:
+            if item_index < 1 or item_index > len(items):
+                raise ValueError(f"item_index {item_index} out of range (1..{len(items)}).")
+            chosen = {**items[item_index - 1], "index": item_index}
+        else:
+            chosen = {**items[0], "index": 1}
+
+        chosen_raw = str(chosen.get("raw") or "").strip()
+        if not chosen_raw:
+            raise RuntimeError(f"Selected DB item '{chosen.get('title') or chosen.get('name')}' has no raw text.")
+
+        resolved_slot = resolve_slot_name(worker, slot_name) if slot_name else None
+        tip_params: dict[str, Any] = {"raw": chosen_raw, "compare": True}
+        if resolved_slot:
+            tip_params["slotName"] = resolved_slot
+        native_tip = worker.call("item_tooltip", tip_params)
+
+        def _do_equip_db(w: BridgeWorker) -> dict[str, Any]:
+            add_params: dict[str, Any] = {"raw": chosen_raw, "equip": True}
+            if resolved_slot:
+                add_params["slotName"] = resolved_slot
+            add_res = w.call("add_item", add_params)
+            return {
+                "addedItem": add_res.get("item"),
+                "slotName": resolved_slot or (add_res.get("item") or {}).get("primarySlot") or chosen.get("primarySlot"),
+            }
+
+        mutation_res = run_mutation(worker, _do_equip_db, apply=apply)
+        return {
+            "query": query,
+            "dbType": kind.upper(),
+            "total": total_hits,
+            "matches": indexed_items,
+            "equipped": True,
+            "applied": apply,
+            "mode": mutation_res["mode"],
+            "slotName": resolved_slot or mutation_res["detail"].get("slotName") or chosen.get("primarySlot"),
+            "selectedItem": chosen,
+            "tooltip": native_tip,
+            "mutation": mutation_res,
+        }
+
+
+def _match_named_option(
+    options: list[dict[str, Any]],
+    query: str,
+    entity_label: str,
+) -> dict[str, Any]:
+    q = query.strip()
+    q_low = q.lower()
+    if q_low in ("none", "无", "clear", "0"):
+        for opt in options:
+            if opt.get("id") == 0 or str(opt.get("name") or "").lower() == "none":
+                return opt
+
+    for opt in options:
+        n_en = strip_pob_escapes(str(opt.get("name") or "")).strip().lower()
+        n_zh = strip_pob_escapes(str(opt.get("nameZh") or "")).strip().lower()
+        if q_low in (n_en, n_zh) or (q.isdigit() and int(q) == opt.get("id")):
+            return opt
+
+    sub_matches = [
+        opt
+        for opt in options
+        if q_low in strip_pob_escapes(str(opt.get("name") or "")).strip().lower()
+        or q_low in strip_pob_escapes(str(opt.get("nameZh") or "")).strip().lower()
+    ]
+    if len(sub_matches) == 1:
+        return sub_matches[0]
+    if len(sub_matches) > 1:
+        samples = ", ".join(f"{o.get('name')} ({o.get('nameZh')})" for o in sub_matches[:6])
+        raise ValueError(f"Ambiguous {entity_label} '{query}' matched multiple options: {samples}")
+
+    available = ", ".join(f"{o.get('name')}/{o.get('nameZh')}" for o in options[:12])
+    raise ValueError(f"Unknown {entity_label} '{query}'. Available: {available}")
+
+
+def set_class_ascendancy(
+    worker: BridgeWorker,
+    *,
+    class_name: str | None = None,
+    ascendancy_name: str | None = None,
+    secondary_ascendancy_name: str | None = None,
+    apply: bool = False,
+) -> dict[str, Any]:
+    """Change character class, primary ascendancy, and/or secondary ascendancy (Bloodline) in a snapshot transaction."""
+    if not any(x is not None and str(x).strip() != "" for x in (class_name, ascendancy_name, secondary_ascendancy_name)):
+        raise ValueError("Specify at least one of class_name, ascendancy_name, or secondary_ascendancy_name.")
+
+    def _do_set_class(w: BridgeWorker) -> dict[str, Any]:
+        lc = w.call("list_classes", {})
+        classes = lc.get("classes", [])
+        secondary = lc.get("secondary", [])
+        before = dict(lc.get("current") or {})
+
+        target_class_obj: dict[str, Any] | None = None
+        target_asc_obj: dict[str, Any] | None = None
+        target_sec_obj: dict[str, Any] | None = None
+        changes: list[str] = []
+        class_change_mode: str | None = None
+
+        if class_name is not None and str(class_name).strip():
+            target_class_obj = _match_named_option(classes, str(class_name), "class")
+        else:
+            cur_cid = before.get("classId")
+            target_class_obj = next((c for c in classes if c.get("id") == cur_cid), None)
+
+        if ascendancy_name is not None and str(ascendancy_name).strip():
+            asc_q = str(ascendancy_name).strip()
+            if class_name is not None and str(class_name).strip():
+                assert target_class_obj is not None
+                target_asc_obj = _match_named_option(
+                    target_class_obj.get("ascendancies", []),
+                    asc_q,
+                    f"ascendancy for {target_class_obj.get('name')}",
+                )
+            else:
+                # First try current class; if not found, infer owning class automatically (e.g. Reliquarian -> Scion)
+                try:
+                    assert target_class_obj is not None
+                    target_asc_obj = _match_named_option(
+                        target_class_obj.get("ascendancies", []),
+                        asc_q,
+                        f"ascendancy for {target_class_obj.get('name')}",
+                    )
+                except ValueError:
+                    found_pairs: list[tuple[dict[str, Any], dict[str, Any]]] = []
+                    q_low = asc_q.lower()
+                    for cls in classes:
+                        for asc in cls.get("ascendancies", []):
+                            if asc.get("id") == 0:
+                                continue
+                            n_en = strip_pob_escapes(str(asc.get("name") or "")).strip().lower()
+                            n_zh = strip_pob_escapes(str(asc.get("nameZh") or "")).strip().lower()
+                            if q_low in (n_en, n_zh) or q_low in n_en or q_low in n_zh:
+                                found_pairs.append((cls, asc))
+                    exact_pairs = [
+                        p
+                        for p in found_pairs
+                        if q_low
+                        in (
+                            strip_pob_escapes(str(p[1].get("name") or "")).strip().lower(),
+                            strip_pob_escapes(str(p[1].get("nameZh") or "")).strip().lower(),
+                        )
+                    ]
+                    chosen_pairs = exact_pairs or found_pairs
+                    if len(chosen_pairs) == 1:
+                        target_class_obj, target_asc_obj = chosen_pairs[0]
+                    elif len(chosen_pairs) > 1:
+                        samples = ", ".join(f"{c['name']}/{a['name']}" for c, a in chosen_pairs[:6])
+                        raise ValueError(f"Ambiguous ascendancy '{asc_q}': {samples}")
+                    else:
+                        raise
+
+        if secondary_ascendancy_name is not None and str(secondary_ascendancy_name).strip():
+            target_sec_obj = _match_named_option(secondary, str(secondary_ascendancy_name), "secondary ascendancy")
+
+        # 1. Apply class change if needed
+        if target_class_obj is not None and target_class_obj.get("id") != before.get("classId"):
+            cid = int(target_class_obj["id"])
+            res = w.call("set_class", {"classId": cid})
+            if res.get("needsConfirm") == "class_change":
+                res = w.call("set_class", {"classId": cid, "confirm": "connect"})
+                if res.get("connectFailed") or res.get("needsConfirm") == "class_change":
+                    res = w.call("set_class", {"classId": cid, "confirm": "reset"})
+                    class_change_mode = "reset"
+                else:
+                    class_change_mode = "connect"
+            else:
+                class_change_mode = "direct"
+            changes.append(
+                f"class: {before.get('className')} -> {target_class_obj.get('name')} ({class_change_mode})"
+            )
+
+        # 2. Apply primary ascendancy
+        if target_asc_obj is not None:
+            aid = int(target_asc_obj["id"])
+            w.call("set_ascendancy", {"ascendClassId": aid})
+            changes.append(f"ascendancy: {before.get('ascendClassName')} -> {target_asc_obj.get('name')}")
+
+        # 3. Apply secondary ascendancy (Bloodline)
+        if target_sec_obj is not None:
+            sid = int(target_sec_obj["id"])
+            w.call("set_secondary_ascendancy", {"ascendClassId": sid})
+            changes.append(f"secondaryAscendancy: {target_sec_obj.get('name')} (id={sid})")
+
+        after = dict(w.call("list_classes", {}).get("current") or {})
+        return {
+            "before": before,
+            "after": after,
+            "changes": changes,
+            "classChangeMode": class_change_mode,
+        }
+
+    return run_mutation(worker, _do_set_class, apply=apply)
+
+
 def _coerce_config_value(raw_val: Any) -> Any:
     if isinstance(raw_val, (bool, int, float)):
         return raw_val
@@ -593,14 +1096,38 @@ def _coerce_config_value(raw_val: Any) -> Any:
         return s
 
 
+def _split_custom_mod_lines(raw_text: str) -> list[str]:
+    """Split multiline or semicolon-separated custom mod text into clean non-empty lines."""
+    lines: list[str] = []
+    for raw_line in raw_text.splitlines():
+        for part in raw_line.split(";"):
+            s = part.strip()
+            if s:
+                lines.append(s)
+    return lines
+
+
 def _apply_config_in_place(
     w: BridgeWorker,
     assignments: list[tuple[str, Any]],
     custom_mods: str | None = None,
+    append_custom_mods: str | None = None,
 ) -> dict[str, Any]:
     applied_vars: list[dict[str, Any]] = []
     touched_boss = False
-    for var, raw_val in assignments:
+
+    # Build case-insensitive config var lookup so e.g. MultiplierWitheredStackCount resolves to multiplierWitheredStackCount
+    known_vars: dict[str, str] = {}
+    if assignments:
+        cfg_meta = w.call("list_config", {})
+        for sec in cfg_meta.get("sections", []):
+            for item in sec.get("items", []):
+                vname = item.get("var")
+                if vname:
+                    known_vars[str(vname).lower()] = str(vname)
+
+    for raw_var, raw_val in assignments:
+        var = known_vars.get(str(raw_var).strip().lower(), str(raw_var).strip())
         v_str = str(raw_val).strip()
         if v_str.lower() in ("reset", "none", "null", "default"):
             res = w.call("reset_config", {"var": var})
@@ -635,22 +1162,77 @@ def _apply_config_in_place(
             )
             applied_vars.append({"var": "customMods", "action": "set", "value": cm_clean})
 
+    if append_custom_mods is not None:
+        new_lines = _split_custom_mod_lines(append_custom_mods)
+        if not new_lines:
+            raise ValueError("append_custom_mods cannot be empty.")
+
+        cfg_cur = w.call("list_config", {})
+        existing_blocks = list(cfg_cur.get("customMods") or [])
+        updated_blocks: list[dict[str, Any]] = []
+        target_idx: int | None = None
+
+        for blk in existing_blocks:
+            title = blk.get("title") or "Default"
+            enabled = blk.get("enabled", True) is not False
+            raw_blk_text = str(blk.get("text") or "")
+            # Strip '# disabled' placeholder lines left by clear/dewater operations
+            cleaned_lines = [
+                ln
+                for ln in raw_blk_text.splitlines()
+                if ln.strip().lower() != "# disabled"
+            ]
+            cleaned_text = "\n".join(cleaned_lines).strip()
+            updated_blocks.append({"title": title, "text": cleaned_text, "enabled": enabled})
+            if enabled:
+                target_idx = len(updated_blocks) - 1
+
+        append_str = "\n".join(new_lines)
+        if target_idx is None:
+            updated_blocks.append({"title": "Default", "text": append_str, "enabled": True})
+        else:
+            prev_text = updated_blocks[target_idx]["text"]
+            updated_blocks[target_idx]["text"] = f"{prev_text}\n{append_str}" if prev_text else append_str
+
+        w.call("set_custom_mods", {"list": updated_blocks})
+        combined_text = "\n".join(b["text"] for b in updated_blocks if b.get("enabled") and b.get("text"))
+        applied_vars.append(
+            {
+                "var": "customMods",
+                "action": "append",
+                "appendedLines": new_lines,
+                "customModsText": combined_text,
+            }
+        )
+
     return {"assignments": applied_vars}
 
 
 def modify_config(
     worker: BridgeWorker,
     *,
-    assignments: list[tuple[str, Any]],
+    assignments: dict[str, Any] | list[tuple[str, Any]] | None = None,
     custom_mods: str | None = None,
+    append_custom_mods: str | None = None,
     apply: bool = False,
 ) -> dict[str, Any]:
-    """Set or reset one or more PoB ConfigTab variables (`key=value` or `key=reset`) and/or `customMods`."""
-    if not assignments and custom_mods is None:
-        raise ValueError("No config assignments or --custom-mods provided.")
+    """Set/reset PoB ConfigTab variables and/or replace or append `customMods` (0-residue by default)."""
+    pairs: list[tuple[str, Any]] = []
+    if isinstance(assignments, dict):
+        pairs = list(assignments.items())
+    elif assignments:
+        pairs = [(k, v) for k, v in assignments]
+
+    if not pairs and custom_mods is None and append_custom_mods is None:
+        raise ValueError("No config assignments, custom_mods, or append_custom_mods provided.")
 
     def _do_cfg(w: BridgeWorker) -> dict[str, Any]:
-        return _apply_config_in_place(w, assignments, custom_mods=custom_mods)
+        return _apply_config_in_place(
+            w,
+            pairs,
+            custom_mods=custom_mods,
+            append_custom_mods=append_custom_mods,
+        )
 
     return run_mutation(worker, _do_cfg, apply=apply)
 
@@ -811,7 +1393,13 @@ def run_batch(
                 for var in op.get("reset") or []:
                     pairs.append((var, "reset"))
                 cm = op.get("customMods")
-                cfg_res = _apply_config_in_place(w, pairs, custom_mods=str(cm) if cm is not None else None)
+                acm = op.get("appendCustomMods")
+                cfg_res = _apply_config_in_place(
+                    w,
+                    pairs,
+                    custom_mods=str(cm) if cm is not None else None,
+                    append_custom_mods=str(acm) if acm is not None else None,
+                )
                 step_results.append({"step": idx, "op": "config", "count": len(cfg_res["assignments"])})
             elif kind == "flask":
                 f_sel = str(op.get("index", "all")).strip().lower()

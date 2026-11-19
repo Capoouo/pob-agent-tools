@@ -583,19 +583,147 @@ def resolve_slot_name(worker: BridgeWorker, slot_query: str) -> str:
     raise ValueError(f"Equipment slot '{slot_query}' not found.")
 
 
+_KNOWN_CONFIG_DEFAULTS: dict[str, Any] = {
+    "enemyIsBoss": "Pinnacle",
+    "resistancePenalty": -60,
+    "bandit": "None",
+    "pantheonMajorGod": "None",
+    "pantheonMinorGod": "None",
+    "presetBossSkills": "None",
+}
+
+_ALWAYS_SHOW_VISIBLE_CONFIG_VARS = frozenset({
+    "enemyIsBoss",
+})
+
+
+def _infer_config_default(item: dict[str, Any]) -> Any:
+    var = str(item.get("var") or "")
+    if var in _KNOWN_CONFIG_DEFAULTS:
+        return _KNOWN_CONFIG_DEFAULTS[var]
+    itype = str(item.get("type") or "")
+    if itype == "check":
+        return False
+    if itype == "list":
+        opts = item.get("list") or []
+        if opts and isinstance(opts[0], dict):
+            return opts[0].get("val")
+        return "None"
+    return None
+
+
+def inspect_config(
+    worker: BridgeWorker,
+    *,
+    include_defaults: bool = False,
+) -> dict[str, Any]:
+    """Inspect active PoB ConfigTab set, active/non-default config variables, and raw customMods."""
+    with worker.lock:
+        cfg_res = worker.call("list_config", {})
+
+    active_id = cfg_res.get("activeConfigSetId")
+    config_sets = cfg_res.get("configSets", [])
+    active_set = next((s for s in config_sets if s.get("id") == active_id), None)
+
+    variables: list[dict[str, Any]] = []
+    total_count = 0
+    active_count = 0
+
+    for sec in cfg_res.get("sections", []):
+        sec_name = sec.get("name") or ""
+        sec_name_zh = sec.get("nameZh") or sec_name
+        for item in sec.get("items", []):
+            var = item.get("var")
+            if not var:
+                continue
+            total_count += 1
+            val = item.get("value")
+            default_val = _infer_config_default(item)
+            visible = bool(item.get("visible", True))
+
+            if item.get("type") == "check":
+                is_default = (val in (None, False)) and (default_val is False)
+            elif item.get("type") == "list":
+                is_default = (val is None) or (val == default_val)
+            else:
+                is_default = val in (None, "") or (val == default_val)
+
+            is_active = visible and (not is_default or var in _ALWAYS_SHOW_VISIBLE_CONFIG_VARS)
+            if is_active:
+                active_count += 1
+
+            if include_defaults or is_active:
+                entry: dict[str, Any] = {
+                    "section": sec_name,
+                    "sectionZh": sec_name_zh,
+                    "var": var,
+                    "label": strip_pob_escapes(item.get("label") or ""),
+                    "labelZh": strip_pob_escapes(item.get("labelZh") or item.get("label") or ""),
+                    "type": item.get("type"),
+                    "value": val,
+                    "defaultValue": default_val,
+                    "placeholder": item.get("placeholder"),
+                    "visible": visible,
+                    "isDefault": is_default,
+                }
+                if item.get("list"):
+                    entry["options"] = [
+                        {
+                            "val": o.get("val"),
+                            "label": strip_pob_escapes(o.get("label") or ""),
+                            "labelZh": strip_pob_escapes(o.get("labelZh") or o.get("label") or ""),
+                        }
+                        for o in item["list"]
+                    ]
+                variables.append(entry)
+
+    custom_mods = cfg_res.get("customMods", [])
+    enabled_texts: list[str] = []
+    active_custom_lines: list[str] = []
+    for blk in custom_mods:
+        if blk.get("enabled", True):
+            txt = str(blk.get("text") or "")
+            if txt.strip():
+                enabled_texts.append(txt.strip())
+                for line in txt.splitlines():
+                    s = line.strip()
+                    if s and not s.startswith("#"):
+                        active_custom_lines.append(s)
+
+    return {
+        "activeConfigSetId": active_id,
+        "activeConfigSet": active_set,
+        "configSets": config_sets,
+        "variables": variables,
+        "activeCount": active_count,
+        "totalCount": total_count,
+        "includeDefaults": include_defaults,
+        "customMods": custom_mods,
+        "customModsText": "\n".join(enabled_texts),
+        "activeCustomModLines": active_custom_lines,
+        "rev": cfg_res.get("rev"),
+    }
+
+
 def inspect_items(
     worker: BridgeWorker,
+    slot_selector: str | None = None,
     *,
     slot_name: str | None = None,
     raw: bool = False,
+    include_raw: bool = False,
+    all_raw: bool = False,
 ) -> dict[str, Any]:
-    """List equipped items or inspect a single slot's tooltip and raw text."""
+    """List equipped items (optionally fetching all raw texts + allocated jewel sockets in one lock pass) or inspect one slot."""
+    effective_slot = slot_selector if slot_selector is not None else slot_name
+    want_raw = bool(raw or include_raw or all_raw)
+
     with worker.lock:
         items_res = worker.call("list_items", {})
         items_by_id = {it["id"]: it for it in items_res.get("items", [])}
 
-        if slot_name:
-            resolved_slot = resolve_slot_name(worker, slot_name)
+        if effective_slot:
+            resolved_slot = resolve_slot_name(worker, effective_slot)
             slot_obj = next((s for s in items_res.get("slots", []) if s["name"] == resolved_slot), None)
             item_id = slot_obj.get("selItemId") if slot_obj else None
             if not item_id:
@@ -606,7 +734,7 @@ def inspect_items(
                     "raw": None,
                 }
             tip = worker.call("item_tooltip", {"id": item_id, "slotName": resolved_slot, "compare": False})
-            raw_text = worker.call("item_raw", {"id": item_id}).get("raw") if raw else None
+            raw_text = worker.call("item_raw", {"id": item_id}).get("raw") if want_raw else None
             return {
                 "slot": slot_obj,
                 "item": items_by_id.get(item_id),
@@ -614,31 +742,56 @@ def inspect_items(
                 "raw": raw_text,
             }
 
+        allocated_nodes: set[int] = set()
+        if all_raw:
+            tree_state = worker.call("get_tree_state", {})
+            allocated_nodes = {int(x) for x in tree_state.get("allocatedNodes", [])}
+
         equipped_slots: list[dict[str, Any]] = []
+        raw_cache: dict[int, str | None] = {}
         for s in items_res.get("slots", []):
             item_id = s.get("selItemId")
-            if not item_id and not s.get("shown"):
-                continue
+            node_id = s.get("nodeId")
+            is_jewel_socket = node_id is not None
+            is_allocated_socket = is_jewel_socket and (int(node_id) in allocated_nodes)
+
+            if all_raw:
+                # Include all equipped active slots AND all allocated jewel sockets (#1..#N)
+                if s.get("inactive"):
+                    continue
+                if not item_id and not is_allocated_socket:
+                    continue
+            else:
+                if not item_id and not s.get("shown"):
+                    continue
+
             item = items_by_id.get(item_id) if item_id else None
             entry: dict[str, Any] = {
                 "slotName": s["name"],
                 "label": s.get("labelZh") or s.get("label") or s["name"],
                 "socketIndex": s.get("socketIndex"),
-                "nodeId": s.get("nodeId"),
+                "nodeId": node_id,
                 "isFlask": bool(s.get("isFlask")),
                 "active": bool(s.get("active")),
                 "inactive": bool(s.get("inactive")),
                 "itemId": item_id,
                 "item": item,
             }
-            if raw and item_id:
-                entry["raw"] = worker.call("item_raw", {"id": item_id}).get("raw")
+            if all_raw and is_jewel_socket:
+                entry["allocated"] = is_allocated_socket
+            if want_raw and item_id:
+                iid = int(item_id)
+                if iid not in raw_cache:
+                    raw_cache[iid] = worker.call("item_raw", {"id": iid}).get("raw")
+                entry["raw"] = raw_cache[iid]
             equipped_slots.append(entry)
 
         return {
             "activeItemSetId": items_res.get("activeItemSetId"),
             "itemSets": items_res.get("itemSets", []),
             "equippedSlots": equipped_slots,
+            "equippedCount": sum(1 for e in equipped_slots if e.get("itemId")),
+            "allRaw": all_raw,
             "totalItemsInBuild": len(items_res.get("items", [])),
         }
 
@@ -833,58 +986,287 @@ def inspect_tree(
         }
 
 
-def search_calcs_breakdown(worker: BridgeWorker, keyword: str) -> dict[str, Any]:
-    """Search `get_calcs` rows by keyword and fetch `calcs_breakdown` for matching cells."""
-    q = keyword.strip().lower()
-    with worker.lock:
-        calcs = worker.call("get_calcs", {})
-        matches: list[dict[str, Any]] = []
+_CAMEL_SPLIT_RE = re.compile(r"([a-z0-9])([A-Z])")
+_CALC_PUNCT_RE = re.compile(r"[\s_\-\"'`.,:/\\()\[\]{}%+]+")
 
-        for sec in calcs.get("sections", []):
-            si = sec.get("si")
-            sec_id = sec.get("id")
-            sec_group = sec.get("group")
-            for sub in sec.get("subsections", []):
-                ui = sub.get("ui")
-                sub_label = sub.get("labelZh") or sub.get("label") or ""
-                for row in sub.get("rows", []):
-                    ri = row.get("ri")
-                    r_label = row.get("label") or ""
-                    r_label_zh = row.get("labelZh") or ""
-                    haystack = f"{sec_id} {sec_group} {sub.get('label', '')} {sub_label} {r_label} {r_label_zh}".lower()
-                    if q in haystack:
-                        cells_out = []
+_CALC_TOKEN_SYNONYMS: dict[str, tuple[str, ...]] = {
+    "regen": ("regeneration", "recovery", "回复"),
+    "regeneration": ("regen", "recovery", "回复"),
+    "recovery": ("regen", "regeneration", "回复"),
+    "es": ("energy shield", "能量护盾"),
+    "ehp": ("effective hit pool", "effective health pool", "有效生命"),
+    "effective": ("eff", "有效"),
+    "eff": ("effective", "有效"),
+    "dps": ("damage", "totaldps", "秒伤", "伤害"),
+    "dmg": ("damage", "伤害"),
+    "avg": ("average", "平均"),
+    "average": ("avg", "平均"),
+    "crit": ("critical", "crits", "暴击"),
+    "critical": ("crit", "crits", "暴击"),
+    "mult": ("multiplier", "multi", "加成", "倍率"),
+    "multi": ("multiplier", "mult", "加成", "倍率"),
+    "multiplier": ("multi", "mult", "加成", "倍率"),
+    "res": ("resist", "resistance", "抗性"),
+    "resist": ("res", "resistance", "抗性"),
+    "resistance": ("resist", "res", "抗性"),
+    "phys": ("physical", "物理"),
+    "ele": ("elemental", "元素"),
+    "pen": ("penetration", "穿透"),
+    "supp": ("suppression", "压制"),
+    "suppression": ("supp", "suppress", "压制"),
+    "inc": ("increased", "提高"),
+    "max": ("maximum", "最大"),
+    "min": ("minimum", "最小"),
+    "mana": ("魔力",),
+    "life": ("生命",),
+    "hit": ("击中",),
+    "dot": ("持续伤", "damage over time"),
+    "speed": ("rate", "速度"),
+    "armour": ("armor", "护甲"),
+    "armor": ("armour", "护甲"),
+    "evasion": ("evade", "闪避"),
+    "block": ("格挡",),
+    "leech": ("偷取",),
+    "cost": ("消耗",),
+}
+
+
+def _norm_calc_text(text: str | None) -> str:
+    """Normalize calc label/query: strip PoB escapes, split camelCase, lowercase, collapse punctuation."""
+    if not text:
+        return ""
+    cleaned = strip_pob_escapes(str(text))
+    cleaned = _CAMEL_SPLIT_RE.sub(r"\1 \2", cleaned)
+    cleaned = _CALC_PUNCT_RE.sub(" ", cleaned).strip().lower()
+    return cleaned
+
+
+def _compact_calc_text(text: str | None) -> str:
+    """Strip spaces/underscores/punctuation and lowercase for compact key matching ('Average Hit' == 'averagehit')."""
+    return _norm_calc_text(text).replace(" ", "")
+
+
+def _token_matches_haystack(token: str, hay_norm: str, hay_compact: str) -> bool:
+    if token in hay_norm or token in hay_compact:
+        return True
+    for syn in _CALC_TOKEN_SYNONYMS.get(token, ()):
+        syn_norm = _norm_calc_text(syn)
+        syn_compact = syn_norm.replace(" ", "")
+        if syn_norm in hay_norm or (syn_compact and syn_compact in hay_compact):
+            return True
+    return False
+
+
+def _score_calc_row(
+    q_norm: str,
+    q_compact: str,
+    q_tokens: list[str],
+    sec_norm: str,
+    sub_norm: str,
+    row_norm: str,
+    cells_norm: str,
+    sub_row_compact: str,
+) -> float:
+    """Score how well a calcs row matches the bilingual query (0.0 means no match)."""
+    if not q_compact:
+        return 1.0
+
+    row_compact = row_norm.replace(" ", "")
+    sub_compact = sub_norm.replace(" ", "")
+    full_norm = f"{sec_norm} {sub_norm} {row_norm} {cells_norm}".strip()
+    full_compact = full_norm.replace(" ", "")
+
+    # 1. Direct normalized or compact match in row label (highest priority)
+    if q_norm in row_norm or q_compact in row_compact:
+        return 100.0 + (20.0 if row_compact == q_compact else 0.0)
+
+    # 2. Combined subsection + row match (e.g. '魔力回复' matching sub '魔力' + row '回复')
+    if q_compact in sub_row_compact:
+        return 90.0
+
+    # 3. Direct match in subsection or section or cell values (e.g. '有效生命' or skill/minion names like '寒霜法师')
+    if q_norm in sub_norm or q_compact in sub_compact:
+        return 75.0
+    if q_norm in cells_norm or q_compact in cells_norm.replace(" ", ""):
+        return 70.0
+    if q_norm in sec_norm or q_compact in sec_norm.replace(" ", ""):
+        return 60.0
+
+    # 4. Multi-token + bilingual synonym matching (e.g. 'Mana Regeneration' -> sub 'Mana' + row 'Recovery')
+    if len(q_tokens) >= 2:
+        if all(_token_matches_haystack(tok, full_norm, full_compact) for tok in q_tokens):
+            row_hits = sum(1 for tok in q_tokens if _token_matches_haystack(tok, row_norm, row_compact))
+            sub_hits = sum(1 for tok in q_tokens if _token_matches_haystack(tok, sub_norm, sub_compact))
+            if row_hits > 0:
+                return 80.0 + row_hits * 5.0 + sub_hits * 3.0
+            return 55.0 + sub_hits * 3.0
+    elif len(q_tokens) == 1:
+        tok = q_tokens[0]
+        if _token_matches_haystack(tok, row_norm, row_compact):
+            return 65.0
+        if _token_matches_haystack(tok, sub_norm, sub_compact):
+            return 50.0
+        if _token_matches_haystack(tok, full_norm, full_compact):
+            return 40.0
+
+    return 0.0
+
+
+def search_calcs_breakdown(
+    worker: BridgeWorker,
+    keyword: str,
+    *,
+    limit: int = 20,
+    max_breakdowns: int = 8,
+) -> dict[str, Any]:
+    """Bilingual (EN + ZH) search across `get_calcs` rows and fetch `calcs_breakdown` for top matches."""
+    q_norm = _norm_calc_text(keyword)
+    q_compact = q_norm.replace(" ", "")
+    q_tokens = [t for t in q_norm.split(" ") if t]
+
+    with worker.lock:
+        # Ensure we have both English and Chinese labels regardless of current set_translate state.
+        # When translate=True, bridge.lua's get_calcs returns BOTH English (label / cell.raw) and Chinese (labelZh / cell.text).
+        # If translate was False, briefly toggle it on inside try...finally so ZH labels are also indexed.
+        orig_translate: bool | None = None
+        toggled_translate = False
+        if worker.caps.get("translateToggle", False):
+            try:
+                ver = worker.call("version", {})
+                orig_translate = ver.get("translate")
+                if orig_translate is False:
+                    worker.call("set_translate", {"enabled": True})
+                    toggled_translate = True
+            except Exception:
+                toggled_translate = False
+
+        try:
+            calcs = worker.call("get_calcs", {})
+            scored_rows: list[tuple[float, int, dict[str, Any]]] = []
+            seq = 0
+
+            for sec in calcs.get("sections", []):
+                si = sec.get("si")
+                sec_id = str(sec.get("id") or "")
+                sec_group = str(sec.get("group") or "")
+                sec_norm = _norm_calc_text(f"{sec_id} {sec_group}")
+                for sub in sec.get("subsections", []):
+                    ui = sub.get("ui")
+                    sub_en = str(sub.get("label") or "")
+                    sub_zh = str(sub.get("labelZh") or "")
+                    sub_extra = str(sub.get("extra") or "")
+                    sub_norm = _norm_calc_text(f"{sub_en} {sub_zh} {sub_extra}")
+                    for row in sub.get("rows", []):
+                        ri = row.get("ri")
+                        r_en = str(row.get("label") or "")
+                        r_zh = str(row.get("labelZh") or "")
+                        row_norm = _norm_calc_text(f"{r_en} {r_zh}")
+
+                        cell_parts: list[str] = []
                         for cell in row.get("cells", []):
-                            ci = cell.get("ci")
-                            c_entry = {
-                                "ci": ci,
-                                "text": strip_pob_escapes(cell.get("text") or cell.get("raw") or ""),
-                                "hasBreakdown": bool(cell.get("hasBreakdown")),
-                            }
-                            if cell.get("hasBreakdown") and len(matches) < 8:
-                                try:
-                                    bd = worker.call(
-                                        "calcs_breakdown",
-                                        {"si": si, "ui": ui, "ri": ri, "ci": ci},
-                                    )
-                                    c_entry["breakdown"] = bd.get("sections", [])
-                                except Exception:
-                                    pass
-                            cells_out.append(c_entry)
-                        matches.append(
-                            {
-                                "sectionId": sec_id,
-                                "sectionGroup": sec_group,
-                                "subsection": sub_label,
-                                "rowLabel": r_label,
-                                "rowLabelZh": r_label_zh,
-                                "coords": {"si": si, "ui": ui, "ri": ri},
-                                "cells": cells_out,
-                            }
+                            if cell.get("text"):
+                                cell_parts.append(str(cell["text"]))
+                            if cell.get("raw") and cell.get("raw") != cell.get("text"):
+                                cell_parts.append(str(cell["raw"]))
+                            widget = cell.get("widget")
+                            if isinstance(widget, dict):
+                                if widget.get("value"):
+                                    cell_parts.append(str(widget["value"]))
+                                sel_idx = widget.get("selIndex")
+                                w_list = widget.get("list")
+                                if isinstance(w_list, list) and isinstance(sel_idx, int) and 1 <= sel_idx <= len(w_list):
+                                    sel_entry = w_list[sel_idx - 1]
+                                    if isinstance(sel_entry, dict):
+                                        cell_parts.append(str(sel_entry.get("label") or ""))
+                                        cell_parts.append(str(sel_entry.get("labelZh") or ""))
+                                    else:
+                                        cell_parts.append(str(sel_entry))
+                        cells_norm = _norm_calc_text(" ".join(cell_parts))
+                        sub_row_compact = (
+                            _compact_calc_text(f"{sub_en} {r_en}")
+                            + " "
+                            + _compact_calc_text(f"{sub_zh} {r_zh}")
                         )
+
+                        score = _score_calc_row(
+                            q_norm,
+                            q_compact,
+                            q_tokens,
+                            sec_norm,
+                            sub_norm,
+                            row_norm,
+                            cells_norm,
+                            sub_row_compact,
+                        )
+                        if score > 0:
+                            scored_rows.append(
+                                (
+                                    score,
+                                    seq,
+                                    {
+                                        "si": si,
+                                        "ui": ui,
+                                        "ri": ri,
+                                        "sec_id": sec_id,
+                                        "sec_group": sec_group,
+                                        "sub_en": sub_en,
+                                        "sub_zh": sub_zh or sub_en,
+                                        "row_en": r_en,
+                                        "row_zh": r_zh,
+                                        "cells": row.get("cells", []),
+                                    },
+                                )
+                            )
+                            seq += 1
+
+            # Sort highest match score first, preserving original Calcs order for ties
+            scored_rows.sort(key=lambda item: (-item[0], item[1]))
+
+            matches: list[dict[str, Any]] = []
+            breakdowns_fetched = 0
+            for score, _, item in scored_rows[:limit]:
+                cells_out: list[dict[str, Any]] = []
+                for cell in item["cells"]:
+                    ci = cell.get("ci")
+                    c_entry: dict[str, Any] = {
+                        "ci": ci,
+                        "text": strip_pob_escapes(cell.get("text") or cell.get("raw") or ""),
+                        "hasBreakdown": bool(cell.get("hasBreakdown")),
+                    }
+                    if cell.get("hasBreakdown") and breakdowns_fetched < max_breakdowns:
+                        try:
+                            bd = worker.call(
+                                "calcs_breakdown",
+                                {"si": item["si"], "ui": item["ui"], "ri": item["ri"], "ci": ci},
+                            )
+                            c_entry["breakdown"] = bd.get("sections", [])
+                            breakdowns_fetched += 1
+                        except Exception:
+                            pass
+                    cells_out.append(c_entry)
+
+                matches.append(
+                    {
+                        "sectionId": item["sec_id"],
+                        "sectionGroup": item["sec_group"],
+                        "subsection": item["sub_zh"],
+                        "subsectionEn": item["sub_en"],
+                        "rowLabel": item["row_en"],
+                        "rowLabelZh": item["row_zh"],
+                        "score": score,
+                        "coords": {"si": item["si"], "ui": item["ui"], "ri": item["ri"]},
+                        "cells": cells_out,
+                    }
+                )
+        finally:
+            if toggled_translate and orig_translate is not None:
+                try:
+                    worker.call("set_translate", {"enabled": orig_translate})
+                except Exception:
+                    pass
 
         return {
             "keyword": keyword,
-            "totalMatches": len(matches),
-            "matches": matches[:20],
+            "totalMatches": len(scored_rows),
+            "matches": matches,
         }

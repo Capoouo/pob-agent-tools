@@ -13,7 +13,8 @@ from .analyzer import (
 from .bridge_client import BridgeWorker
 from .formatters import fmt_delta, fmt_num, strip_pob_escapes
 from .importers import load_build_into_worker
-from .snapshot import CORE_STAT_KEYS, capture_digest, run_mutation
+from .mutators import _apply_config_in_place
+from .snapshot import CORE_STAT_KEYS, capture_digest, diff_digest, run_mutation
 
 EXTERNAL_ENV_WHITELIST = (
     "enemyIsBoss",
@@ -574,3 +575,199 @@ def borrow_from_ref(
             }
 
         return run_mutation(main_worker, _do_borrow, apply=apply)
+
+
+DEFAULT_MATRIX_SCENARIOS: list[str] = ["Original", "Pinnacle", "Uber", "FlasksOff"]
+
+
+def _parse_matrix_scenario(spec: str | dict[str, Any]) -> dict[str, Any]:
+    """Normalize a string or dict matrix scenario specification into a canonical execution plan."""
+    if isinstance(spec, dict):
+        name = str(spec.get("name") or "").strip()
+        base_raw = str(spec.get("base") or "Original").strip()
+        base_low = base_raw.lower()
+        if base_low == "pinnacle":
+            base = "Pinnacle"
+        elif base_low == "uber":
+            base = "Uber"
+        elif base_low == "original":
+            base = "Original"
+        else:
+            raise ValueError(f"Unsupported matrix base '{base_raw}' (expected 'Original', 'Pinnacle', or 'Uber').")
+
+        cfg_raw = spec.get("config") or {}
+        if isinstance(cfg_raw, dict):
+            config_pairs = list(cfg_raw.items())
+        elif isinstance(cfg_raw, list):
+            config_pairs = [(k, v) for k, v in cfg_raw]
+        else:
+            raise ValueError("Matrix scenario 'config' must be a dict or list of (key, value) pairs.")
+
+        flasks = spec.get("flasks")
+        if flasks is not None:
+            flasks = bool(flasks)
+
+        return {
+            "name": name or base,
+            "base": base,
+            "config": config_pairs,
+            "flasks": flasks,
+            "customMods": spec.get("customMods"),
+            "appendCustomMods": spec.get("appendCustomMods"),
+        }
+
+    raw = str(spec or "").strip()
+    if not raw:
+        raise ValueError("Matrix scenario specification cannot be empty.")
+
+    raw_low = raw.lower()
+    if raw_low == "original":
+        return {"name": "Original", "base": "Original", "config": [], "flasks": None, "customMods": None, "appendCustomMods": None}
+    if raw_low == "pinnacle":
+        return {"name": "Pinnacle", "base": "Pinnacle", "config": [], "flasks": None, "customMods": None, "appendCustomMods": None}
+    if raw_low == "uber":
+        return {"name": "Uber", "base": "Uber", "config": [], "flasks": None, "customMods": None, "appendCustomMods": None}
+    if raw_low in ("flasksoff", "flasks_off", "noflasks", "no_flasks"):
+        return {"name": "FlasksOff", "base": "Original", "config": [], "flasks": False, "customMods": None, "appendCustomMods": None}
+    if raw_low in ("flaskson", "flasks_on"):
+        return {"name": "FlasksOn", "base": "Original", "config": [], "flasks": True, "customMods": None, "appendCustomMods": None}
+
+    # Check "Label:body" syntax (only if ':' appears before any '=')
+    label = raw
+    body = raw
+    colon_idx = raw.find(":")
+    eq_idx = raw.find("=")
+    if colon_idx != -1 and (eq_idx == -1 or colon_idx < eq_idx):
+        label = raw[:colon_idx].strip() or raw
+        body = raw[colon_idx + 1 :].strip()
+
+    base = "Original"
+    flasks: bool | None = None
+    config_pairs: list[tuple[str, Any]] = []
+    custom_mods: str | None = None
+    append_custom_mods: str | None = None
+
+    tokens = [tok.strip() for tok in body.split(",") if tok.strip()]
+    if not tokens:
+        raise ValueError(f"Matrix scenario '{raw}' has an empty specification body.")
+
+    for tok in tokens:
+        t_low = tok.lower()
+        if "=" in tok:
+            k, v = tok.split("=", 1)
+            k_clean = k.strip()
+            v_clean = v.strip()
+            if k_clean.lower() == "custommods":
+                custom_mods = v_clean
+            elif k_clean.lower() == "appendcustommods":
+                append_custom_mods = v_clean
+            elif k_clean.lower() == "flasks":
+                flasks = v_clean.lower() in ("true", "1", "yes", "on")
+            elif k_clean.lower() == "base":
+                b_low = v_clean.lower()
+                if b_low == "pinnacle":
+                    base = "Pinnacle"
+                elif b_low == "uber":
+                    base = "Uber"
+                elif b_low == "original":
+                    base = "Original"
+                else:
+                    raise ValueError(f"Unsupported matrix base '{v_clean}' in scenario '{raw}'.")
+            else:
+                config_pairs.append((k_clean, v_clean))
+        elif t_low == "original":
+            base = "Original"
+        elif t_low == "pinnacle":
+            base = "Pinnacle"
+        elif t_low == "uber":
+            base = "Uber"
+        elif t_low in ("flasksoff", "flasks_off", "noflasks", "no_flasks"):
+            flasks = False
+        elif t_low in ("flaskson", "flasks_on"):
+            flasks = True
+        else:
+            raise ValueError(
+                f"Unrecognized matrix token '{tok}' in scenario '{raw}'. "
+                f"Use Original/Pinnacle/Uber/FlasksOff or key=value pairs."
+            )
+
+    return {
+        "name": label,
+        "base": base,
+        "config": config_pairs,
+        "flasks": flasks,
+        "customMods": custom_mods,
+        "appendCustomMods": append_custom_mods,
+    }
+
+
+def _apply_matrix_scenario_in_place(worker: BridgeWorker, plan: dict[str, Any]) -> dict[str, Any]:
+    """Apply a single parsed matrix scenario in place on the worker."""
+    applied_info: dict[str, Any] = {"base": plan["base"], "stripped": None, "config": [], "flasks": plan["flasks"]}
+
+    if plan["base"] == "Pinnacle":
+        applied_info["stripped"] = dewater_build_in_place(worker)
+    elif plan["base"] == "Uber":
+        applied_info["stripped"] = dewater_build_in_place(worker)
+        worker.call("set_config", {"var": "enemyIsBoss", "value": "Uber"})
+        applied_info["config"].append({"var": "enemyIsBoss", "action": "set", "value": "Uber"})
+
+    if plan["flasks"] is not None:
+        active_flag = bool(plan["flasks"])
+        for idx in range(1, 6):
+            worker.call("set_slot_active", {"slotName": f"Flask {idx}", "active": active_flag})
+
+    if plan["config"] or plan["customMods"] is not None or plan["appendCustomMods"] is not None:
+        cfg_res = _apply_config_in_place(
+            worker,
+            plan["config"],
+            custom_mods=plan["customMods"],
+            append_custom_mods=plan["appendCustomMods"],
+        )
+        applied_info["config"].extend(cfg_res.get("assignments", []))
+
+    return applied_info
+
+
+def run_matrix(
+    worker: BridgeWorker,
+    *,
+    scenarios: list[str | dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Evaluate multiple build scenarios in a single atomic 0-residue transaction.
+
+    Preserves the worker's loaded build, undo_stack, redo_stack, and last_good_code.
+    """
+    raw_scenarios = list(scenarios) if scenarios else list(DEFAULT_MATRIX_SCENARIOS)
+    parsed_plans = [_parse_matrix_scenario(s) for s in raw_scenarios]
+
+    with worker.lock:
+        baseline_code = worker.call("export_code", {})["code"]
+        results: list[dict[str, Any]] = []
+        first_digest: dict[str, Any] | None = None
+
+        try:
+            for idx, plan in enumerate(parsed_plans):
+                if idx > 0:
+                    worker.call("import_code", {"code": baseline_code, "mode": "replace"})
+                applied_info = _apply_matrix_scenario_in_place(worker, plan)
+                digest = capture_digest(worker)
+                if first_digest is None:
+                    first_digest = digest
+                deltas_vs_first = diff_digest(first_digest, digest)
+                results.append(
+                    {
+                        "name": plan["name"],
+                        "base": plan["base"],
+                        "applied": applied_info,
+                        "digest": digest,
+                        "deltasVsFirst": deltas_vs_first,
+                    }
+                )
+        finally:
+            worker.call("import_code", {"code": baseline_code, "mode": "replace"})
+
+        return {
+            "baseline": results[0]["name"] if results else "Original",
+            "scenarios": results,
+        }
