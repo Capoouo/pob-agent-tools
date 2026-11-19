@@ -3,22 +3,41 @@
 from __future__ import annotations
 
 import json
+import math
+import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
 import click
 
-from .daemon import call_daemon
-from .external_data import query_price, query_wiki
+from .daemon import (
+    BootstrapMissingError,
+    call_daemon,
+    emit_stderr_update_alert,
+    read_daemon_state,
+)
+from .external_data import query_meta, query_price, query_wiki
 from .formatters import (
     fmt_delta,
     fmt_num,
     render_table,
+    render_update_warning,
     strip_pob_escapes,
     to_json_str,
 )
+from .game_data import ensure_gamedata_index, query_local_data
 from .importers import xml_to_share_code
+from .poedb_client import query_poedb
+from .updater import (
+    STATE_BOOTSTRAP_MISSING,
+    bootstrap_engine,
+    check_and_apply_updates,
+    format_stderr_update_alert,
+    get_update_warning,
+    load_update_state,
+)
 
 
 def _echo_utf8(text: str) -> None:
@@ -28,6 +47,52 @@ def _echo_utf8(text: str) -> None:
     except Exception:
         pass
     click.echo(text)
+
+
+def _echo_stderr_utf8(text: str) -> None:
+    """Write UTF-8 safely to stderr on Windows consoles."""
+    try:
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    click.echo(text, err=True)
+
+
+def _daemon_call(
+    action: str,
+    params: dict[str, Any] | None = None,
+    *,
+    auto_start: bool = True,
+    timeout: float = 150.0,
+) -> dict[str, Any]:
+    """Call daemon and translate BootstrapMissingError into clean stderr guidance + exit(1)."""
+    try:
+        return call_daemon(action, params, auto_start=auto_start, timeout=timeout)
+    except BootstrapMissingError as exc:
+        alert = format_stderr_update_alert(exc.update_status) or str(exc)
+        _echo_stderr_utf8(alert)
+        sys.exit(1)
+
+
+def _prepend_warning(body: str, res: dict[str, Any]) -> str:
+    banner = render_update_warning(res.get("updateWarning"))
+    return f"{banner}{body}" if banner else body
+
+
+def _safe_min_ele_max_hit(stats: dict[str, Any]) -> float | str | None:
+    vals: list[float] = []
+    for key in ("FireMaximumHitTaken", "ColdMaximumHitTaken", "LightningMaximumHitTaken"):
+        raw = stats.get(key)
+        if raw is None:
+            continue
+        try:
+            vals.append(float(raw))
+        except (TypeError, ValueError):
+            pass
+    if not vals:
+        return None
+    m = min(vals)
+    return "inf" if math.isinf(m) and m > 0 else m
 
 
 def _render_mutation_report(title: str, res: dict[str, Any]) -> str:
@@ -90,27 +155,174 @@ def _render_mutation_report(title: str, res: dict[str, Any]) -> str:
 
 
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
-def main() -> None:
+@click.option("--offline", is_flag=True, help="Skip GitHub engine update checks (sets POB_OFFLINE=1).")
+def main(offline: bool) -> None:
     """Headless Path of Building (PoB) CLI for build inspection, what-if testing, and optimization."""
-    pass
+    if offline:
+        os.environ["POB_OFFLINE"] = "1"
 
 
-# --- 4.1 Lifecycle & Build I/O ---
+# --- 4.1 Lifecycle, Engine Updates & Build I/O ---
+
+
+@main.command("bootstrap")
+@click.option("--proxy", help="HTTP/SOCKS proxy URL (e.g. http://127.0.0.1:7890).")
+@click.option("--mirror", help="Optional GitHub mirror prefix URL.")
+@click.option("--no-zh", is_flag=True, help="Skip PobTools-zh bilingual Chinese DataV2 pack.")
+@click.option(
+    "--from-dir",
+    "from_dir",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    help="Offline import from an existing local PobTools directory.",
+)
+@click.option("--json", "as_json", is_flag=True, help="Output raw JSON.")
+def cmd_bootstrap(
+    proxy: str | None,
+    mirror: str | None,
+    no_zh: bool,
+    from_dir: Path | None,
+    as_json: bool,
+) -> None:
+    """Bootstrap or offline-import the managed headless PoB engine."""
+    if read_daemon_state() is not None:
+        try:
+            call_daemon("stop", auto_start=False)
+            deadline = time.monotonic() + 2.0
+            while read_daemon_state() is not None and time.monotonic() < deadline:
+                time.sleep(0.1)
+        except Exception:
+            pass
+
+    res = bootstrap_engine(
+        proxy=proxy,
+        mirror=mirror,
+        include_zh=not no_zh,
+        from_dir=from_dir,
+    )
+    warn = get_update_warning(res)
+    if warn:
+        res["updateWarning"] = warn
+    state_name = str(res.get("state") or "")
+    if state_name == STATE_BOOTSTRAP_MISSING or state_name.startswith("degraded_"):
+        emit_stderr_update_alert(res)
+
+    if as_json:
+        _echo_utf8(to_json_str(res, sanitize=False))
+    else:
+        rows = [
+            ["State", state_name or "-"],
+            ["Engine Dir", res.get("engineDir") or "-"],
+            ["PoB Version", res.get("localPobVersion") or "-"],
+            ["PobTools-zh", res.get("pobToolsVersion") or "-"],
+            ["Data Pack", res.get("dataVersion") or "-"],
+            ["Updated Files", res.get("updatedFilesCount") if res.get("updatedFilesCount") is not None else "-"],
+            ["Source", res.get("source") or "github"],
+        ]
+        body = "### PoB Engine Bootstrap\n" + render_table(["Field", "Value"], rows)
+        _echo_utf8(_prepend_warning(body, res))
+
+    if state_name == STATE_BOOTSTRAP_MISSING:
+        sys.exit(1)
+
+
+@main.command("update")
+@click.option("--check", "check_only", is_flag=True, help="Check remote versions without applying updates.")
+@click.option("--force", is_flag=True, help="Force full check/apply ignoring cached ETag.")
+@click.option("--proxy", help="HTTP/SOCKS proxy URL (e.g. http://127.0.0.1:7890).")
+@click.option("--mirror", help="Optional GitHub mirror prefix URL.")
+@click.option("--offline", is_flag=True, help="Skip network check and report local versions.")
+@click.option("--json", "as_json", is_flag=True, help="Output raw JSON.")
+def cmd_update(
+    check_only: bool,
+    force: bool,
+    proxy: str | None,
+    mirror: str | None,
+    offline: bool,
+    as_json: bool,
+) -> None:
+    """Check or incrementally update managed PoB & PobTools-zh engine (preserving loaded builds if daemon is alive)."""
+    eff_offline = bool(offline or os.environ.get("POB_OFFLINE", "").strip().lower() in ("1", "true", "yes", "on"))
+    res: dict[str, Any] | None = None
+    if read_daemon_state() is not None:
+        try:
+            res = call_daemon(
+                "update",
+                {
+                    "check_only": check_only,
+                    "force": force,
+                    "proxy": proxy,
+                    "mirror": mirror,
+                    "offline": eff_offline,
+                },
+                auto_start=False,
+                timeout=180.0,
+            )
+        except RuntimeError as exc:
+            if "not running" not in str(exc).lower():
+                raise
+
+    if res is None:
+        res = check_and_apply_updates(
+            check_only=check_only,
+            force=force,
+            proxy=proxy,
+            mirror=mirror,
+            offline=eff_offline,
+        )
+        warn = get_update_warning(res)
+        if warn:
+            res["updateWarning"] = warn
+
+    state_name = str(res.get("state") or "")
+    if state_name == STATE_BOOTSTRAP_MISSING or state_name.startswith("degraded_"):
+        emit_stderr_update_alert(res)
+
+    if as_json:
+        _echo_utf8(to_json_str(res, sanitize=False))
+    else:
+        rows = [
+            ["State", state_name or "-"],
+            ["Local PoB Version", res.get("localPobVersion") or "-"],
+            ["Remote PoB Version", res.get("remotePobVersion") or "-"],
+            ["PobTools-zh Version", res.get("pobToolsVersion") or "-"],
+            ["Data Pack Version", res.get("dataVersion") or "-"],
+            ["Engine Dir", res.get("engineDir") or "-"],
+            ["Update Available", res.get("updateAvailable") if res.get("updateAvailable") is not None else "-"],
+            ["Files Updated", res.get("updatedFilesCount") if res.get("updatedFilesCount") is not None else "-"],
+        ]
+        if res.get("networkError"):
+            rows.append(["Network Error", res["networkError"]])
+        body = "### PoB Engine Update Status\n" + render_table(["Field", "Value"], rows)
+        _echo_utf8(_prepend_warning(body, res))
+
+    if state_name == STATE_BOOTSTRAP_MISSING:
+        sys.exit(1)
 
 
 @main.command("status")
 @click.option("--json", "as_json", is_flag=True, help="Output raw JSON.")
 def cmd_status(as_json: bool) -> None:
-    """Show daemon status and currently loaded builds in main/ref slots."""
-    res = call_daemon("status")
+    """Show daemon status, engine versions, update state, and loaded builds in main/ref slots."""
+    res = _daemon_call("status")
+    upd = res.get("updateStatus") or {}
+    if str(upd.get("state") or "").startswith("degraded_") or res.get("updateWarning"):
+        emit_stderr_update_alert(upd)
+
     if as_json:
         _echo_utf8(to_json_str(res))
         return
 
     m = res.get("main", {})
     m_info = m.get("buildInfo") or {}
+    m_hello = m.get("hello") or {}
     r = res.get("ref", {})
     r_info = r.get("buildInfo") or {}
+
+    pob_ver = upd.get("localPobVersion") or m_hello.get("pobVersion") or "-"
+    tools_ver = upd.get("pobToolsVersion") or "-"
+    data_ver = upd.get("dataVersion") or "-"
+    upd_state = upd.get("state") or "-"
+
     rows = [
         [
             "main",
@@ -129,8 +341,12 @@ def cmd_status(as_json: bool) -> None:
             "-",
         ],
     ]
-    _echo_utf8(f"Daemon PID: `{res.get('pid')}` | Uptime: `{res.get('uptimeSec')}s`")
-    _echo_utf8(render_table(["Slot", "State", "Class", "Ascendancy", "Level", "Undo/Redo"], rows))
+    header = (
+        f"Daemon PID: `{res.get('pid')}` | Uptime: `{res.get('uptimeSec')}s` | "
+        f"PoB: `{pob_ver}` | PobTools: `{tools_ver}` | Data: `{data_ver}` | Update: `{upd_state}`\n"
+    )
+    body = header + render_table(["Slot", "State", "Class", "Ascendancy", "Level", "Undo/Redo"], rows)
+    _echo_utf8(_prepend_warning(body, res))
 
 
 @main.command("stop")
@@ -184,7 +400,14 @@ def cmd_load(source: str, target: str, as_json: bool) -> None:
     else:
         params["source"] = resolved_src
 
-    res = call_daemon("load", params)
+    try:
+        res = _daemon_call("load", params)
+    except Exception as exc:
+        upd_state = load_update_state()
+        if str(upd_state.get("state") or "").startswith("degraded_"):
+            emit_stderr_update_alert(upd_state)
+        raise click.ClickException(str(exc)) from exc
+
     if as_json:
         _echo_utf8(to_json_str(res))
         return
@@ -215,7 +438,8 @@ def cmd_load(source: str, target: str, as_json: bool) -> None:
         ["Main Skill Group", f"#{main_sg.get('index')} ({_dd_label(main_sg)})"],
         ["Active Skill", _dd_label(main_sk)],
     ]
-    _echo_utf8(render_table(["Field", "Value"], rows))
+    body = render_table(["Field", "Value"], rows)
+    _echo_utf8(_prepend_warning(body, res))
 
 
 @main.command("save")
@@ -224,7 +448,7 @@ def cmd_load(source: str, target: str, as_json: bool) -> None:
 @click.option("--json", "as_json", is_flag=True, help="Output raw JSON.")
 def cmd_save(xml_path: str, target: str, as_json: bool) -> None:
     """Save the current build to a local .xml file (written by CLI, R11)."""
-    res = call_daemon("export", {"target": target, "include_xml": True})
+    res = _daemon_call("export", {"target": target, "include_xml": True})
     out_file = Path(xml_path).resolve()
     out_file.parent.mkdir(parents=True, exist_ok=True)
     xml_content = res.get("xml") or ""
@@ -241,7 +465,7 @@ def cmd_save(xml_path: str, target: str, as_json: bool) -> None:
 @click.option("--json", "as_json", is_flag=True, help="Output raw JSON.")
 def cmd_export_code(target: str, as_json: bool) -> None:
     """Export current build as a URL-safe Base64 PoB share code."""
-    res = call_daemon("export", {"target": target, "include_xml": False})
+    res = _daemon_call("export", {"target": target, "include_xml": False})
     if as_json:
         _echo_utf8(to_json_str({"target": target, "code": res.get("code")}))
     else:
@@ -272,7 +496,7 @@ def cmd_switch_main(
     as_json: bool,
 ) -> None:
     """Switch active passive tree spec, main skill group/part, item/skill/config set, or loadout."""
-    res = call_daemon(
+    res = _daemon_call(
         "switch_main",
         {
             "target": target,
@@ -298,7 +522,7 @@ def cmd_switch_main(
 @click.option("--json", "as_json", is_flag=True, help="Output raw JSON.")
 def cmd_undo(target: str, as_json: bool) -> None:
     """Undo the last `--apply` mutation."""
-    res = call_daemon("undo", {"target": target})
+    res = _daemon_call("undo", {"target": target})
     if as_json:
         _echo_utf8(to_json_str(res))
         return
@@ -313,7 +537,7 @@ def cmd_undo(target: str, as_json: bool) -> None:
 @click.option("--json", "as_json", is_flag=True, help="Output raw JSON.")
 def cmd_redo(target: str, as_json: bool) -> None:
     """Redo the last undone mutation."""
-    res = call_daemon("redo", {"target": target})
+    res = _daemon_call("redo", {"target": target})
     if as_json:
         _echo_utf8(to_json_str(res))
         return
@@ -331,7 +555,7 @@ def cmd_redo(target: str, as_json: bool) -> None:
 @click.option("--json", "as_json", is_flag=True, help="Output raw JSON.")
 def cmd_summary(target: str, as_json: bool) -> None:
     """Display comprehensive build identity, offence, minion offence, defence, and warnings."""
-    res = call_daemon("summary", {"target": target})
+    res = _daemon_call("summary", {"target": target})
     if as_json:
         _echo_utf8(to_json_str(res))
         return
@@ -396,7 +620,7 @@ def cmd_summary(target: str, as_json: bool) -> None:
         for w in warnings:
             lines.append(f"- {w}")
 
-    _echo_utf8("\n".join(lines))
+    _echo_utf8(_prepend_warning("\n".join(lines), res))
 
 
 @main.command("audit")
@@ -404,7 +628,7 @@ def cmd_summary(target: str, as_json: bool) -> None:
 @click.option("--json", "as_json", is_flag=True, help="Output raw JSON.")
 def cmd_audit(target: str, as_json: bool) -> None:
     """Run build health check and non-destructive 4-part PoB inflation ('water') audit."""
-    res = call_daemon("audit", {"target": target})
+    res = _daemon_call("audit", {"target": target})
     if as_json:
         _echo_utf8(to_json_str(res))
         return
@@ -467,12 +691,16 @@ def cmd_audit(target: str, as_json: bool) -> None:
 
 @main.command("items")
 @click.option("--slot", help="Inspect a specific slot (e.g. 'Weapon 1', 'Amulet', 'Flask 1', or '#1' jewel socket).")
+@click.option("--all", "all_items", is_flag=True, help="Fetch all equipped items and allocated jewel sockets with full raw mods.")
 @click.option("--raw", is_flag=True, help="Include raw PoE item text.")
 @click.option("--target", type=click.Choice(["main", "ref"]), default="main")
 @click.option("--json", "as_json", is_flag=True, help="Output raw JSON.")
-def cmd_items(slot: str | None, raw: bool, target: str, as_json: bool) -> None:
-    """List equipped items or inspect a single slot's mods and raw text."""
-    res = call_daemon("items", {"target": target, "slot": slot, "raw": raw})
+def cmd_items(slot: str | None, all_items: bool, raw: bool, target: str, as_json: bool) -> None:
+    """List equipped items, inspect a single slot, or dump all equipped items & jewels (`--all --raw`)."""
+    res = _daemon_call(
+        "items",
+        {"target": target, "slot": slot, "raw": bool(raw or all_items), "allRaw": bool(all_items)},
+    )
     if as_json:
         _echo_utf8(to_json_str(res))
         return
@@ -492,6 +720,29 @@ def cmd_items(slot: str | None, raw: bool, target: str, as_json: bool) -> None:
                 lines.append(f"  {txt}")
         if raw and res.get("raw"):
             lines.append("\n```text\n" + res["raw"].strip() + "\n```")
+        _echo_utf8("\n".join(lines))
+        return
+
+    if all_items:
+        slots = res.get("equippedSlots", [])
+        lines = [
+            f"### All Equipped Items & Allocated Jewels (`{res.get('equippedCount', 0)}` equipped / `{len(slots)}` slots)",
+        ]
+        for s in slots:
+            slot_disp = s["slotName"]
+            if s.get("socketIndex"):
+                slot_disp = f"{slot_disp} (#{s['socketIndex']})"
+            it = s.get("item")
+            if not it:
+                lines.append(f"\n#### `{slot_disp}` — _(Empty)_")
+                continue
+            title = strip_pob_escapes(it.get("titleZh") or it.get("title") or it.get("nameZh") or it.get("name") or "-")
+            base = strip_pob_escapes(it.get("baseNameZh") or it.get("baseName") or "")
+            status = " [OFF]" if (s.get("isFlask") and not s.get("active")) else ""
+            lines.append(f"\n#### `{slot_disp}`{status}: {title} — {base} (`{it.get('rarity') or '-'}`)")
+            raw_txt = s.get("raw")
+            if raw_txt:
+                lines.append("```text\n" + str(raw_txt).strip() + "\n```")
         _echo_utf8("\n".join(lines))
         return
 
@@ -520,7 +771,7 @@ def cmd_items(slot: str | None, raw: bool, target: str, as_json: bool) -> None:
 @click.option("--json", "as_json", is_flag=True, help="Output raw JSON.")
 def cmd_skills(group: str | None, target: str, as_json: bool) -> None:
     """List all skill groups or inspect gems and per-gem DPS tooltips in a group."""
-    res = call_daemon("skills", {"target": target, "group": group})
+    res = _daemon_call("skills", {"target": target, "group": group})
     if as_json:
         _echo_utf8(to_json_str(res))
         return
@@ -565,7 +816,7 @@ def cmd_skills(group: str | None, target: str, as_json: bool) -> None:
 
 def _run_tree_inspect(search: str | None, target: str, as_json: bool) -> None:
     """Summarize allocated Keystones, Ascendancy, Masteries, Notables, Jewels, or search tree nodes."""
-    res = call_daemon("tree", {"target": target, "search": search})
+    res = _daemon_call("tree", {"target": target, "search": search})
     if as_json:
         _echo_utf8(to_json_str(res))
         return
@@ -619,7 +870,7 @@ def _run_tree_inspect(search: str | None, target: str, as_json: bool) -> None:
 @click.option("--json", "as_json", is_flag=True, help="Output raw JSON.")
 def cmd_calc(keyword: str, target: str, as_json: bool) -> None:
     """Search PoB Calcs breakdown tables and formulas by English/Chinese keyword."""
-    res = call_daemon("calc", {"target": target, "keyword": keyword})
+    res = _daemon_call("calc", {"target": target, "keyword": keyword})
     if as_json:
         _echo_utf8(to_json_str(res))
         return
@@ -656,7 +907,7 @@ def cmd_calc(keyword: str, target: str, as_json: bool) -> None:
 
 @main.group("item")
 def grp_item() -> None:
-    """Evaluate or mutate equipped items, flasks, and anoints."""
+    """Evaluate, edit, search DB, or mutate equipped items, flasks, and anoints."""
     pass
 
 
@@ -683,7 +934,7 @@ def cmd_item_try(
     if not raw_text:
         raise click.UsageError("Provide either --raw \"<item_text>\" or --file <item.txt>.")
 
-    res = call_daemon(
+    res = _daemon_call(
         "item_try",
         {
             "target": target,
@@ -720,6 +971,144 @@ def cmd_item_try(
     _echo_utf8("\n".join(lines))
 
 
+@grp_item.command("edit")
+@click.option("--slot", required=True, help="Equipped slot to edit (e.g. 'Ring 1', 'Weapon 1', '#1').")
+@click.option(
+    "--replace-mod",
+    "replace_mods",
+    nargs=2,
+    multiple=True,
+    metavar="<OLD> <NEW>",
+    help="Replace matching mod line(s) with NEW text (repeatable).",
+)
+@click.option("--add-mod", "add_mods", multiple=True, help="Append an explicit mod line (repeatable).")
+@click.option("--remove-mod", "remove_mods", multiple=True, help="Remove matching mod line(s) (repeatable).")
+@click.option("--apply", is_flag=True, help="Persist edited item into build.")
+@click.option("--target", type=click.Choice(["main", "ref"]), default="main")
+@click.option("--json", "as_json", is_flag=True, help="Output raw JSON.")
+def cmd_item_edit(
+    slot: str,
+    replace_mods: tuple[tuple[str, str], ...],
+    add_mods: tuple[str, ...],
+    remove_mods: tuple[str, ...],
+    apply: bool,
+    target: str,
+    as_json: bool,
+) -> None:
+    """In-place replace, add, or remove mod lines on an equipped item (0-residue what-if by default)."""
+    if not replace_mods and not add_mods and not remove_mods:
+        raise click.UsageError("Provide at least one of --replace-mod, --add-mod, or --remove-mod.")
+
+    res = _daemon_call(
+        "item_edit",
+        {
+            "target": target,
+            "slot": slot,
+            "replace_mods": [list(p) for p in replace_mods],
+            "add_mods": list(add_mods),
+            "remove_mods": list(remove_mods),
+            "apply": apply,
+        },
+    )
+    if as_json:
+        _echo_utf8(to_json_str(res))
+        return
+
+    lines = [f"### Item Mod Edit (`{res.get('slotName')}`)"]
+    changes = res.get("changes") or []
+    if changes:
+        c_rows = [
+            [
+                c.get("action"),
+                c.get("section") or "-",
+                c.get("before") or "-",
+                c.get("after") or "-",
+            ]
+            for c in changes
+        ]
+        lines.append(render_table(["Action", "Section", "Before", "After"], c_rows))
+    if res.get("mutation"):
+        lines.append("\n" + _render_mutation_report(f"Item Edit Impact ({res.get('slotName')})", res["mutation"]))
+    _echo_utf8("\n".join(lines))
+
+
+@grp_item.command("db")
+@click.argument("query")
+@click.option(
+    "--type",
+    "db_type",
+    type=click.Choice(["UNIQUE", "RARE"], case_sensitive=False),
+    default="UNIQUE",
+    show_default=True,
+    help="PoB item database kind.",
+)
+@click.option("--slot", help="Target equipment slot when equipping/comparing.")
+@click.option("--index", "item_index", type=int, help="1-based match index to select when equipping.")
+@click.option("--equip", is_flag=True, help="Try equipping selected DB item (what-if unless --apply).")
+@click.option("--apply", is_flag=True, help="Persist equipped DB item into build (implies --equip).")
+@click.option("--limit", type=int, default=15, show_default=True, help="Maximum matches to return.")
+@click.option("--target", type=click.Choice(["main", "ref"]), default="main")
+@click.option("--json", "as_json", is_flag=True, help="Output raw JSON.")
+def cmd_item_db(
+    query: str,
+    db_type: str,
+    slot: str | None,
+    item_index: int | None,
+    equip: bool,
+    apply: bool,
+    limit: int,
+    target: str,
+    as_json: bool,
+) -> None:
+    """Search PoB's built-in Unique/Rare item database (EN/ZH) and optionally try/equip a match."""
+    res = _daemon_call(
+        "item_db",
+        {
+            "target": target,
+            "query": query,
+            "db_type": db_type.upper(),
+            "slot": slot,
+            "index": item_index,
+            "equip": bool(equip or apply),
+            "apply": apply,
+            "limit": limit,
+        },
+        timeout=60.0,
+    )
+    if as_json:
+        _echo_utf8(to_json_str(res))
+        return
+
+    if not res.get("equipped"):
+        rows = []
+        for m in res.get("matches", []):
+            title = strip_pob_escapes(m.get("titleZh") or m.get("title") or m.get("nameZh") or m.get("name") or "-")
+            base = strip_pob_escapes(m.get("baseNameZh") or m.get("baseName") or m.get("type") or "-")
+            rows.append([m.get("index"), title, base, m.get("primarySlot") or "-", m.get("league") or "-"])
+        _echo_utf8(f"### PoB Item DB Search (`{res.get('dbType')}`): `{query}` ({res.get('total', 0)} hits)")
+        _echo_utf8(render_table(["#", "Title", "Base", "Primary Slot", "League"], rows))
+        return
+
+    sel = res.get("selectedItem") or {}
+    sel_name = strip_pob_escapes(sel.get("titleZh") or sel.get("title") or sel.get("name") or query)
+    lines = [f"### Item DB Equip: {sel_name} (Slot: `{res.get('slotName') or 'Auto'}`)"]
+    tip = res.get("tooltip") or {}
+    t_lines = tip.get("lines") or []
+    if t_lines:
+        lines.append("\n#### Native PoB Tooltip")
+        for ln in t_lines:
+            txt = (
+                strip_pob_escapes(ln.get("text") or ln.get("raw") or "")
+                if isinstance(ln, dict)
+                else strip_pob_escapes(str(ln))
+            )
+            if txt:
+                lines.append(f"  {txt}")
+    if res.get("mutation"):
+        lines.append("\n" + _render_mutation_report(f"Item DB Simulation ({sel_name})", res["mutation"]))
+    _echo_utf8("\n".join(lines))
+
+
 @grp_item.command("flask")
 @click.argument("index", type=str)
 @click.argument("state", type=click.Choice(["on", "off"], case_sensitive=False))
@@ -728,7 +1117,7 @@ def cmd_item_try(
 @click.option("--json", "as_json", is_flag=True, help="Output raw JSON.")
 def cmd_item_flask(index: str, state: str, apply: bool, target: str, as_json: bool) -> None:
     """Toggle Flask 1..5 or `all` on or off."""
-    res = call_daemon(
+    res = _daemon_call(
         "item_flask",
         {
             "target": target,
@@ -759,7 +1148,7 @@ def cmd_item_anoint(
     as_json: bool,
 ) -> None:
     """Anoint an equipped item via PoB's native item_edit_popup workflow."""
-    res = call_daemon(
+    res = _daemon_call(
         "item_anoint",
         {
             "target": target,
@@ -809,7 +1198,7 @@ def cmd_skill_set(
     as_json: bool,
 ) -> None:
     """Modify gem level/quality/enabled/count/gemId or group FullDPS state."""
-    res = call_daemon(
+    res = _daemon_call(
         "skill_set",
         {
             "target": target,
@@ -848,7 +1237,7 @@ def cmd_skill_add(
     as_json: bool,
 ) -> None:
     """Add a gem to a skill group."""
-    res = call_daemon(
+    res = _daemon_call(
         "skill_add",
         {
             "target": target,
@@ -873,7 +1262,7 @@ def cmd_skill_add(
 @click.option("--json", "as_json", is_flag=True, help="Output raw JSON.")
 def cmd_skill_rm(group: str, gem: str, apply: bool, target: str, as_json: bool) -> None:
     """Remove a gem from a skill group."""
-    res = call_daemon(
+    res = _daemon_call(
         "skill_rm",
         {
             "target": target,
@@ -894,7 +1283,7 @@ def cmd_skill_rm(group: str, gem: str, apply: bool, target: str, as_json: bool) 
 @click.option("--json", "as_json", is_flag=True, help="Output raw JSON.")
 @click.pass_context
 def grp_tree(ctx: click.Context, search: str | None, target: str, as_json: bool) -> None:
-    """Inspect passive tree (`pob tree [--search ...]`) or mutate nodes (`pob tree change ...`)."""
+    """Inspect passive tree (`pob tree [--search ...]`), mutate nodes (`change`), or switch class/ascendancy (`set-class`)."""
     if ctx.invoked_subcommand is None:
         _run_tree_inspect(search=search, target=target, as_json=as_json)
 
@@ -915,7 +1304,7 @@ def cmd_tree_change(
     """Allocate or deallocate passive tree nodes idempotently (R12)."""
     alloc_list = [x.strip() for x in allocate.split(",") if x.strip()] if allocate else []
     dealloc_list = [x.strip() for x in deallocate.split(",") if x.strip()] if deallocate else []
-    res = call_daemon(
+    res = _daemon_call(
         "tree_change",
         {
             "target": target,
@@ -930,28 +1319,101 @@ def cmd_tree_change(
     _echo_utf8(_render_mutation_report("Passive Tree Change", res))
 
 
+@grp_tree.command("set-class")
+@click.argument("class_name", required=False)
+@click.argument("ascendancy", required=False)
+@click.option("--secondary-asc", "secondary_asc", help="Secondary / Bloodline ascendancy name (or 'None' to clear).")
+@click.option("--apply", is_flag=True, help="Persist class/ascendancy change into build.")
+@click.option("--target", type=click.Choice(["main", "ref"]), default="main")
+@click.option("--json", "as_json", is_flag=True, help="Output raw JSON.")
+def cmd_tree_set_class(
+    class_name: str | None,
+    ascendancy: str | None,
+    secondary_asc: str | None,
+    apply: bool,
+    target: str,
+    as_json: bool,
+) -> None:
+    """Switch character class, primary ascendancy, and/or secondary (Bloodline) ascendancy."""
+    if not class_name and not ascendancy and not secondary_asc:
+        raise click.UsageError("Specify class_name, ascendancy, and/or --secondary-asc.")
+
+    res = _daemon_call(
+        "tree_set_class",
+        {
+            "target": target,
+            "class_name": class_name,
+            "ascendancy_name": ascendancy,
+            "secondary_ascendancy_name": secondary_asc,
+            "apply": apply,
+        },
+    )
+    if as_json:
+        _echo_utf8(to_json_str(res))
+        return
+    detail = res.get("detail") or {}
+    changes = detail.get("changes") or []
+    title = f"Set Class / Ascendancy ({'; '.join(changes) or 'no-op'})"
+    _echo_utf8(_render_mutation_report(title, res))
+
+
 @main.group("config")
 def grp_config() -> None:
-    """Inspect or modify PoB ConfigTab parameters."""
+    """Inspect or modify PoB ConfigTab parameters and customMods."""
     pass
+
+
+@grp_config.command("list")
+@click.option("--all", "include_defaults", is_flag=True, help="Include default/inactive config variables.")
+@click.option("--target", type=click.Choice(["main", "ref"]), default="main")
+@click.option("--json", "as_json", is_flag=True, help="Output raw JSON.")
+def cmd_config_list(include_defaults: bool, target: str, as_json: bool) -> None:
+    """List active (non-default) ConfigTab variables and raw customMods."""
+    res = _daemon_call("config_list", {"target": target, "includeDefaults": include_defaults})
+    if as_json:
+        _echo_utf8(to_json_str(res))
+        return
+
+    active_set = res.get("activeConfigSet") or {}
+    set_title = active_set.get("title") or res.get("activeConfigSetId") or "Default"
+    lines = [
+        f"### ConfigTab (`{set_title}`) — `{res.get('activeCount', 0)}` active / `{res.get('totalCount', 0)}` total",
+    ]
+    rows = [
+        [
+            v.get("sectionZh") or v.get("section") or "-",
+            v.get("var") or "-",
+            fmt_num(v.get("value")),
+            v.get("labelZh") or v.get("label") or "-",
+        ]
+        for v in res.get("variables", [])
+    ]
+    lines.append(render_table(["Section", "Var", "Value", "Label"], rows))
+
+    cm_text = (res.get("customModsText") or "").strip()
+    if cm_text:
+        lines.append("\n#### Custom Modifiers\n```text\n" + cm_text + "\n```")
+    _echo_utf8("\n".join(lines))
 
 
 @grp_config.command("set")
 @click.argument("pairs", nargs=-1, required=False)
-@click.option("--custom-mods", "custom_mods", help="Set custom modifiers text (or 'clear' to disable).")
+@click.option("--custom-mods", "custom_mods", help="Replace custom modifiers text (or 'clear' to disable).")
+@click.option("--append-mods", "append_mods", help="Append custom modifier line(s) without overwriting existing customMods.")
 @click.option("--apply", is_flag=True, help="Persist config changes into build.")
 @click.option("--target", type=click.Choice(["main", "ref"]), default="main")
 @click.option("--json", "as_json", is_flag=True, help="Output raw JSON.")
 def cmd_config_set(
     pairs: tuple[str, ...],
     custom_mods: str | None,
+    append_mods: str | None,
     apply: bool,
     target: str,
     as_json: bool,
 ) -> None:
-    """Set or reset ConfigTab variables (`key=value` or `key=reset`) and/or `--custom-mods`."""
-    if not pairs and custom_mods is None:
-        raise click.UsageError("Provide at least one `key=value` assignment or `--custom-mods`.")
+    """Set/reset ConfigTab variables (`key=value` or `key=reset`), replace `--custom-mods`, or `--append-mods`."""
+    if not pairs and custom_mods is None and append_mods is None:
+        raise click.UsageError("Provide at least one `key=value` assignment, `--custom-mods`, or `--append-mods`.")
     assignments: list[list[str]] = []
     for p in pairs:
         if "=" not in p:
@@ -959,20 +1421,25 @@ def cmd_config_set(
         k, v = p.split("=", 1)
         assignments.append([k.strip(), v.strip()])
 
-    res = call_daemon(
+    res = _daemon_call(
         "config_set",
         {
             "target": target,
             "assignments": assignments,
             "custom_mods": custom_mods,
+            "appendCustomMods": append_mods,
             "apply": apply,
         },
     )
     if as_json:
         _echo_utf8(to_json_str(res))
     else:
-        desc = ", ".join(pairs) + (f", customMods={custom_mods!r}" if custom_mods is not None else "")
-        _echo_utf8(_render_mutation_report(f"Config Set ({desc.strip(', ')})", res))
+        desc_parts = list(pairs)
+        if custom_mods is not None:
+            desc_parts.append(f"customMods={custom_mods!r}")
+        if append_mods is not None:
+            desc_parts.append(f"appendMods={append_mods!r}")
+        _echo_utf8(_render_mutation_report(f"Config Set ({', '.join(desc_parts)})", res))
 
 
 @main.command("batch")
@@ -1001,11 +1468,82 @@ def cmd_batch(
     if not isinstance(ops, list):
         raise click.UsageError("Batch input must be a JSON list of operation objects (or `{\"ops\": [...]}`).")
 
-    res = call_daemon("batch", {"target": target, "ops": ops, "apply": apply})
+    res = _daemon_call("batch", {"target": target, "ops": ops, "apply": apply})
     if as_json:
         _echo_utf8(to_json_str(res))
     else:
         _echo_utf8(_render_mutation_report(f"Batch Execution ({len(ops)} steps)", res))
+
+
+@main.command("matrix")
+@click.argument("scenarios", nargs=-1, required=False)
+@click.option(
+    "-s",
+    "--scenario",
+    "opt_scenarios",
+    multiple=True,
+    help="Scenario spec (e.g. Original, Pinnacle, Uber, FlasksOff, 'Wither15:Pinnacle,MultiplierWitheredStackCount=15').",
+)
+@click.option("--target", type=click.Choice(["main", "ref"]), default="main")
+@click.option("--json", "as_json", is_flag=True, help="Output raw JSON.")
+def cmd_matrix(
+    scenarios: tuple[str, ...],
+    opt_scenarios: tuple[str, ...],
+    target: str,
+    as_json: bool,
+) -> None:
+    """Run multi-scenario what-if comparison in one atomic 0-residue transaction (default: Original/Pinnacle/Uber/FlasksOff)."""
+    all_specs = [*scenarios, *opt_scenarios] or None
+    res = _daemon_call("matrix", {"target": target, "scenarios": all_specs})
+    if as_json:
+        _echo_utf8(to_json_str(res))
+        return
+
+    sc_list = res.get("scenarios", [])
+    if not sc_list:
+        _echo_utf8("_(No matrix scenarios evaluated)_")
+        return
+
+    base_dig = sc_list[0].get("digest", {})
+    base_dps = base_dig.get("primaryDps")
+    base_ehp = base_dig.get("totalEhp")
+    p_key = base_dig.get("primaryDpsKey") or "CombinedDPS"
+
+    rows = []
+    for idx, sc in enumerate(sc_list):
+        dig = sc.get("digest", {})
+        st = dig.get("stats", {})
+        p_dps = dig.get("primaryDps")
+        ehp = dig.get("totalEhp")
+        dps_delta = "Baseline" if idx == 0 else fmt_delta(base_dps, p_dps)
+        ehp_delta = "Baseline" if idx == 0 else fmt_delta(base_ehp, ehp)
+        ele_min = _safe_min_ele_max_hit(st)
+        max_hit_str = (
+            f"{fmt_num(st.get('PhysicalMaximumHitTaken'))} / "
+            f"{fmt_num(ele_min)} / "
+            f"{fmt_num(st.get('ChaosMaximumHitTaken'))}"
+        )
+        rows.append(
+            [
+                sc.get("name") or "-",
+                fmt_num(p_dps),
+                dps_delta,
+                fmt_num(st.get("AverageDamage")),
+                f"{fmt_num(st.get('Speed'), 2)}/s" if st.get("Speed") is not None else "-",
+                fmt_num(ehp),
+                ehp_delta,
+                f"{fmt_num(st.get('Life'))} / {fmt_num(st.get('EnergyShield'))}",
+                max_hit_str,
+            ]
+        )
+
+    _echo_utf8(f"### Scenario Matrix Comparison (`{target}`, Baseline: `{res.get('baseline')}`, Primary: `{p_key}`)")
+    _echo_utf8(
+        render_table(
+            ["Scenario", p_key, "DPS Delta", "Avg Hit", "Speed", "TotalEHP", "EHP Delta", "Life / ES", "MaxHit (P/E/C)"],
+            rows,
+        )
+    )
 
 
 # --- 4.4 ROI Rankings & Cross-Build Comparison ---
@@ -1019,7 +1557,7 @@ def cmd_batch(
 @click.option("--json", "as_json", is_flag=True, help="Output raw JSON.")
 def cmd_rank_nodes(stat: str, max_dist: int, top: int, target: str, as_json: bool) -> None:
     """Rank unallocated passive tree nodes by ROI per point (`pathPower`) and total gain (`power`)."""
-    res = call_daemon(
+    res = _daemon_call(
         "rank_nodes",
         {"target": target, "stat": stat, "max_dist": max_dist, "top": top},
         timeout=180.0,
@@ -1063,7 +1601,7 @@ def cmd_rank_gems(
     as_json: bool,
 ) -> None:
     """Rank support/active candidate gems for a skill group by DPS gain."""
-    res = call_daemon(
+    res = _daemon_call(
         "rank_gems",
         {
             "target": target,
@@ -1111,7 +1649,7 @@ def cmd_compare(ref_source: str | None, as_json: bool) -> None:
         else:
             params["ref_source"] = resolved_src
 
-    res = call_daemon("compare", params)
+    res = _daemon_call("compare", params)
     if as_json:
         _echo_utf8(to_json_str(res))
         return
@@ -1170,7 +1708,7 @@ def cmd_compare(ref_source: str | None, as_json: bool) -> None:
 def cmd_borrow(item_slot: str | None, skill_group: str | None, apply: bool, as_json: bool) -> None:
     """Borrow items and/or a skill group from `ref` into `main` and compute exact delta."""
     slots = [x.strip() for x in item_slot.split(",") if x.strip()] if item_slot else []
-    res = call_daemon(
+    res = _daemon_call(
         "borrow",
         {
             "item_slots": slots,
@@ -1190,40 +1728,373 @@ def cmd_borrow(item_slot: str | None, skill_group: str | None, apply: bool, as_j
     _echo_utf8(report)
 
 
-# --- 4.5 External Price & Wiki Queries ---
+# --- 4.5 Local Offline Game Data & External Economy/PoEDB/Wiki Queries ---
+
+
+@main.command("data")
+@click.argument("kind", type=click.Choice(["gem", "unique", "mod", "base", "translate"], case_sensitive=False))
+@click.argument("query")
+@click.option("--slot", help="Filter mods/uniques/bases by slot (e.g. 'body_armour', 'helmet', 'ring', 'wand').")
+@click.option("--ilvl", type=int, help="Maximum item level / required level filter.")
+@click.option("--limit", type=int, default=25, show_default=True, help="Maximum number of results.")
+@click.option("--rebuild", is_flag=True, help="Force rebuild the local SQLite game data index.")
+@click.option("--json", "as_json", is_flag=True, help="Output raw JSON.")
+def cmd_data(
+    kind: str,
+    query: str,
+    slot: str | None,
+    ilvl: int | None,
+    limit: int,
+    rebuild: bool,
+    as_json: bool,
+) -> None:
+    """Query local 0ms PoB Lua game data & ZH dictionary (`gem|unique|mod|base|translate`, daemon-free)."""
+    if rebuild:
+        ensure_gamedata_index(force_rebuild=True)
+    res = query_local_data(kind, query, slot=slot, ilvl=ilvl, limit=limit)
+    if as_json:
+        _echo_utf8(to_json_str(res, sanitize=False))
+        return
+
+    kind_norm = res.get("kind", kind.lower())
+    results = res.get("results", [])
+    lines = [
+        f"### Local Game Data (`{kind_norm}`): `{query}` — `{res.get('count', 0)}` hits "
+        f"(PoB `{res.get('pobVersion')}` / Data `{res.get('dataVersion')}`)",
+    ]
+    if not results:
+        lines.append("_(no matches)_")
+        _echo_utf8("\n".join(lines))
+        return
+
+    if kind_norm == "translate":
+        rows = [[r.get("en"), r.get("zh") or "-", r.get("category") or "-", r.get("match_type") or "-"] for r in results]
+        lines.append(render_table(["English", "Chinese", "Category", "Match"], rows))
+    elif kind_norm == "gem":
+        for r in results:
+            zh_part = f" ({r['zh_name']})" if r.get("zh_name") else ""
+            kind_lbl = "Support" if r.get("is_support") else "Active"
+            lines.append(f"\n#### {r.get('display_name') or r.get('name')}{zh_part} — `{r.get('color') or '-'}` {kind_lbl}")
+            meta_bits = []
+            if r.get("tag_string"):
+                meta_bits.append(f"Tags: {r['tag_string']}")
+            if r.get("cast_time") is not None:
+                meta_bits.append(f"Cast: {r['cast_time']}s")
+            if r.get("crit_chance") is not None:
+                meta_bits.append(f"Crit: {r['crit_chance']}%")
+            if r.get("damage_effectiveness") is not None:
+                meta_bits.append(f"DmgEff: {r['damage_effectiveness']}")
+            if r.get("mana_multiplier") is not None:
+                meta_bits.append(f"CostMult: {r['mana_multiplier']}%")
+            if meta_bits:
+                lines.append("- " + " | ".join(meta_bits))
+
+            lvls = r.get("levels") or {}
+            if lvls:
+                lvl_rows = []
+                for lk in sorted(lvls.keys(), key=lambda x: int(x) if str(x).isdigit() else 999):
+                    lv = lvls[lk]
+                    cost_s = ", ".join(f"{k}:{v}" for k, v in (lv.get("cost") or {}).items()) or "-"
+                    stats_s = "; ".join(f"{k}={v}" for k, v in list((lv.get("stats") or {}).items())[:6]) or "-"
+                    lvl_rows.append(
+                        [
+                            f"Lv.{lk}",
+                            lv.get("levelRequirement") if lv.get("levelRequirement") is not None else "-",
+                            cost_s,
+                            lv.get("critChance") if lv.get("critChance") is not None else "-",
+                            lv.get("damageEffectiveness") if lv.get("damageEffectiveness") is not None else "-",
+                            stats_s[:100],
+                        ]
+                    )
+                lines.append(render_table(["Lv", "ReqLv", "Cost", "Crit", "DmgEff", "Key Stats"], lvl_rows))
+
+            q_stats = r.get("quality_stats") or []
+            if q_stats:
+                q_str = "; ".join(f"{q['stat']}={q['at_20_quality']} (@20%)" for q in q_stats[:4])
+                lines.append(f"- **Quality (20%)**: {q_str}")
+            variants = r.get("variants") or []
+            if variants:
+                v_parts = []
+                for v in variants[:8]:
+                    v_zh = f" ({v['zh_name']})" if v.get("zh_name") else ""
+                    v_parts.append(f"{v.get('name')}{v_zh} [{v.get('relation')}]")
+                lines.append(f"- **Variants**: {', '.join(v_parts)}")
+    elif kind_norm == "unique":
+        for r in results:
+            zh_part = f" ({r['zh_name']})" if r.get("zh_name") else ""
+            base_zh = f" ({r['base_type_zh']})" if r.get("base_type_zh") else ""
+            lines.append(f"\n#### {r.get('name')}{zh_part} — {r.get('base_type')}{base_zh} (`{r.get('item_class')}`)")
+            meta = [x for x in [f"ReqLv {r['req_level']}" if r.get("req_level") else "", r.get("league") or "", r.get("source") or ""] if x]
+            if meta:
+                lines.append("- " + " | ".join(meta))
+            for imp, imp_zh in zip(r.get("implicits") or [], (r.get("implicits_zh") or []) + [None] * 10):
+                lines.append(f"- [Implicit] {imp}" + (f" / {imp_zh}" if imp_zh else ""))
+            for exp, exp_zh in zip(r.get("explicits") or [], (r.get("explicits_zh") or []) + [None] * 30):
+                lines.append(f"- {exp}" + (f" / {exp_zh}" if exp_zh else ""))
+            fb_mods = r.get("foulborn_mods") or []
+            if fb_mods:
+                lines.append("- **Foulborn Mutations**:")
+                for fb in fb_mods[:8]:
+                    st_en = "; ".join(fb.get("stats") or [])
+                    st_zh = "; ".join(x for x in (fb.get("stats_zh") or []) if x)
+                    lines.append(f"  - {st_en}" + (f" / {st_zh}" if st_zh else ""))
+    elif kind_norm == "mod":
+        rows = []
+        for r in results:
+            en_s = "; ".join(r.get("stats") or [])
+            zh_s = "; ".join(x for x in (r.get("stats_zh") or []) if x)
+            stat_disp = f"{en_s} / {zh_s}" if zh_s else en_s
+            weights = r.get("weights") or {}
+            bench = r.get("bench_info")
+            if bench:
+                cost = bench.get("cost")
+                cost_s = ", ".join(f"{k}:{v}" for k, v in cost.items()) if isinstance(cost, dict) else str(cost or "")
+                types_s = ",".join((bench.get("types") or [])[:5])
+                w_disp = f"Bench[{types_s}]" + (f" ({cost_s})" if cost_s else "")
+            else:
+                w_disp = ", ".join(f"{k}:{v}" for k, v in list(weights.items())[:5]) or "-"
+            affix_grp = f"{r.get('affix') or '-'} ({r.get('group') or '-'})"
+            rows.append(
+                [
+                    r.get("source") or "-",
+                    r.get("generation_type") or "-",
+                    affix_grp[:40],
+                    r.get("level") if r.get("level") is not None else "-",
+                    stat_disp[:120],
+                    w_disp[:60],
+                ]
+            )
+        lines.append(render_table(["Source", "Type", "Affix (Group)", "iLvl", "Stats", "Weights / Bench"], rows))
+    elif kind_norm == "base":
+        rows = []
+        for r in results:
+            name_disp = f"{r.get('name')} ({r['zh_name']})" if r.get("zh_name") else r.get("name")
+            req = r.get("req") or {}
+            req_s = f"Lv{req.get('level', 0)}/{req.get('str', 0)}/{req.get('dex', 0)}/{req.get('int', 0)}"
+            props = r.get("properties") or {}
+            prop_bits = []
+            for pk, pv in props.items():
+                if isinstance(pv, dict):
+                    prop_bits.append(f"{pk}: " + ",".join(f"{k}={v}" for k, v in list(pv.items())[:4]))
+            imp_s = "; ".join(r.get("implicits") or []) or "-"
+            sub_part = f" ({r['sub_type']})" if r.get("sub_type") else ""
+            rows.append(
+                [
+                    name_disp,
+                    f"{r.get('type') or '-'}{sub_part}",
+                    req_s,
+                    "; ".join(prop_bits)[:60] or "-",
+                    imp_s[:80],
+                ]
+            )
+        lines.append(render_table(["Base", "Class", "Req (Lv/S/D/I)", "Properties", "Implicits"], rows))
+
+    _echo_utf8("\n".join(lines))
+
+
+@main.command("poedb")
+@click.argument("query")
+@click.option("--mods", "include_mods", is_flag=True, help="Fetch item/base mod pool with DropChance weights & fossil tags.")
+@click.option("--lang", type=click.Choice(["cn", "us", "en"], case_sensitive=False), default="cn", show_default=True, help="PoEDB language.")
+@click.option("--proxy", help="Optional HTTP/SOCKS proxy URL.")
+@click.option("--limit", type=int, default=60, show_default=True, help="Maximum mod pool rows to return.")
+@click.option("--json", "as_json", is_flag=True, help="Output raw JSON.")
+def cmd_poedb(
+    query: str,
+    include_mods: bool,
+    lang: str,
+    proxy: str | None,
+    limit: int,
+    as_json: bool,
+) -> None:
+    """Query poedb.tw CN/US autocomplete index, properties, version history, and mod pool weights (cached)."""
+    res = query_poedb(query, include_mods=include_mods, lang=lang, proxy=proxy, limit_mods=limit)
+    if as_json:
+        _echo_utf8(to_json_str(res, sanitize=False))
+        return
+
+    lines = [
+        f"### PoEDB: {res.get('title')} (`{res.get('slug')}`) — {res.get('url')}",
+    ]
+    if res.get("category"):
+        lines.append(f"- **Category**: {res['category']}")
+    for prop in res.get("properties") or []:
+        lines.append(f"- {prop}")
+    if res.get("implicits"):
+        lines.append("\n#### Implicits")
+        for ln in res["implicits"]:
+            lines.append(f"- {ln}")
+    if res.get("explicits"):
+        lines.append("\n#### Explicits")
+        for ln in res["explicits"]:
+            lines.append(f"- {ln}")
+
+    vh = res.get("versionHistory") or []
+    if vh:
+        lines.append("\n#### Version History")
+        v_rows = [[v.get("version"), "; ".join(v.get("changes") or [])[:140]] for v in vh[:10]]
+        lines.append(render_table(["Version", "Changes"], v_rows))
+
+    mods = res.get("mods")
+    if mods is not None:
+        pool_slug = res.get("modPoolSlug") or res.get("slug")
+        total_m = res.get("modCountTotal", len(mods))
+        lines.append(f"\n#### Mod Pool (`{pool_slug}` — showing {len(mods)} of {total_m} mods)")
+        m_rows = []
+        for m in mods:
+            fam = ", ".join(m.get("family") or [])[:35] or "-"
+            tags = ", ".join(m.get("fossilNo") or m.get("tags") or [])[:40] or "-"
+            m_rows.append(
+                [
+                    m.get("side") or "-",
+                    fam,
+                    m.get("level") if m.get("level") is not None else "-",
+                    (m.get("text") or "-")[:90],
+                    m.get("dropChance") if m.get("dropChance") is not None else "-",
+                    tags,
+                ]
+            )
+        lines.append(render_table(["Side", "Family", "iLvl", "Mod Text", "Weight", "Tags (fossil_no)"], m_rows))
+
+    _echo_utf8("\n".join(lines))
 
 
 @main.command("price")
 @click.argument("query")
 @click.option("--league", help="League name (defaults to current primary softcore trade league).")
-@click.option("--category", default="all", show_default=True, help="Category: unique, weapon, armour, accessory, flask, jewel, cluster, gem, currency, card, oil, scarab, tattoo, omen, fossil, essence, all.")
+@click.option("--category", default="all", show_default=True, help="Category (all, unique, gem, imbuedgem, currency, card, cluster, base, flask, scarab, runegraft, wombgift, etc.).")
+@click.option("--variant", help="Filter matches by variant substring (e.g. 'Necromancer', '8 passives', '21/20').")
+@click.option("--limit", type=int, default=20, show_default=True, help="Maximum number of matches to return.")
+@click.option("--detailed", is_flag=True, help="Use detailed stash overview API (gem level/quality, corrupted, links, cluster passives).")
 @click.option("--json", "as_json", is_flag=True, help="Output raw JSON.")
-def cmd_price(query: str, league: str | None, category: str, as_json: bool) -> None:
-    """Query poe.ninja economy prices (15m local cache)."""
-    res = query_price(query, league=league, category=category)
+def cmd_price(
+    query: str,
+    league: str | None,
+    category: str,
+    variant: str | None,
+    limit: int,
+    detailed: bool,
+    as_json: bool,
+) -> None:
+    """Query poe.ninja economy prices (15m local cache, 52 overview categories, optional --detailed/--variant)."""
+    res = query_price(
+        query,
+        league=league,
+        category=category,
+        limit=limit,
+        variant=variant,
+        detailed=detailed,
+    )
     if as_json:
         _echo_utf8(to_json_str(res, sanitize=False))
         return
 
-    rows = []
-    for m in res.get("matches", []):
-        trend = m.get("trend24hPct")
-        trend_str = f"{float(trend):+.1f}%" if trend is not None else "-"
-        rows.append(
-            [
-                m.get("name"),
-                m.get("type"),
-                m.get("variant") or (f"{m['links']}L" if m.get("links") else "-"),
-                fmt_num(m.get("chaosValue"), 1),
-                fmt_num(m.get("divineValue"), 2) if m.get("divineValue") is not None else "-",
-                trend_str,
-                m.get("listingCount") if m.get("listingCount") is not None else "-",
-            ]
-        )
+    matches = res.get("matches", [])
+    is_det = bool(res.get("detailed")) or any(
+        m.get("gemLevel") is not None or m.get("corrupted") is not None for m in matches
+    )
     div_rate = res.get("divineChaosRate")
     rate_str = f" | 1 Divine = `{fmt_num(div_rate, 1)}` Chaos" if div_rate else ""
-    _echo_utf8(f"### poe.ninja Price Search: `{query}` (League: `{res.get('league')}`{rate_str})")
-    _echo_utf8(render_table(["Item / Currency", "Category", "Variant / Links", "Chaos", "Divine", "24h Trend", "Listings"], rows))
+    det_tag = " [Detailed]" if is_det else ""
+    _echo_utf8(
+        f"### poe.ninja Price Search{det_tag}: `{query}` (League: `{res.get('league')}`{rate_str}, {res.get('totalMatches', 0)} matches)"
+    )
+
+    if is_det:
+        rows = []
+        for m in matches:
+            lv = m.get("gemLevel")
+            ql = m.get("gemQuality")
+            lv_q = f"{lv}/{ql or 0}" if lv is not None else "-"
+            corr = "Yes" if m.get("corrupted") is True else ("No" if m.get("corrupted") is False else "-")
+            links = f"{m['links']}L" if m.get("links") else "-"
+            rows.append(
+                [
+                    m.get("name"),
+                    m.get("type"),
+                    m.get("variant") or "-",
+                    lv_q,
+                    corr,
+                    links,
+                    fmt_num(m.get("chaosValue"), 1),
+                    fmt_num(m.get("divineValue"), 2) if m.get("divineValue") is not None else "-",
+                    m.get("listingCount") if m.get("listingCount") is not None else "-",
+                ]
+            )
+        _echo_utf8(
+            render_table(
+                ["Item / Currency", "Category", "Variant", "Lvl/Qual", "Corrupted", "Links", "Chaos", "Divine", "Listings"],
+                rows,
+            )
+        )
+    else:
+        rows = []
+        for m in matches:
+            trend = m.get("trend24hPct")
+            trend_str = f"{float(trend):+.1f}%" if trend is not None else "-"
+            rows.append(
+                [
+                    m.get("name"),
+                    m.get("type"),
+                    m.get("variant") or (f"{m['links']}L" if m.get("links") else "-"),
+                    fmt_num(m.get("chaosValue"), 1),
+                    fmt_num(m.get("divineValue"), 2) if m.get("divineValue") is not None else "-",
+                    trend_str,
+                    m.get("listingCount") if m.get("listingCount") is not None else "-",
+                ]
+            )
+        _echo_utf8(
+            render_table(["Item / Currency", "Category", "Variant / Links", "Chaos", "Divine", "24h Trend", "Listings"], rows)
+        )
+
+
+@main.command("meta")
+@click.option("--league", help="League name or slug (defaults to current primary challenge league).")
+@click.option("--skill", help="Filter by main skill substring.")
+@click.option("--class", "class_name", help="Filter by ascendancy/class substring.")
+@click.option("--top", type=int, default=15, show_default=True, help="Number of top entries to show.")
+@click.option("--json", "as_json", is_flag=True, help="Output raw JSON.")
+def cmd_meta(
+    league: str | None,
+    skill: str | None,
+    class_name: str | None,
+    top: int,
+    as_json: bool,
+) -> None:
+    """Query poe.ninja league meta snapshot (total builds, ascendancy & main skill share)."""
+    res = query_meta(league=league, skill=skill, class_name=class_name, top=top)
+    if as_json:
+        _echo_utf8(to_json_str(res, sanitize=False))
+        return
+
+    lines = [
+        f"### poe.ninja Meta Snapshot: `{res.get('league')}` — `{res.get('totalBuilds', 0):,}` total builds",
+    ]
+    asc_rows = [
+        [
+            a.get("class"),
+            f"{a.get('percentage', 0):.2f}%",
+            f"{a.get('estimatedBuilds', 0):,}",
+            ", ".join((a.get("skills") or [])[:4]),
+        ]
+        for a in res.get("ascendancies", [])
+    ]
+    lines.append("\n#### Top Ascendancies")
+    lines.append(render_table(["Ascendancy", "Share", "Est. Builds", "Top Skills"], asc_rows))
+
+    sk_rows = [
+        [
+            s.get("skill"),
+            f"{s.get('percentage', 0):.2f}%",
+            f"{s.get('estimatedBuilds', 0):,}",
+            ", ".join((s.get("classes") or [])[:4]),
+        ]
+        for s in res.get("topSkills", [])
+    ]
+    lines.append("\n#### Top Main Skills")
+    lines.append(render_table(["Skill", "Share", "Est. Builds", "Top Classes"], sk_rows))
+
+    _echo_utf8("\n".join(lines))
 
 
 @main.command("wiki")

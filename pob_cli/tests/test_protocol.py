@@ -11,7 +11,7 @@ from pob_cli.importers import POE_NINJA_CHAR_RE, share_code_to_xml, xml_to_share
 
 
 def test_forbidden_methods_blocked() -> None:
-    """Verify R1, R2, R3, R4, R7, R11 forbidden RPC methods raise BridgeError before touching subprocess."""
+    """Verify R1, R3, R4, R7, R11 static blocklist and R2 dynamic caps.sidebarBreakdown gating."""
     worker = BridgeWorker(slot_name="test")
     expected_blocked = [
         "compare_load",
@@ -24,7 +24,6 @@ def test_forbidden_methods_blocked() -> None:
         "compare_skills",
         "compare_config",
         "compare_use",
-        "sidebar_breakdown",
         "config_mod_search",
         "config_mod_add",
         "set_pob_options",
@@ -36,6 +35,18 @@ def test_forbidden_methods_blocked() -> None:
         assert method in FORBIDDEN_METHODS
         with pytest.raises(BridgeError):
             worker.call(method, {})
+
+    # Dynamic R2: sidebar_breakdown is NOT in static FORBIDDEN_METHODS, but raises when caps.sidebarBreakdown is False
+    assert "sidebar_breakdown" not in FORBIDDEN_METHODS
+
+    class _FakeProc:
+        def poll(self) -> None:
+            return None
+
+    worker._proc = _FakeProc()  # type: ignore[assignment]
+    worker.caps = {"sidebarBreakdown": False}
+    with pytest.raises(BridgeError, match="R2: sidebarBreakdown"):
+        worker.call("sidebar_breakdown", {})
 
 
 def test_color_escape_stripping_and_raw_preservation() -> None:
