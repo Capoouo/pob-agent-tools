@@ -39,13 +39,14 @@ MAXROLL_POB_RE = re.compile(r"^https?://maxroll\.gg/poe/pob/([A-Za-z0-9_-]+)", r
 
 def xml_to_share_code(xml_text: str) -> str:
     """Compress raw PoB XML string into a URL-safe Base64 PoB share code."""
-    compressed = zlib.compress(xml_text.encode("utf-8"), level=9)
+    clean_xml = xml_text.lstrip("\ufeff")
+    compressed = zlib.compress(clean_xml.encode("utf-8"), level=9)
     return base64.urlsafe_b64encode(compressed).decode("ascii")
 
 
 def share_code_to_xml(code: str) -> str:
     """Decompress a URL-safe Base64 PoB share code into raw PoB XML text."""
-    cleaned = code.strip().replace("-", "+").replace("_", "/")
+    cleaned = code.lstrip("\ufeff").strip().replace("-", "+").replace("_", "/")
     pad = (-len(cleaned)) % 4
     if pad:
         cleaned += "=" * pad
@@ -54,7 +55,7 @@ def share_code_to_xml(code: str) -> str:
         decompressed = zlib.decompress(raw_bytes)
     except zlib.error:
         decompressed = zlib.decompress(raw_bytes, -15)
-    return decompressed.decode("utf-8", errors="replace")
+    return decompressed.decode("utf-8-sig", errors="replace").lstrip("\ufeff")
 
 
 def _get_cache_dir() -> Path:
@@ -348,11 +349,17 @@ def load_build_into_worker(
     with worker.lock:
         import_method = "code"
         if xml_code:
-            res = worker.call("import_code", {"code": xml_code.strip(), "mode": "replace"})
+            clean_xml_code = xml_code.lstrip("\ufeff").strip()
+            if clean_xml_code.startswith("<"):
+                clean_xml_code = xml_to_share_code(clean_xml_code)
+            res = worker.call("import_code", {"code": clean_xml_code, "mode": "replace"})
             import_method = "xml_file"
         elif source:
-            src = source.strip()
-            if POE_NINJA_CHAR_RE.match(src):
+            src = source.lstrip("\ufeff").strip()
+            if src.startswith("<"):
+                res = worker.call("import_code", {"code": xml_to_share_code(src), "mode": "replace"})
+                import_method = "xml_file"
+            elif POE_NINJA_CHAR_RE.match(src):
                 code = fetch_poe_ninja_character_code(src)
                 res = worker.call("import_code", {"code": code, "mode": "replace"})
                 import_method = "poe_ninja_character"

@@ -175,7 +175,23 @@ def render_table(headers: list[str], rows: list[list[Any]]) -> str:
     return "\n".join([hdr_line, sep_line, *body_lines])
 
 
+def _sanitize_nonfinite_json(obj: Any) -> Any:
+    """Convert non-finite floats (NaN/Inf/-Inf) into RFC-8259 JSON-safe values."""
+    if isinstance(obj, float):
+        if math.isnan(obj):
+            return None
+        if math.isinf(obj):
+            return "inf" if obj > 0 else "-inf"
+        return obj
+    if isinstance(obj, list):
+        return [_sanitize_nonfinite_json(item) for item in obj]
+    if isinstance(obj, dict):
+        return {k: _sanitize_nonfinite_json(v) for k, v in obj.items()}
+    return obj
+
+
 def to_json_str(data: Any, *, sanitize: bool = True) -> str:
-    """Serialize output data to formatted JSON (optionally skipping PoB escape stripping for external APIs)."""
+    """Serialize output data to strict RFC-8259 JSON (no NaN/Infinity tokens)."""
     payload = sanitize_for_output(data) if sanitize else data
-    return json.dumps(payload, ensure_ascii=False, indent=2)
+    payload = _sanitize_nonfinite_json(payload)
+    return json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False)

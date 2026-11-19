@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from pob_cli.bridge_client import FORBIDDEN_METHODS, BridgeError, BridgeWorker
+from pob_cli.cli import _prepare_load_source
 from pob_cli.external_data import _strip_html, query_price
 from pob_cli.formatters import fmt_delta, sanitize_for_output, strip_pob_escapes, to_json_str
 from pob_cli.importers import POE_NINJA_CHAR_RE, share_code_to_xml, xml_to_share_code
@@ -84,6 +87,25 @@ def test_xml_share_code_roundtrip() -> None:
     code = xml_to_share_code(sample_xml)
     restored = share_code_to_xml(code)
     assert restored == sample_xml
+
+
+def test_utf8_bom_xml_file_routes_to_xml_not_base64(tmp_path: Path) -> None:
+    """Verify Windows UTF-8 BOM XML files and raw BOM strings decode cleanly as XML, not Base64."""
+    xml_body = '<?xml version="1.0" encoding="UTF-8"?>\n<PathOfBuilding><Build level="99" className="Scion"/></PathOfBuilding>'
+    bom_file = tmp_path / "bom_build.xml"
+    bom_file.write_bytes(b"\xef\xbb\xbf" + xml_body.encode("utf-8"))
+
+    src1, xml_code1 = _prepare_load_source(str(bom_file))
+    assert src1 is None and xml_code1 is not None
+    assert share_code_to_xml(xml_code1) == xml_body
+
+    src2, xml_code2 = _prepare_load_source(f"@{bom_file}")
+    assert src2 is None and xml_code2 is not None
+    assert share_code_to_xml(xml_code2) == xml_body
+
+    src3, xml_code3 = _prepare_load_source("\ufeff" + xml_body)
+    assert src3 is None and xml_code3 is not None
+    assert share_code_to_xml(xml_code3) == xml_body
 
 
 def test_poe_ninja_character_url_regex() -> None:

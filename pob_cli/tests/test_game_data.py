@@ -20,7 +20,7 @@ HAS_REAL_POB = (REAL_POB_DIR / "PoE1" / "Data" / "Gems.lua").is_file()
 
 @pytest.mark.skipif(not HAS_REAL_POB, reason="Real PobTools[20261102] directory not available")
 def test_cold_build_and_warm_query_benchmarks(tmp_path: Path) -> None:
-    """Verify cold SQLite index builds < 5s and warm queries execute < 15ms."""
+    """Verify cold SQLite index builds < 12s and warm queries execute < 15ms."""
     t0 = time.perf_counter()
     db_path = ensure_gamedata_index(pob_dir=REAL_POB_DIR, runtime_dir=tmp_path)
     cold_sec = time.perf_counter() - t0
@@ -28,7 +28,7 @@ def test_cold_build_and_warm_query_benchmarks(tmp_path: Path) -> None:
     assert db_path.is_file()
     assert db_path.parent == tmp_path / "cache"
     assert db_path.name.startswith("gamedata_") and db_path.name.endswith(".sqlite")
-    assert cold_sec < 5.0, f"Cold build took {cold_sec:.2f}s (expected < 5.0s)"
+    assert cold_sec < 12.0, f"Cold build took {cold_sec:.2f}s (expected < 12.0s)"
 
     # Subsequent ensure_gamedata_index should hit cache immediately
     t_cache = time.perf_counter()

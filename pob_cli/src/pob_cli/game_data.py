@@ -1666,11 +1666,16 @@ def ensure_gamedata_index(
 
     conn = sqlite3.connect(str(tmp_path))
     try:
+        conn.execute("PRAGMA page_size = 8192")
+        conn.execute("PRAGMA locking_mode = EXCLUSIVE")
         conn.execute("PRAGMA journal_mode = OFF")
         conn.execute("PRAGMA synchronous = OFF")
         conn.execute("PRAGMA temp_store = MEMORY")
         conn.execute("PRAGMA cache_size = -65536")
         _create_schema(conn)
+        conn.execute("PRAGMA journal_mode = OFF")
+        conn.execute("PRAGMA synchronous = OFF")
+        conn.execute("PRAGMA temp_store = MEMORY")
 
         conn.executemany(
             "INSERT INTO meta (key, value) VALUES (?, ?)",

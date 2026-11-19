@@ -29,6 +29,7 @@ POBTOOLS_DOWNLOAD_BASE = "https://github.com/Hsiung-Shao/PobTools-zh/releases/do
 POB_MANIFEST_URL = "https://raw.githubusercontent.com/PathOfBuildingCommunity/PathOfBuilding/master/manifest.xml"
 
 # Strict fast-fail budget for metadata checks (no retries on connect timeout)
+AUTO_CHECK_TIMEOUT = httpx.Timeout(connect=1.5, read=5.0, write=5.0, pool=1.5)
 CHECK_TIMEOUT = httpx.Timeout(connect=3.0, read=8.0, write=8.0, pool=3.0)
 ASSET_TIMEOUT = httpx.Timeout(connect=5.0, read=20.0, write=20.0, pool=5.0)
 ASSET_MAX_RETRIES = 1
@@ -1429,7 +1430,8 @@ def check_and_apply_updates(
         save_update_state(state, rt_dir)
         return state
 
-    # Concurrent fast-fail metadata checks (< 3s connect timeout, no retries)
+    # Concurrent fast-fail metadata checks (1.5s connect on auto-check, 3.0s on --force)
+    check_timeout = CHECK_TIMEOUT if force else AUTO_CHECK_TIMEOUT
     prev_etag = None if force else prev_state.get("pobManifestEtag")
     # Only send ETag if previous state was for the same local PoB version
     if prev_etag and prev_state.get("localPobVersion") != local_pob_ver:
@@ -1447,13 +1449,13 @@ def check_and_apply_updates(
             etag=prev_etag,
             proxy=proxy,
             mirror=mirror,
-            timeout=CHECK_TIMEOUT,
+            timeout=check_timeout,
         )
         fut_tools = pool.submit(
             fetch_pobtools_latest_info,
             proxy=proxy,
             mirror=mirror,
-            timeout=CHECK_TIMEOUT,
+            timeout=check_timeout,
             fetch_manifest=False,
         )
         try:
@@ -1500,7 +1502,7 @@ def check_and_apply_updates(
                     etag=None,
                     proxy=proxy,
                     mirror=mirror,
-                    timeout=CHECK_TIMEOUT,
+                    timeout=check_timeout,
                 )
             except Exception as exc:  # noqa: BLE001
                 err_msg = f"PoB manifest repair fetch: {type(exc).__name__}: {exc}"
@@ -1541,7 +1543,7 @@ def check_and_apply_updates(
             full_tools = fetch_pobtools_latest_info(
                 proxy=proxy,
                 mirror=mirror,
-                timeout=CHECK_TIMEOUT,
+                timeout=check_timeout,
                 fetch_manifest=True,
             )
             tools_info = full_tools

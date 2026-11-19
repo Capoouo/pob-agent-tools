@@ -597,3 +597,136 @@ def test_bridge_worker_dynamic_r2_and_import_code_deadlock_recovery(
         assert stats_after["count"] > 100
     finally:
         worker.stop()
+
+
+def test_daemon_hot_reload_serializes_concurrent_get_worker_and_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify DLL-unlock concurrency safety: get_worker/status/periodic check cannot touch workers mid-hot-reload."""
+    import threading
+    import pob_cli.daemon as daemon_mod
+
+    rt = tmp_path / "runtime"
+    eng = _make_fake_engine(rt / "engine", version="2.67.2")
+    monkeypatch.setenv("POB_RUNTIME_DIR", str(rt))
+
+    events: list[str] = []
+    reload_entered = threading.Event()
+    allow_reload_finish = threading.Event()
+    check_calls = 0
+
+    class _FakeWorker:
+        def __init__(self, slot_name: str = "main", pob_dir: Path | None = None) -> None:
+            self.slot_name = slot_name
+            self.pob_root = pob_dir or eng
+            self.alive = False
+            self.stopped = False
+            self.last_good_code: str | None = None
+            self.undo_stack: list[str] = []
+            self.redo_stack: list[str] = []
+            self.source_label: str | None = None
+            self.hello_info: dict[str, Any] = {"pobVersion": "2.67.2"}
+
+        def is_alive(self) -> bool:
+            return self.alive
+
+        def start(self) -> None:
+            if self.stopped:
+                raise AssertionError("Old stopped worker restarted during hot-reload!")
+            self.alive = True
+
+        def stop(self) -> None:
+            self.alive = False
+            self.stopped = True
+
+        def ensure_alive(self) -> None:
+            if self.stopped:
+                raise AssertionError("ensure_alive() called on stopped worker mid-hot-reload!")
+            self.alive = True
+
+        def update_checkpoint(self) -> str:
+            return "fake-code"
+
+        def call(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+            if self.stopped:
+                raise AssertionError(f"RPC {method} called on stopped worker!")
+            return {"level": 90}
+
+    monkeypatch.setattr(daemon_mod, "BridgeWorker", _FakeWorker)
+
+    def _fake_update(**kwargs: Any) -> dict[str, Any]:
+        nonlocal check_calls
+        check_calls += 1
+        if kwargs.get("check_only"):
+            return {"state": STATE_UP_TO_DATE, "updateAvailable": True, "checkedAt": time.time()}
+        events.append("reload_updating")
+        reload_entered.set()
+        assert allow_reload_finish.wait(timeout=5.0)
+        events.append("reload_done")
+        return {"state": STATE_UPDATED, "localPobVersion": "2.68.1", "checkedAt": time.time()}
+
+    monkeypatch.setattr(daemon_mod, "check_and_apply_updates", _fake_update)
+
+    mgr = daemon_mod.DaemonManager(pob_dir=eng, token="tok", runtime_dir=rt, offline=False)
+    mgr.main_worker.start()
+    old_worker = mgr.main_worker
+
+    # Trigger _hot_reload_update in thread 1
+    errs: list[BaseException] = []
+
+    def _run_reload() -> None:
+        try:
+            mgr._hot_reload_update()
+        except BaseException as exc:  # noqa: BLE001
+            errs.append(exc)
+
+    t_reload = threading.Thread(target=_run_reload)
+    t_reload.start()
+    assert reload_entered.wait(timeout=3.0)
+
+    # While old_worker is stopped and DLLs are unlocked, concurrent get_worker & status must block cleanly
+    def _run_get_worker() -> None:
+        try:
+            w = mgr.get_worker("main")
+            assert w is not old_worker
+            events.append("get_worker_after_reload")
+        except BaseException as exc:  # noqa: BLE001
+            errs.append(exc)
+
+    def _run_status() -> None:
+        try:
+            st = mgr.dispatch("status", {})
+            assert st["main"]["alive"] is True
+            events.append("status_after_reload")
+        except BaseException as exc:  # noqa: BLE001
+            errs.append(exc)
+
+    t_gw = threading.Thread(target=_run_get_worker)
+    t_st = threading.Thread(target=_run_status)
+    t_gw.start()
+    t_st.start()
+    time.sleep(0.1)
+
+    # Neither concurrent thread could proceed before reload_done
+    assert events == ["reload_updating"]
+    allow_reload_finish.set()
+
+    t_reload.join(timeout=3.0)
+    t_gw.join(timeout=3.0)
+    t_st.join(timeout=3.0)
+    assert not errs, f"Unexpected thread errors: {errs}"
+    assert events[0] == "reload_updating"
+    assert events[1] == "reload_done"
+    assert set(events[2:]) == {"get_worker_after_reload", "status_after_reload"}
+
+    # Double-checked _maybe_periodic_update_check: stale timestamp triggers check_only=True once across concurrent threads
+    mgr.update_status = {"state": STATE_UP_TO_DATE, "checkedAt": 0.0}
+    check_calls = 0
+    t_p1 = threading.Thread(target=mgr._maybe_periodic_update_check)
+    t_p2 = threading.Thread(target=mgr._maybe_periodic_update_check)
+    t_p1.start()
+    t_p2.start()
+    t_p1.join(timeout=3.0)
+    t_p2.join(timeout=3.0)
+    # 1 check_only + 1 _hot_reload_update (second thread sees fresh checkedAt after lock release)
+    assert check_calls == 2

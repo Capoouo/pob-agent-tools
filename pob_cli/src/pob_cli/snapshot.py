@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any, Callable
 
 from .bridge_client import BridgeWorker, MAX_UNDO_STEPS
-from .formatters import fmt_delta, fmt_num, strip_pob_escapes
+from .formatters import _parse_numeric_or_none, fmt_delta, fmt_num, strip_pob_escapes
 
 CORE_STAT_KEYS: list[tuple[str, str, str]] = [
     ("FullDPS", "Full DPS", ""),
@@ -49,6 +50,20 @@ CORE_STAT_KEYS: list[tuple[str, str, str]] = [
 ]
 
 
+def _stat_float(val: Any) -> float:
+    parsed = _parse_numeric_or_none(val)
+    return parsed if parsed is not None else 0.0
+
+
+def _json_safe_stat(val: Any) -> float | str:
+    parsed = _parse_numeric_or_none(val)
+    if parsed is None:
+        return 0.0
+    if math.isfinite(parsed):
+        return parsed
+    return fmt_num(parsed)
+
+
 def capture_digest(worker: BridgeWorker) -> dict[str, Any]:
     """Capture a complete offence/defence/warning digest of the current build."""
     with worker.lock:
@@ -66,9 +81,9 @@ def capture_digest(worker: BridgeWorker) -> dict[str, Any]:
 
     # Pick primary headline DPS metric
     primary_dps_key = "CombinedDPS"
-    if float(stats.get("FullDPS") or 0) > 0:
+    if _stat_float(stats.get("FullDPS")) > 0:
         primary_dps_key = "FullDPS"
-    elif float(stats.get("MinionCombinedDPS") or 0) > float(stats.get("CombinedDPS") or 0):
+    elif _stat_float(stats.get("MinionCombinedDPS")) > _stat_float(stats.get("CombinedDPS")):
         primary_dps_key = "MinionCombinedDPS"
 
     return {
@@ -77,9 +92,9 @@ def capture_digest(worker: BridgeWorker) -> dict[str, Any]:
         "buildInfo": info_res,
         "buildHeader": header_res,
         "primaryDpsKey": primary_dps_key,
-        "primaryDps": float(stats.get(primary_dps_key) or 0.0),
-        "totalEhp": float(stats.get("TotalEHP") or 0.0),
-        "life": float(stats.get("Life") or 0.0),
+        "primaryDps": _json_safe_stat(stats.get(primary_dps_key)),
+        "totalEhp": _json_safe_stat(stats.get("TotalEHP")),
+        "life": _json_safe_stat(stats.get("Life")),
     }
 
 
@@ -94,19 +109,46 @@ def diff_digest(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]
         a_val = a_stats.get(key)
         if b_val is None and a_val is None:
             continue
-        bf = float(b_val or 0.0)
-        af = float(a_val or 0.0)
-        if abs(af - bf) < 1e-4:
+
+        bf = _parse_numeric_or_none(b_val)
+        af = _parse_numeric_or_none(a_val)
+        if bf is None or af is None:
+            b_disp = fmt_num(b_val)
+            a_disp = fmt_num(a_val)
+            if b_disp == a_disp:
+                continue
+            rows.append(
+                {
+                    "stat": key,
+                    "label": label,
+                    "unit": unit,
+                    "before": b_disp,
+                    "after": a_disp,
+                    "delta": None,
+                    "pct": None,
+                    "beforeStr": f"{b_disp}{unit}",
+                    "afterStr": f"{a_disp}{unit}",
+                    "deltaStr": fmt_delta(b_val, a_val, unit),
+                }
+            )
             continue
-        pct = ((af - bf) / abs(bf) * 100.0) if abs(bf) > 1e-6 else None
+
+        if (math.isnan(bf) and math.isnan(af)) or bf == af:
+            continue
+        both_finite = math.isfinite(bf) and math.isfinite(af)
+        if both_finite and abs(af - bf) < 1e-4:
+            continue
+
+        delta_val: float | None = (af - bf) if both_finite else None
+        pct = ((af - bf) / abs(bf) * 100.0) if (both_finite and abs(bf) > 1e-6) else None
         rows.append(
             {
                 "stat": key,
                 "label": label,
                 "unit": unit,
-                "before": bf,
-                "after": af,
-                "delta": af - bf,
+                "before": bf if math.isfinite(bf) else fmt_num(bf),
+                "after": af if math.isfinite(af) else fmt_num(af),
+                "delta": delta_val,
                 "pct": pct,
                 "beforeStr": f"{fmt_num(bf)}{unit}",
                 "afterStr": f"{fmt_num(af)}{unit}",

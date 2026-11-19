@@ -162,31 +162,33 @@ class DaemonManager:
 
     def start(self) -> None:
         """Check/apply updates before launching any pob-zh.exe worker, then start main_worker."""
-        if not self.skip_update_check:
-            self.update_status = check_and_apply_updates(
-                engine_dir=self._explicit_pob_dir,
-                runtime_dir=self.runtime_dir,
-                offline=self.offline,
-                proxy=self.proxy,
-                mirror=self.mirror,
-            )
+        with self._lock:
+            if not self.skip_update_check:
+                self.update_status = check_and_apply_updates(
+                    engine_dir=self._explicit_pob_dir,
+                    runtime_dir=self.runtime_dir,
+                    offline=self.offline,
+                    proxy=self.proxy,
+                    mirror=self.mirror,
+                )
 
-        if self._explicit_pob_dir is None:
-            self.pob_dir = resolve_engine_root(runtime_dir=self.runtime_dir)
+            if self._explicit_pob_dir is None:
+                self.pob_dir = resolve_engine_root(runtime_dir=self.runtime_dir)
 
-        if self.update_status.get("state") == STATE_BOOTSTRAP_MISSING and not is_valid_engine_dir(self.pob_dir):
-            hint = get_update_warning(self.update_status) or (
-                f"No usable PoB engine found at {self.pob_dir}. "
-                "Configure HTTPS_PROXY / POB_PROXY and run `pob bootstrap`, or use `pob bootstrap --from-dir <path>`."
-            )
-            raise BootstrapMissingError(hint, update_status=self.update_status)
+            if self.update_status.get("state") == STATE_BOOTSTRAP_MISSING and not is_valid_engine_dir(self.pob_dir):
+                hint = get_update_warning(self.update_status) or (
+                    f"No usable PoB engine found at {self.pob_dir}. "
+                    "Configure HTTPS_PROXY / POB_PROXY and run `pob bootstrap`, or use `pob bootstrap --from-dir <path>`."
+                )
+                raise BootstrapMissingError(hint, update_status=self.update_status)
 
-        if self.main_worker.pob_root != self.pob_dir:
-            self.main_worker = BridgeWorker(slot_name="main", pob_dir=self.pob_dir)
-        self.main_worker.start()
+            if self.main_worker.pob_root != self.pob_dir:
+                self.main_worker = BridgeWorker(slot_name="main", pob_dir=self.pob_dir)
+            self.main_worker.start()
 
     def _current_update_warning(self) -> str | None:
-        return get_update_warning(self.update_status)
+        with self._lock:
+            return get_update_warning(self.update_status)
 
     def _attach_warning_if_degraded(self, payload: dict[str, Any]) -> dict[str, Any]:
         warn = self._current_update_warning()
@@ -296,28 +298,32 @@ class DaemonManager:
         if (time.time() - checked_at) <= UPDATE_RECHECK_INTERVAL_SEC:
             return
 
-        probe_state = check_and_apply_updates(
-            engine_dir=self._explicit_pob_dir,
-            runtime_dir=self.runtime_dir,
-            proxy=self.proxy,
-            mirror=self.mirror,
-            offline=False,
-            check_only=True,
-        )
-        self.update_status = probe_state
-        if probe_state.get("updateAvailable"):
-            self._hot_reload_update(proxy=self.proxy, mirror=self.mirror, force=False, offline=False)
+        with self._lock:
+            checked_at = float(self.update_status.get("checkedAt") or 0.0)
+            if (time.time() - checked_at) <= UPDATE_RECHECK_INTERVAL_SEC:
+                return
+            probe_state = check_and_apply_updates(
+                engine_dir=self._explicit_pob_dir,
+                runtime_dir=self.runtime_dir,
+                proxy=self.proxy,
+                mirror=self.mirror,
+                offline=False,
+                check_only=True,
+            )
+            self.update_status = probe_state
+            if probe_state.get("updateAvailable"):
+                self._hot_reload_update(proxy=self.proxy, mirror=self.mirror, force=False, offline=False)
 
     def get_worker(self, target: str = "main") -> BridgeWorker:
-        self.last_active_ts = time.time()
-        if target == "ref":
-            with self._lock:
+        with self._lock:
+            self.last_active_ts = time.time()
+            if target == "ref":
                 if self.ref_worker is None:
                     self.ref_worker = BridgeWorker(slot_name="ref", pob_dir=self.pob_dir)
                 self.ref_worker.ensure_alive()
                 return self.ref_worker
-        self.main_worker.ensure_alive()
-        return self.main_worker
+            self.main_worker.ensure_alive()
+            return self.main_worker
 
     def check_idle(self) -> bool:
         """Recycle `ref` if idle > 5m; return True if global daemon should shut down (> 30m idle)."""
@@ -363,6 +369,31 @@ class DaemonManager:
         self.last_active_ts = time.time()
         target = str(params.get("target") or "main").lower()
 
+        if action == "stop":
+            self.shutdown_all()
+            return {"stopped": True}
+
+        if action == "game_data":
+            with self._lock:
+                pob_dir = self.pob_dir
+                rt_dir = self.runtime_dir
+            if params.get("rebuild"):
+                ensure_gamedata_index(pob_dir=pob_dir, runtime_dir=rt_dir, force_rebuild=True)
+            return query_local_data(
+                kind=str(params.get("kind") or ""),
+                query=str(params.get("query") or ""),
+                pob_dir=pob_dir,
+                runtime_dir=rt_dir,
+                slot=params.get("slot"),
+                ilvl=int(params["ilvl"]) if params.get("ilvl") is not None else None,
+                limit=int(params.get("limit") or 25),
+            )
+
+        with self._lock:
+            return self._dispatch_locked(action, params, target)
+
+    def _dispatch_locked(self, action: str, params: dict[str, Any], target: str) -> dict[str, Any]:
+        """Execute worker/state-mutating RPC actions under `self._lock` to prevent hot-reload DLL races."""
         if action == "status":
             self._maybe_periodic_update_check()
             main_alive = self.main_worker.is_alive()
@@ -384,7 +415,7 @@ class DaemonManager:
                 "uptimeSec": round(time.time() - self.started_at, 1),
                 "idleSec": round(time.time() - self.last_active_ts, 1),
                 "engineDir": str(self.pob_dir),
-                "updateStatus": self.update_status,
+                "updateStatus": dict(self.update_status),
                 "main": {
                     "alive": main_alive,
                     "hello": self.main_worker.hello_info,
@@ -425,10 +456,6 @@ class DaemonManager:
                 offline=False,
             )
             return self._attach_warning_if_degraded(dict(updated))
-
-        if action == "stop":
-            self.shutdown_all()
-            return {"stopped": True}
 
         if action == "load":
             self._maybe_periodic_update_check()
@@ -654,19 +681,6 @@ class DaemonManager:
             return run_matrix(
                 self.get_worker(target),
                 scenarios=params.get("scenarios"),
-            )
-
-        if action == "game_data":
-            if params.get("rebuild"):
-                ensure_gamedata_index(pob_dir=self.pob_dir, runtime_dir=self.runtime_dir, force_rebuild=True)
-            return query_local_data(
-                kind=str(params.get("kind") or ""),
-                query=str(params.get("query") or ""),
-                pob_dir=self.pob_dir,
-                runtime_dir=self.runtime_dir,
-                slot=params.get("slot"),
-                ilvl=int(params["ilvl"]) if params.get("ilvl") is not None else None,
-                limit=int(params.get("limit") or 25),
             )
 
         if action == "rank_nodes":
@@ -964,19 +978,19 @@ def call_daemon(
 
         # Wait up to 25 seconds for daemon.json to appear and respond (fast-failing on boot_error)
         deadline = time.monotonic() + 25.0
-        while time.monotonic() < deadline:
-            boot_err = _read_boot_error(rt_dir)
-            if boot_err is not None:
-                err_msg = str(boot_err.get("error") or "PoB daemon failed to start.")
-                if boot_err.get("state") == STATE_BOOTSTRAP_MISSING:
-                    raise BootstrapMissingError(err_msg, update_status=boot_err.get("updateStatus"))
-                raise RuntimeError(err_msg)
+        with httpx.Client(timeout=5.0, trust_env=False) as ping_client:
+            while time.monotonic() < deadline:
+                boot_err = _read_boot_error(rt_dir)
+                if boot_err is not None:
+                    err_msg = str(boot_err.get("error") or "PoB daemon failed to start.")
+                    if boot_err.get("state") == STATE_BOOTSTRAP_MISSING:
+                        raise BootstrapMissingError(err_msg, update_status=boot_err.get("updateStatus"))
+                    raise RuntimeError(err_msg)
 
-            st = read_daemon_state(rt_dir)
-            if st is not None:
-                try:
-                    with httpx.Client(timeout=5.0, trust_env=False) as client:
-                        ping = client.post(
+                st = read_daemon_state(rt_dir)
+                if st is not None:
+                    try:
+                        ping = ping_client.post(
                             f"http://127.0.0.1:{st['port']}/rpc",
                             headers={"X-PoB-Token": st["token"]},
                             json={"action": "status", "params": {}},
@@ -986,23 +1000,23 @@ def call_daemon(
                             if ping_json.get("ok"):
                                 ping_status_result = ping_json["result"]
                                 break
-                except Exception:
-                    pass
+                    except Exception:
+                        pass
 
-            if spawned_proc is not None and spawned_proc.poll() is not None:
-                boot_err = _read_boot_error(rt_dir)
-                if boot_err is not None:
-                    err_msg = str(boot_err.get("error") or "PoB daemon exited during startup.")
-                    if boot_err.get("state") == STATE_BOOTSTRAP_MISSING:
-                        raise BootstrapMissingError(err_msg, update_status=boot_err.get("updateStatus"))
-                    raise RuntimeError(err_msg)
-                raise RuntimeError(
-                    f"PoB daemon exited immediately with code {spawned_proc.returncode}. Check {log_path}."
-                )
+                if spawned_proc is not None and spawned_proc.poll() is not None:
+                    boot_err = _read_boot_error(rt_dir)
+                    if boot_err is not None:
+                        err_msg = str(boot_err.get("error") or "PoB daemon exited during startup.")
+                        if boot_err.get("state") == STATE_BOOTSTRAP_MISSING:
+                            raise BootstrapMissingError(err_msg, update_status=boot_err.get("updateStatus"))
+                        raise RuntimeError(err_msg)
+                    raise RuntimeError(
+                        f"PoB daemon exited immediately with code {spawned_proc.returncode}. Check {log_path}."
+                    )
 
-            time.sleep(0.1)
-        else:
-            raise RuntimeError(f"Timed out waiting for PoB daemon to start. Check {log_path}.")
+                time.sleep(0.05)
+            else:
+                raise RuntimeError(f"Timed out waiting for PoB daemon to start. Check {log_path}.")
     finally:
         if acquired_lock:
             try:

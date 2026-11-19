@@ -368,8 +368,8 @@ def _prepare_load_source(source: str) -> tuple[str | None, str | None]:
 
     Returns `(source_str, xml_code_str)`.
     """
-    raw = source.strip()
-    candidate_path = raw[1:].strip() if raw.startswith("@") else raw
+    raw = source.lstrip("\ufeff").strip()
+    candidate_path = raw[1:].lstrip("\ufeff").strip() if raw.startswith("@") else raw
     is_local_file = False
     if len(candidate_path) <= 260 and not candidate_path.startswith(("http://", "https://")):
         try:
@@ -379,10 +379,13 @@ def _prepare_load_source(source: str) -> tuple[str | None, str | None]:
             is_local_file = False
 
     if is_local_file:
-        text = Path(candidate_path).read_text(encoding="utf-8", errors="replace").strip()
+        text = Path(candidate_path).read_text(encoding="utf-8-sig", errors="replace").lstrip("\ufeff").strip()
         if text.lstrip().startswith("<"):
             return None, xml_to_share_code(text)
         return text, None
+
+    if raw.lstrip().startswith("<"):
+        return None, xml_to_share_code(raw)
 
     return raw, None
 
@@ -930,7 +933,7 @@ def cmd_item_try(
 ) -> None:
     """Evaluate or equip a raw PoE item with native tooltip comparison + full snapshot diff."""
     if file_path:
-        raw_text = Path(file_path).read_text(encoding="utf-8", errors="replace")
+        raw_text = Path(file_path).read_text(encoding="utf-8-sig", errors="replace").lstrip("\ufeff")
     if not raw_text:
         raise click.UsageError("Provide either --raw \"<item_text>\" or --file <item.txt>.")
 
@@ -1457,7 +1460,7 @@ def cmd_batch(
 ) -> None:
     """Execute multiple item/skill/tree/config mutations in a single snapshot transaction."""
     if file_path:
-        raw = Path(file_path).read_text(encoding="utf-8", errors="replace")
+        raw = Path(file_path).read_text(encoding="utf-8-sig", errors="replace").lstrip("\ufeff")
     elif json_ops:
         raw = json_ops
     else:

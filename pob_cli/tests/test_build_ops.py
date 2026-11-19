@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from pob_cli.formatters import (
     fmt_num,
     render_update_warning,
     sanitize_for_output,
+    to_json_str,
 )
 from pob_cli.mutators import (
     _edit_raw_item_mods,
@@ -24,7 +26,7 @@ from pob_cli.mutators import (
     search_and_try_item_db,
     set_class_ascendancy,
 )
-from pob_cli.snapshot import undo_build
+from pob_cli.snapshot import diff_digest, undo_build
 
 POB_DIR = Path("F:/poe/PobTools[20261102]")
 
@@ -61,6 +63,65 @@ def test_formatters_inf_nan_and_sentinels() -> None:
     assert fmt_delta("N/A", "N/A") == "0"
     assert fmt_delta("N/A", "100") == "N/A -> 100"
     assert fmt_delta(100, 150, "%") == "+50% (+50.0%)"
+
+
+def test_diff_digest_ci_inf_nan_rfc8259_json() -> None:
+    """Verify diff_digest + to_json_str handles PoB 'inf'/'-inf'/'nan' stats with valid RFC-8259 JSON."""
+    before = {
+        "stats": {
+            "CombinedDPS": 100000.0,
+            "TotalEHP": "inf",
+            "ChaosMaximumHitTaken": "inf",
+            "PhysicalMaximumHitTaken": 15000.0,
+            "Ward": "nan",
+            "Life": 1.0,
+        },
+        "warnings": [],
+        "buildInfo": {"points": {"used": 100}},
+    }
+    after = {
+        "stats": {
+            "CombinedDPS": 120000.0,
+            "TotalEHP": "inf",           # unchanged 'inf' must be skipped!
+            "ChaosMaximumHitTaken": 12000.0,  # 'inf' -> finite must emit None delta/pct
+            "PhysicalMaximumHitTaken": "inf",  # finite -> 'inf' must emit None delta/pct
+            "Ward": math.nan,            # both NaN must be skipped!
+            "Life": 1.0,
+        },
+        "warnings": [],
+        "buildInfo": {"points": {"used": 100}},
+    }
+    diff = diff_digest(before, after)
+    by_stat = {d["stat"]: d for d in diff["deltas"]}
+
+    assert "TotalEHP" not in by_stat
+    assert "Ward" not in by_stat
+    assert "Life" not in by_stat
+
+    assert by_stat["CombinedDPS"]["delta"] == pytest.approx(20000.0)
+    assert by_stat["CombinedDPS"]["pct"] == pytest.approx(20.0)
+
+    assert by_stat["ChaosMaximumHitTaken"]["before"] == "inf"
+    assert by_stat["ChaosMaximumHitTaken"]["after"] == 12000.0
+    assert by_stat["ChaosMaximumHitTaken"]["delta"] is None
+    assert by_stat["ChaosMaximumHitTaken"]["pct"] is None
+    assert by_stat["ChaosMaximumHitTaken"]["deltaStr"] == "inf -> 12,000"
+
+    assert by_stat["PhysicalMaximumHitTaken"]["before"] == 15000.0
+    assert by_stat["PhysicalMaximumHitTaken"]["after"] == "inf"
+    assert by_stat["PhysicalMaximumHitTaken"]["delta"] is None
+    assert by_stat["PhysicalMaximumHitTaken"]["pct"] is None
+    assert by_stat["PhysicalMaximumHitTaken"]["deltaStr"] == "15,000 -> inf"
+
+    json_text = to_json_str(diff)
+    assert "NaN" not in json_text
+    assert "Infinity" not in json_text
+
+    def _reject_nonfinite(tok: str) -> None:
+        raise ValueError(f"Non-RFC-8259 JSON token: {tok}")
+
+    parsed = json.loads(json_text, parse_constant=_reject_nonfinite)
+    assert len(parsed["deltas"]) == 3
 
 
 def test_render_update_warning_and_raw_preserve_keys() -> None:
