@@ -57,6 +57,10 @@ pob trade search --slot S [--stat "text|中文=min"]... [--want T]... [--budget 
 pob trade convert (--text T | --file f) --to fire|cold|lightning [--out f] [--json]    # Harvest 3.30 swap preview (same tier, rerolled)
 pob bench list --slot S [--search "<text|中文>"] [--affix prefix|suffix] [--limit 25] [--json]
 pob bench suggest --slot S --stat "<text|中文>" [--affix prefix|suffix] [--limit 5] [--json]
+
+# Timeless Jewel Seed Search (every reported row is a real headless PoB calculation, run on parallel throwaway engines)
+pob timeless list [--target main|ref] [--json]                                         # 11 jewel types (EN + local name) and the build's allocated sockets
+pob timeless search --jewel "<name|本地名>" --socket <nodeId> [--conqueror C] [--mod "<line>"]... [--stat CombinedDPS|TotalEHP|Life|...] [--top 15] [--workers N] [--idle] [--exact] [--json]  # samples + estimates which seeds can reach the top, then calculates those; --exact calculates all
 ```
 
 ## 2. Architecture, Env & Paths
@@ -64,7 +68,7 @@ pob bench suggest --slot S --stat "<text|中文>" [--affix prefix|suffix] [--lim
 - Engine lookup (`updater.resolve_engine_root`): `POB_ROOT` -> `<POB_RUNTIME_DIR>/engine` (source checkout default `F:/poe/.runtime/engine`; installed/frozen default `%LOCALAPPDATA%/pob-agent-tools/engine`) -> read-only legacy seed `F:/poe/PobTools[20261102]` (never mutate legacy dir; PowerShell always `-LiteralPath` for `[20261102]`; `cwd` must be `PoE1`).
 - Packaging & release: `pob_cli/__init__.py` (`__version__`) is single source of truth; frozen `pob.exe` spawns background daemon via hidden `pob _daemon`; `.github/workflows/{ci,release}.yml` build Windows x64 `--onedir` zip + wheel/sdist + `SHA256SUMS.txt`, publish GitHub Release on `v*` tags, and auto-update in-repo Scoop bucket `bucket/pob.json`; `install.ps1` provides 1-line Windows install/upgrade.
 - Env vars: `POB_ROOT`, `POB_RUNTIME_DIR`, `POB_PROXY` / `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY`, `POB_GITHUB_MIRROR`, `POB_OFFLINE=1`, `POB_LEGACY_DIR`, `POESESSID` / `POE_COOKIE` (trade env-only).
-- Modules (`pob_cli/src/pob_cli/`): `updater.py`, `bridge_client.py`, `daemon.py`, `importers.py`, `snapshot.py`, `analyzer.py`, `mutators.py`, `comparator.py`, `game_data.py`, `external_data.py`, `poedb_client.py`, `trade_item.py`, `trade_client.py`, `trade_query.py`, `trade_eval.py`, `bench.py`, `cli_trade.py`, `formatters.py`, `cli.py`; bundled data `data/bench_costs.json` (ModMaster.lua authoritative primary + clean offline fallback).
+- Modules (`pob_cli/src/pob_cli/`): `updater.py`, `bridge_client.py`, `daemon.py`, `importers.py`, `snapshot.py`, `analyzer.py`, `mutators.py`, `comparator.py`, `game_data.py`, `external_data.py`, `poedb_client.py`, `trade_item.py`, `trade_client.py`, `trade_query.py`, `trade_eval.py`, `bench.py`, `cli_trade.py`, `timeless.py`, `cli_timeless.py`, `formatters.py`, `cli.py`; bundled data `data/bench_costs.json` (ModMaster.lua authoritative primary + clean offline fallback).
 - Runtime state (`<POB_RUNTIME_DIR>/`): `daemon.json` (`pid`, `port`, `token`), `update_state.json`, `slot_{main,ref}.json`, `cache/gamedata_<pobVer>_<dataVer>.sqlite`, `cache/ninja_*.json`, `cache/poedb_*.json`, `cache/trade_ratelimit.json`, `cache/trade_stats*.json`.
 
 ## 3. Hard Constraints (`R1`..`R13`)

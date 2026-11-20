@@ -13,6 +13,7 @@ from typing import Any
 import click
 
 from . import __version__
+from .cli_timeless import timeless_group
 from .cli_trade import bench_group, trade_group
 from .daemon import (
     BootstrapMissingError,
@@ -168,6 +169,7 @@ def main(offline: bool) -> None:
 
 main.add_command(trade_group)
 main.add_command(bench_group)
+main.add_command(timeless_group)
 
 
 @main.command("_daemon", hidden=True)

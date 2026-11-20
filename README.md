@@ -23,6 +23,7 @@ High-signal CLI, managed dual-upstream headless engine, offline Lua game-data SQ
 - **Official PoE1 Trade & Crafting Bench (`pob trade` / `pob bench`)**:
   - Read-only official trade search with 0ms offline local `TradeSiteStats.lua` resolution (bilingual EN/ZH + slot-aware `(Local)` routing), GGG dynamic `X-Rate-Limit-*` persistence, 3.30 instant buyout (`--status available`) & `chaos_equiv` pricing, Harvest same-tier conversion (`--allow-conversion` with same-group conflict guards), and single-snapshot batch headless PoB DPS/EHP verification (`trade_eval_items`). See [docs/TRADE.md](docs/TRADE.md).
   - Dual-source crafting bench lookup (`pob bench list|suggest`) driven by auto-updating `ModMaster.lua` (0 unknown affixes) with a compact offline cost/unlock overlay and ready-to-verify `{crafted}` lines.
+- **Timeless Jewel Seed Search (`pob timeless list|search`)**: Finds the best seeds of any of PoB's 11 timeless jewels at a socket, with every reported number calculated by headless PoB (no hand-set weights). Seeds whose lookup-table bytes match on the notables the build uses are calculated once; for large searches a few hundred groups are calculated, the value of each single node change is fitted from them, and only the seeds that estimate says can reach the top are calculated (`--exact` calculates everything). Work is spread over parallel throwaway engines (`--workers`, ~1.3 GB RAM each). Jewel definitions are read from PoB's own `Data/Uniques/jewel.lua`; names are accepted in English or in the language your PoB displays.
 
 ---
 
@@ -131,6 +132,10 @@ pob trade stats "攻击速度" --slot weapon1
 pob trade search --slot gloves --budget 20 --stat "冰霜抗性=40" --want "Attack Speed" --allow-conversion --pob auto
 pob trade search --slot gloves --budget 10 --stat "最大生命=60" --open-suffix --pob auto
 pob bench suggest --slot gloves --stat "冰霜抗性"
+
+# 7. Timeless jewel seed search (replaces whatever is in that socket; ranks real PoB results)
+pob timeless list
+pob timeless search --jewel "Lethal Pride" --socket 61419 --stat CombinedDPS --idle
 ```
 
 Pass `--json` to any command for structured, color-stripped JSON output. Pass `--offline` before a subcommand (or set `POB_OFFLINE=1`) to skip GitHub update checks. See [AGENTS.md](AGENTS.md) for the compact agent cheat-sheet.

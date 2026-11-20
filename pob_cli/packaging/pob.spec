@@ -15,6 +15,7 @@ hiddenimports = [
     "socksio",
     "pob_cli.daemon",
     "pob_cli.cli_trade",
+    "pob_cli.cli_timeless",
 ]
 
 a = Analysis(
