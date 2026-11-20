@@ -228,6 +228,8 @@ def test_parse_matrix_scenario_formats() -> None:
 @pytest.fixture(scope="module")
 def pob_worker():
     """Boot one isolated headless pob-zh.exe worker for build-ops integration tests (never touches .runtime/)."""
+    if not (POB_DIR / "pob-zh.exe").is_file():
+        pytest.skip(f"Local PobTools engine not available at {POB_DIR}")
     worker = BridgeWorker(slot_name="test", pob_dir=POB_DIR)
     worker.start()
 

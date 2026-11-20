@@ -56,6 +56,7 @@ from .updater import (
     STATE_BOOTSTRAP_MISSING,
     check_and_apply_updates,
     format_stderr_update_alert,
+    get_runtime_dir,
     get_update_warning,
     is_valid_engine_dir,
     load_update_state,
@@ -80,12 +81,18 @@ class BootstrapMissingError(RuntimeError):
 
 
 def _get_runtime_dir(runtime_dir: Path | None = None) -> Path:
+    return get_runtime_dir(runtime_dir)
+
+
+def _build_daemon_spawn_cmd(runtime_dir: Path | None = None) -> list[str]:
+    """Build the command line to spawn the background daemon (supports Python and frozen exe)."""
+    if getattr(sys, "frozen", False):
+        cmd = [sys.executable, "_daemon"]
+    else:
+        cmd = [sys.executable, "-m", "pob_cli.daemon"]
     if runtime_dir is not None:
-        return Path(runtime_dir)
-    env_rt = os.environ.get("POB_RUNTIME_DIR", "").strip()
-    if env_rt:
-        return Path(env_rt)
-    return RUNTIME_DIR
+        cmd.extend(["--runtime-dir", str(runtime_dir)])
+    return cmd
 
 
 def _daemon_state_file(runtime_dir: Path | None = None) -> Path:
@@ -962,14 +969,12 @@ def call_daemon(
                     | subprocess.CREATE_NO_WINDOW
                 )
 
-            cmd = [sys.executable, "-m", "pob_cli.daemon"]
-            if runtime_dir is not None:
-                cmd.extend(["--runtime-dir", str(rt_dir)])
+            cmd = _build_daemon_spawn_cmd(rt_dir if runtime_dir is not None else None)
 
             with open(log_path, "a", encoding="utf-8") as log_fh:
                 spawned_proc = subprocess.Popen(
                     cmd,
-                    cwd=str(DEFAULT_PROJECT_ROOT),
+                    cwd=str(rt_dir),
                     stdout=log_fh,
                     stderr=log_fh,
                     stdin=subprocess.DEVNULL,

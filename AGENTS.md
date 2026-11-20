@@ -52,7 +52,8 @@ pob wiki "<topic>" [--json]                                                     
 
 ## 2. Architecture, Env & Paths
 
-- Engine lookup (`updater.resolve_engine_root`): `POB_ROOT` -> `<POB_RUNTIME_DIR>/engine` (default `F:/poe/.runtime/engine`) -> read-only legacy seed `F:/poe/PobTools[20261102]` (never mutate legacy dir; PowerShell always `-LiteralPath` for `[20261102]`; `cwd` must be `PoE1`).
+- Engine lookup (`updater.resolve_engine_root`): `POB_ROOT` -> `<POB_RUNTIME_DIR>/engine` (source checkout default `F:/poe/.runtime/engine`; installed/frozen default `%LOCALAPPDATA%/pob-agent-tools/engine`) -> read-only legacy seed `F:/poe/PobTools[20261102]` (never mutate legacy dir; PowerShell always `-LiteralPath` for `[20261102]`; `cwd` must be `PoE1`).
+- Packaging & release: `pob_cli/__init__.py` (`__version__`) is single source of truth; frozen `pob.exe` spawns background daemon via hidden `pob _daemon`; `.github/workflows/{ci,release}.yml` build Windows x64 `--onedir` zip + wheel/sdist + `SHA256SUMS.txt`, publish GitHub Release on `v*` tags, and auto-update in-repo Scoop bucket `bucket/pob.json`; `install.ps1` provides 1-line Windows install/upgrade.
 - Env vars: `POB_ROOT`, `POB_RUNTIME_DIR`, `POB_PROXY` / `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY`, `POB_GITHUB_MIRROR`, `POB_OFFLINE=1`, `POB_LEGACY_DIR`.
 - Modules (`pob_cli/src/pob_cli/`): `updater.py`, `bridge_client.py`, `daemon.py`, `importers.py`, `snapshot.py`, `analyzer.py`, `mutators.py`, `comparator.py`, `game_data.py`, `external_data.py`, `poedb_client.py`, `formatters.py`, `cli.py`.
 - Runtime state (`<POB_RUNTIME_DIR>/`): `daemon.json` (`pid`, `port`, `token`), `update_state.json`, `slot_{main,ref}.json`, `cache/gamedata_<pobVer>_<dataVer>.sqlite`, `cache/ninja_*.json`, `cache/poedb_*.json`.

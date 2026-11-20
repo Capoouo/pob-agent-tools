@@ -14,9 +14,11 @@ from typing import Any
 
 import httpx
 
-from .bridge_client import RUNTIME_DIR, BridgeError, BridgeWorker
+from . import __version__
+from .bridge_client import BridgeError, BridgeWorker
+from .updater import get_runtime_dir
 
-USER_AGENT = "pob-cli/0.2.0 (+https://github.com/PathOfBuildingCommunity/PathOfBuilding)"
+USER_AGENT = f"pob-cli/{__version__} (+https://github.com/exilemoulei/pob-agent-tools)"
 
 POE_NINJA_CHAR_RE = re.compile(
     r"^https?://poe\.ninja/poe1/builds/(?P<league>[^/?#]+)/character/(?P<account>[^/?#]+)/(?P<name>[^/?#]+)",
@@ -59,9 +61,7 @@ def share_code_to_xml(code: str) -> str:
 
 
 def _get_cache_dir() -> Path:
-    env_runtime = os.environ.get("POB_RUNTIME_DIR")
-    base_dir = Path(env_runtime) if env_runtime else RUNTIME_DIR
-    cache_dir = base_dir / "cache"
+    cache_dir = get_runtime_dir() / "cache"
     try:
         cache_dir.mkdir(parents=True, exist_ok=True)
         return cache_dir

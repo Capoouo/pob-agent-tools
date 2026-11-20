@@ -15,12 +15,16 @@ import zlib
 from pathlib import Path
 from typing import Any
 
-from .updater import resolve_engine_root
+from .updater import detect_source_checkout_root, get_runtime_dir, resolve_engine_root
 
-DEFAULT_PROJECT_ROOT = Path(os.environ.get("POB_HOME", str(Path(__file__).resolve().parents[3])))
+DEFAULT_PROJECT_ROOT = (
+    Path(os.environ["POB_HOME"].strip())
+    if os.environ.get("POB_HOME", "").strip()
+    else (detect_source_checkout_root() or get_runtime_dir())
+)
 DEFAULT_POB_ROOT = resolve_engine_root()
 DEFAULT_POB_DIR = DEFAULT_POB_ROOT
-RUNTIME_DIR = Path(os.environ.get("POB_RUNTIME_DIR", str(DEFAULT_PROJECT_ROOT / ".runtime")))
+RUNTIME_DIR = get_runtime_dir()
 MAX_UNDO_STEPS = 30
 
 # Hardcoded red-line RPC blocklist (R1, R3, R4, R7, R11; R2 sidebar_breakdown is checked dynamically via caps)
@@ -268,9 +272,7 @@ class BridgeWorker:
 
     @property
     def slot_state_path(self) -> Path:
-        env_rt = os.environ.get("POB_RUNTIME_DIR", "").strip()
-        rt = Path(env_rt) if env_rt else RUNTIME_DIR
-        return rt / f"slot_{self.slot_name}.json"
+        return get_runtime_dir() / f"slot_{self.slot_name}.json"
 
     def save_slot_state(self) -> None:
         """Persist slot build code and undo/redo stacks so daemon restarts never lose state."""

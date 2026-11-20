@@ -10,7 +10,7 @@ High-signal CLI, managed dual-upstream headless engine, offline Lua game-data SQ
 ## Key Features (v0.2)
 
 - **Managed Dual-Upstream Engine & Auto-Update (`pob bootstrap` / `pob update`)**:
-  - Automatically resolves `POB_ROOT` -> `<POB_RUNTIME_DIR>/engine` -> read-only legacy seed (`F:/poe/PobTools[20261102]`).
+  - Automatically resolves `POB_ROOT` -> `<POB_RUNTIME_DIR>/engine` (defaults to `%LOCALAPPDATA%\pob-agent-tools\engine` when installed, or `<repo>/.runtime/engine` in a source checkout).
   - Checks upstream on daemon startup (and every 30m with zero-loss slot hot-reload) via `PobTools-zh` `302` release tags (never `api.github.com`) + official PoB `manifest.xml` SHA1 incremental diff with `gate_result` smoke probe & `.bak/` rollback.
   - Fast-fails (`connect=3s`) when GitHub is unreachable, degrades cleanly to local engine, and emits dual-channel alerts (`stderr` + JSON `updateWarning` / Markdown `> [WARN]`).
 - **Zero-Residue `what-if` Simulation & 30-Step Undo/Redo**: Every mutation (`item try/edit/db/flask/anoint`, `skill set/add/rm`, `tree change/set-class`, `config set [--append-mods]`, `batch`, `borrow`) runs inside an in-memory `export_code`/`import_code` transaction and rolls back unless `--apply` is passed.
@@ -23,25 +23,70 @@ High-signal CLI, managed dual-upstream headless engine, offline Lua game-data SQ
 
 ---
 
-## Installation & Environment
+## Installation (Windows x64)
 
-Requires **Python 3.11+** (Windows x64 for headless `pob-zh.exe`).
+No Python installation is required for the standalone Windows binary.
 
-```bash
-pip install -e ./pob_cli
+### Option 1: One-Click PowerShell Installer (Recommended, No Python Needed)
 
-# Optional: bootstrap a fresh managed engine (supports proxy, mirror, or offline directory)
-pob bootstrap --proxy http://127.0.0.1:7890
-pob bootstrap --from-dir "F:/poe/PobTools[20261102]"
+```powershell
+irm https://raw.githubusercontent.com/exilemoulei/pob-agent-tools/main/install.ps1 | iex
 ```
 
-Supported environment variables: `POB_ROOT`, `POB_RUNTIME_DIR`, `POB_PROXY` / `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY`, `POB_GITHUB_MIRROR`, `POB_OFFLINE=1`.
+If GitHub requires a proxy on your network:
+
+```powershell
+$env:POB_PROXY = "http://127.0.0.1:7890"
+irm https://raw.githubusercontent.com/exilemoulei/pob-agent-tools/main/install.ps1 | iex
+```
+
+Re-run the same command anytime to upgrade to the latest release (verifies SHA256 and stops the old daemon automatically).
+
+### Option 2: Scoop Package Manager (Easy Updates)
+
+This repository doubles as a Scoop bucket (`bucket/pob.json`, auto-updated on every tagged release):
+
+```powershell
+scoop bucket add pob https://github.com/exilemoulei/pob-agent-tools
+scoop install pob
+
+# Update to new releases anytime:
+scoop update pob
+```
+
+### Option 3: Portable Zip from GitHub Releases
+
+Download `pob-vX.Y.Z-windows-x64.zip` from [GitHub Releases](https://github.com/exilemoulei/pob-agent-tools/releases/latest), unzip it, and add the folder containing `pob.exe` to your `PATH`.
+
+### Option 4: Python Package (`uv` / `pipx` / `pip`, Python 3.11+)
+
+```powershell
+# With uv (recommended for Python users)
+uv tool install "git+https://github.com/exilemoulei/pob-agent-tools.git#subdirectory=pob_cli"
+
+# Or with pipx / pip (non-editable, from a release wheel or git tag)
+pipx install "git+https://github.com/exilemoulei/pob-agent-tools.git@v0.2.0#subdirectory=pob_cli"
+pip install "https://github.com/exilemoulei/pob-agent-tools/releases/download/v0.2.0/pob_cli-0.2.0-py3-none-any.whl"
+```
+
+### First-Time Engine Setup
+
+After installing `pob`, download the headless PoB engine once (or import an existing local `PobTools` directory):
+
+```powershell
+pob --version
+pob bootstrap                                  # Direct GitHub download
+pob bootstrap --proxy http://127.0.0.1:7890    # Via HTTP/SOCKS5 proxy
+pob bootstrap --from-dir "D:\path\to\PobTools" # Offline seed from local PobTools
+```
+
+Supported environment variables: `POB_ROOT`, `POB_RUNTIME_DIR` (defaults to `%LOCALAPPDATA%\pob-agent-tools`), `POB_PROXY` / `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY`, `POB_GITHUB_MIRROR`, `POB_OFFLINE=1`.
 
 ---
 
 ## Quick Start
 
-```bash
+```powershell
 # 1. Check engine versions, update state, and load builds (URL, poe.ninja char, .xml, Base64)
 pob status
 pob update --check
@@ -83,12 +128,23 @@ Pass `--json` to any command for structured, color-stripped JSON output. Pass `-
 
 ---
 
-## Running Tests
+## Development & Releasing
 
 ```powershell
-$env:PYTHONPATH = "$PWD\pob_cli\src"
+# Local editable dev install
+pip install -e "./pob_cli[dev]"
+
+# Run tests
 python -m pytest pob_cli/tests -v
+
+# Build standalone Windows binary locally
+pyinstaller --noconfirm --clean pob_cli/packaging/pob.spec
 ```
+
+**Tag-driven releases** (`.github/workflows/release.yml`):
+1. Bump `__version__` in `pob_cli/src/pob_cli/__init__.py` and commit to `main`.
+2. Tag and push: `git tag v0.2.0 && git push origin v0.2.0`.
+3. GitHub Actions (`windows-latest`) validates the tag, runs tests, builds & smoke-tests `pob-v0.2.0-windows-x64.zip` + wheel/sdist + `SHA256SUMS.txt`, publishes the GitHub Release, and auto-updates `bucket/pob.json` for Scoop.
 
 ## License
 

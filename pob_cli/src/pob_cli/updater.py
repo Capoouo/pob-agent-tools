@@ -11,6 +11,7 @@ import queue
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import urllib.parse
@@ -22,7 +23,9 @@ from typing import Any, Callable
 
 import httpx
 
-USER_AGENT = "pob-cli/0.2.0 (+https://github.com/PathOfBuildingCommunity/PathOfBuilding)"
+from . import __version__
+
+USER_AGENT = f"pob-cli/{__version__} (+https://github.com/exilemoulei/pob-agent-tools)"
 
 POBTOOLS_LATEST_URL = "https://github.com/Hsiung-Shao/PobTools-zh/releases/latest"
 POBTOOLS_DOWNLOAD_BASE = "https://github.com/Hsiung-Shao/PobTools-zh/releases/download"
@@ -88,20 +91,73 @@ class PobManifest:
     raw_xml: str
 
 
+def detect_source_checkout_root() -> Path | None:
+    """Return the repository root when running from a source checkout, else None (installed/frozen)."""
+    if getattr(sys, "frozen", False):
+        return None
+    try:
+        parents = Path(__file__).resolve().parents
+        if len(parents) > 3:
+            repo_root = parents[3]
+            if (repo_root / "pob_cli" / "pyproject.toml").is_file():
+                return repo_root
+    except OSError:
+        return None
+    return None
+
+
+def get_default_runtime_dir() -> Path:
+    """Return the default persistent runtime directory for source checkouts or installed/frozen runs.
+
+    Priority:
+      1. `POB_RUNTIME_DIR` environment variable.
+      2. `POB_HOME` environment variable (`<POB_HOME>/.runtime`).
+      3. Source checkout `<repo>/.runtime` (when running directly from git checkout).
+      4. OS user app data directory (`%LOCALAPPDATA%/pob-agent-tools` on Windows,
+         `$XDG_DATA_HOME/pob-agent-tools` or `~/.local/share/pob-agent-tools` on POSIX).
+    """
+    env_rt = os.environ.get("POB_RUNTIME_DIR", "").strip()
+    if env_rt:
+        return Path(env_rt)
+
+    env_home = os.environ.get("POB_HOME", "").strip()
+    if env_home:
+        return Path(env_home) / ".runtime"
+
+    checkout_root = detect_source_checkout_root()
+    if checkout_root is not None:
+        return checkout_root / ".runtime"
+
+    if sys.platform == "win32":
+        local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+        if local_app_data:
+            return Path(local_app_data) / "pob-agent-tools"
+        return Path.home() / ".pob-agent-tools"
+
+    xdg_data = os.environ.get("XDG_DATA_HOME", "").strip()
+    if xdg_data:
+        return Path(xdg_data) / "pob-agent-tools"
+    return Path.home() / ".local" / "share" / "pob-agent-tools"
+
+
+def get_runtime_dir(runtime_dir: Path | None = None) -> Path:
+    if runtime_dir is not None:
+        return Path(runtime_dir)
+    return get_default_runtime_dir()
+
+
 def _get_project_root() -> Path:
     env_home = os.environ.get("POB_HOME", "").strip()
     if env_home:
         return Path(env_home)
-    return Path(__file__).resolve().parents[3]
+    checkout_root = detect_source_checkout_root()
+    if checkout_root is not None:
+        return checkout_root
+    return get_default_runtime_dir()
 
 
 def _get_runtime_dir(runtime_dir: Path | None = None) -> Path:
-    if runtime_dir is not None:
-        return Path(runtime_dir)
-    env_rt = os.environ.get("POB_RUNTIME_DIR", "").strip()
-    if env_rt:
-        return Path(env_rt)
-    return _get_project_root() / ".runtime"
+    return get_runtime_dir(runtime_dir)
 
 
 def is_valid_engine_dir(path: Path | None) -> bool:
@@ -125,8 +181,14 @@ def _find_legacy_dir(legacy_dir: Path | None = None) -> Path | None:
         p = Path(stripped)
         return p if is_valid_engine_dir(p) else None
 
-    candidates = [_get_project_root() / "PobTools[20261102]"]
-    if not os.environ.get("POB_HOME", "").strip():
+    candidates: list[Path] = []
+    env_home = os.environ.get("POB_HOME", "").strip()
+    if env_home:
+        candidates.append(Path(env_home) / "PobTools[20261102]")
+    else:
+        checkout_root = detect_source_checkout_root()
+        if checkout_root is not None:
+            candidates.append(checkout_root / "PobTools[20261102]")
         candidates.append(Path("F:/poe/PobTools[20261102]"))
 
     for cand in candidates:

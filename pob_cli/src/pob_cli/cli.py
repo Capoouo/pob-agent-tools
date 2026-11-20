@@ -12,11 +12,13 @@ from typing import Any
 
 import click
 
+from . import __version__
 from .daemon import (
     BootstrapMissingError,
     call_daemon,
     emit_stderr_update_alert,
     read_daemon_state,
+    run_daemon_server,
 )
 from .external_data import query_meta, query_price, query_wiki
 from .formatters import (
@@ -155,11 +157,38 @@ def _render_mutation_report(title: str, res: dict[str, Any]) -> str:
 
 
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
+@click.version_option(__version__, "-V", "--version", prog_name="pob")
 @click.option("--offline", is_flag=True, help="Skip GitHub engine update checks (sets POB_OFFLINE=1).")
 def main(offline: bool) -> None:
     """Headless Path of Building (PoB) CLI for build inspection, what-if testing, and optimization."""
     if offline:
         os.environ["POB_OFFLINE"] = "1"
+
+
+@main.command("_daemon", hidden=True)
+@click.option("--pob-dir", type=click.Path(path_type=Path), default=None)
+@click.option("--runtime-dir", type=click.Path(path_type=Path), default=None)
+@click.option("--port", type=int, default=0)
+@click.option("--offline", is_flag=True, default=False)
+@click.option("--proxy", type=str, default=None)
+@click.option("--mirror", type=str, default=None)
+def cmd_internal_daemon(
+    pob_dir: Path | None,
+    runtime_dir: Path | None,
+    port: int,
+    offline: bool,
+    proxy: str | None,
+    mirror: str | None,
+) -> None:
+    """Internal entry point for spawning the background daemon (used by standalone binaries)."""
+    run_daemon_server(
+        pob_dir=pob_dir,
+        port=port,
+        runtime_dir=runtime_dir,
+        offline=True if offline else None,
+        proxy=proxy,
+        mirror=mirror,
+    )
 
 
 # --- 4.1 Lifecycle, Engine Updates & Build I/O ---

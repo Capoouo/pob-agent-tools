@@ -17,13 +17,19 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
+from .updater import detect_source_checkout_root, get_runtime_dir
+
 SCHEMA_VERSION = 3
 
 # Constants from PoE1/Data/Misc.lua (GameConstants.dat) used by CalcTools.lua
 SKILL_DAMAGE_BASE_EFFECTIVENESS = 3.885209
 SKILL_DAMAGE_INCREMENTAL_EFFECTIVENESS = 0.360246
 
-DEFAULT_PROJECT_ROOT = Path(os.environ.get("POB_HOME", str(Path(__file__).resolve().parents[3])))
+DEFAULT_PROJECT_ROOT = (
+    Path(os.environ["POB_HOME"].strip())
+    if os.environ.get("POB_HOME", "").strip()
+    else (detect_source_checkout_root() or get_runtime_dir())
+)
 FALLBACK_POB_ROOT = Path("F:/poe/PobTools[20261102]")
 FALLBACK_RUNTIME_DIR = Path("F:/poe/.runtime")
 
@@ -267,18 +273,8 @@ VARIANT_TAG_RE = re.compile(r"\{variant:([^}]+)\}")
 
 
 def resolve_runtime_dir(runtime_dir: Path | None = None) -> Path:
-    """Resolve runtime directory following explicit arg -> POB_RUNTIME_DIR -> repo/.runtime."""
-    if runtime_dir is not None:
-        return Path(runtime_dir)
-    env_rt = os.environ.get("POB_RUNTIME_DIR", "").strip()
-    if env_rt:
-        return Path(env_rt)
-    candidate = DEFAULT_PROJECT_ROOT / ".runtime"
-    if candidate.exists() or (DEFAULT_PROJECT_ROOT / "PobTools[20261102]").exists():
-        return candidate
-    if FALLBACK_RUNTIME_DIR.parent.exists():
-        return FALLBACK_RUNTIME_DIR
-    return candidate
+    """Resolve runtime directory: explicit arg -> POB_RUNTIME_DIR -> POB_HOME -> checkout/.runtime -> user appdata."""
+    return get_runtime_dir(runtime_dir)
 
 
 def resolve_pob_dir(pob_dir: Path | None = None, runtime_dir: Path | None = None) -> Path:
@@ -292,10 +288,14 @@ def resolve_pob_dir(pob_dir: Path | None = None, runtime_dir: Path | None = None
     managed_engine = rt / "engine"
     if (managed_engine / "PoE1" / "Data").is_dir() or (managed_engine / "Data").is_dir():
         return managed_engine
-    local_pob = DEFAULT_PROJECT_ROOT / "PobTools[20261102]"
-    if local_pob.is_dir():
-        return local_pob
-    return FALLBACK_POB_ROOT
+    checkout_root = detect_source_checkout_root()
+    if checkout_root is not None:
+        local_pob = checkout_root / "PobTools[20261102]"
+        if local_pob.is_dir():
+            return local_pob
+    if FALLBACK_POB_ROOT.is_dir():
+        return FALLBACK_POB_ROOT
+    return managed_engine
 
 
 def _resolve_poe1_data_dirs(pob_dir: Path) -> tuple[Path, Path | None]:

@@ -1,0 +1,30 @@
+{
+    "version": "0.2.0",
+    "description": "Headless Path of Building (PoE 1) daemon, offline Lua game-data index, and high-SNR CLI for AI agents",
+    "homepage": "https://github.com/exilemoulei/pob-agent-tools",
+    "license": "GPL-3.0-only",
+    "architecture": {
+        "64bit": {
+            "url": "https://github.com/exilemoulei/pob-agent-tools/releases/download/v0.2.0/pob-v0.2.0-windows-x64.zip",
+            "hash": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+    },
+    "bin": "pob.exe",
+    "pre_install": "if (Get-Command pob -ErrorAction SilentlyContinue) { try { & pob stop 2>$null | Out-Null } catch {} }",
+    "pre_uninstall": "if (Test-Path \"$dir\\pob.exe\") { try { & \"$dir\\pob.exe\" stop 2>$null | Out-Null } catch {} }",
+    "notes": [
+        "Run `pob bootstrap` (or `pob bootstrap --proxy http://127.0.0.1:7890`) once to install the headless PoB engine.",
+        "Runtime state and managed engine are stored in %LOCALAPPDATA%\\pob-agent-tools (override with POB_RUNTIME_DIR)."
+    ],
+    "checkver": "github",
+    "autoupdate": {
+        "architecture": {
+            "64bit": {
+                "url": "https://github.com/exilemoulei/pob-agent-tools/releases/download/v$version/pob-v$version-windows-x64.zip"
+            }
+        },
+        "hash": {
+            "url": "$baseurl/SHA256SUMS.txt"
+        }
+    }
+}

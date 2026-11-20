@@ -18,6 +18,11 @@ GOLDEN_URL = "https://poedb.tw/pob/AWqOLSSmyG"
 LEGACY_ENGINE_DIR = Path("F:/poe/PobTools[20261102]")
 SRC_DIR = Path(__file__).resolve().parents[1] / "src"
 
+pytestmark = pytest.mark.skipif(
+    not (LEGACY_ENGINE_DIR / "pob-zh.exe").is_file(),
+    reason=f"Local PobTools engine not available at {LEGACY_ENGINE_DIR}",
+)
+
 
 def _build_env(runtime_dir: Path, *, extra: dict[str, str | None] | None = None) -> dict[str, str]:
     env = os.environ.copy()
