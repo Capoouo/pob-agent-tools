@@ -60,7 +60,7 @@ pob bench suggest --slot S --stat "<text|中文>" [--affix prefix|suffix] [--lim
 
 # Timeless Jewel Seed Search (every reported row is a real headless PoB calculation, run on parallel throwaway engines)
 pob timeless list [--target main|ref] [--json]                                         # 11 jewel types (EN + local name) and the build's allocated sockets
-pob timeless search --jewel "<name|本地名>" --socket <nodeId> [--conqueror C] [--mod "<line>"]... [--stat CombinedDPS|TotalEHP|Life|...] [--top 15] [--workers N] [--idle] [--exact] [--json]  # samples + estimates which seeds can reach the top, then calculates those; --exact calculates all
+pob timeless search --jewel "<name|本地名>" --socket <nodeId> [--conqueror C] [--mod "<line>"]... [--stat CombinedDPS|TotalEHP|Life|...] [--top 15] [--workers N] [--idle] [--exact] [--json]  # samples + estimates which seeds can reach the top, then calculates those (an estimate, not a proof); --exact calculates all; other Historic jewels are taken out (`removed`)
 ```
 
 ## 2. Architecture, Env & Paths

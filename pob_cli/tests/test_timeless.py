@@ -122,6 +122,83 @@ def test_fit_pieces_recovers_additive_effects_for_unseen_combinations() -> None:
     assert max(unseen, key=predict) == max(unseen, key=true_value)
 
 
+def test_narrow_down_finds_a_rare_valuable_byte_without_calculating_everything() -> None:
+    import random
+
+    # 3 nodes x 12 table bytes; byte 99 on node 0 is rare (5 groups of 1733) and worth far more than the rest
+    sigs = [bytes([a, b, c]) for a in range(12) for b in range(12) for c in range(12)]
+    sigs += [bytes([99, b, 0]) for b in range(5)]
+    truth = {sig: 1000.0 * (1 + sig[0] / 50) * (1 + sig[1] / 80) * (1 + sig[2] / 200) * (3 if sig[0] == 99 else 1)
+             for sig in sigs}
+    for rng_seed in range(20):  # a purely random first sample misses byte 99 in most of these
+        results: dict[bytes, dict[str, float]] = {}
+        estimate = timeless.narrow_down(
+            sigs, results, lambda todo: results.update({sig: {"X": truth[sig]} for sig in todo}),
+            "X", 5, random.Random(rng_seed), lambda _msg: None,
+        )
+        assert estimate is not None and len(results) < len(sigs) // 2
+        assert sorted(truth, key=truth.get, reverse=True)[:5] == sorted(results, key=lambda s: truth[s], reverse=True)[:5]
+
+
+def test_engine_keeps_braces_in_item_lines_and_takes_other_jewels_out_after_each_reload() -> None:
+    calls: list[tuple[str, dict]] = []
+
+    class FakeWorker:
+        def call(self, method: str, params: dict, timeout: float = 0) -> dict:
+            calls.append((method, params))
+            return {}
+
+    engine = timeless.Engine.__new__(timeless.Engine)  # no PoB process
+    engine.code, engine.template, engine.slot, engine.clear, engine.count = "CODE", "{crafted}x\nseed {seed}", "Jewel 1", ["Jewel 2"], 0
+    engine.worker = FakeWorker()  # type: ignore[assignment]
+    engine.stats(777)
+    assert [method for method, _ in calls] == ["import_code", "unequip_slot", "add_item", "get_stats"]
+    assert calls[1][1] == {"slotName": "Jewel 2"}
+    assert calls[2][1]["raw"] == "{crafted}x\nseed 777"
+
+
+class FakeEngine:
+    """Stands in for a PoB engine: sockets 7 (holding a Brutal Restraint) and 9 are allocated, socket 11 is not,
+    922 is an allocated notable."""
+
+    game_dir: Path
+    made: list[FakeEngine] = []
+
+    def __init__(self, code: str, template: str, slot: str, clear: object = ()) -> None:
+        self.template, self.slot, self.clear, self.worker = template, slot, clear, self
+        FakeEngine.made.append(self)
+
+    def call(self, method: str, params: dict, timeout: float = 0) -> dict:
+        assert method == "get_tree_state"
+        return {"allocatedNodes": [7, 9, 922], "overrides": {},
+                "sockets": [{"nodeId": 7, "title": "Brutal Restraint"}, {"nodeId": 9}, {"nodeId": 11}]}
+
+    def reset(self) -> None:
+        pass
+
+    stop = reset
+
+    def read(self) -> dict:
+        return {}
+
+    def stats(self, seed: int) -> dict:
+        raise RuntimeError("reached PoB")
+
+
+def test_search_rejects_non_sockets_and_takes_out_a_second_historic_jewel(game_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    FakeEngine.game_dir, FakeEngine.made = game_dir, []
+    monkeypatch.setattr(timeless, "Engine", FakeEngine)
+    for node in (922, 11, 5):  # an allocated notable, an unallocated socket, no such node
+        with pytest.raises(ValueError, match="not an allocated jewel socket"):
+            timeless.search("code", "", node, "Militant Faith")
+    with pytest.raises(RuntimeError, match="reached PoB"):
+        timeless.search("code", "", 9, "Militant Faith")
+    assert FakeEngine.made[-1].clear == ["Jewel 7"]  # the game allows one Historic jewel
+    with pytest.raises(RuntimeError, match="reached PoB"):
+        timeless.search("code", "", 7, "Militant Faith")  # replaced in its own socket: nothing else to take out
+    assert FakeEngine.made[-1].clear == []
+
+
 def test_load_table_reads_single_file_and_numbered_parts(tmp_path: Path) -> None:
     folder = tmp_path / "Data" / "TimelessJewelData"
     folder.mkdir(parents=True)

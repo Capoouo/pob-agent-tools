@@ -1,4 +1,4 @@
-"""`pob timeless` - exact timeless jewel seed search, every seed calculated by headless PoB."""
+"""`pob timeless` - timeless jewel seed search; every reported number is calculated by headless PoB."""
 
 from __future__ import annotations
 
@@ -38,7 +38,7 @@ def _pct(new: Any, old: Any) -> str:
 
 @click.group("timeless")
 def timeless_group() -> None:
-    """Find the best timeless jewel seeds for the loaded build (exact, calculated by PoB)."""
+    """Find the best timeless jewel seeds for the loaded build (every reported number is calculated by PoB)."""
 
 
 @timeless_group.command("list")
@@ -108,7 +108,7 @@ def cmd_timeless_search(
     base = res["baseline"]
     rows = [["now", f"{base['CombinedDPS']:,.0f}", "", f"{base['TotalEHP']:,.0f}", "", base["Life"], "-", "socket as loaded"]]
     shown = res["outcomes"][:top]
-    if res["cutoff"] is not None:  # estimated search: list exactly the outcomes it guarantees to be complete
+    if res["cutoff"] is not None:  # estimated search: list only the outcomes the estimate speaks for
         shown = [o for o in res["outcomes"] if (o["stats"].get(stat) or 0) >= res["cutoff"]]
     for i, outcome in enumerate(shown, 1):
         s, seeds = outcome["stats"], outcome["seeds"]
@@ -124,12 +124,15 @@ def cmd_timeless_search(
         f"{res['workers']} engines in {res['seconds']}s, ranked by `{stat}`\n"
         + render_table(["#", "Combined DPS", "vs now", "Total EHP", "vs now", "Life", "Seeds", "Seed numbers"], rows)
     )
+    for other in res["removed"]:
+        _echo(f"\n> `{other['jewel']}` at socket `{other['socket']}` was taken out for this search: "
+              "the game allows one Historic jewel.")
     if est:
         err = f"{est['maxError'] * 100:.2f}%" if est["relative"] else f"{est['maxError']:.3g}"
         _echo(
-            f"\n> Rows are real PoB results and list every seed at or above the {top}th best group. The other "
-            f"{res['groupCount'] - res['calculated']:,} groups were estimated from the calculated ones (error allowed for: "
-            f"{err}) and none of them is estimated to reach that level. Use `--exact` to calculate everything."
+            f"\n> Rows are real PoB results. The other {res['groupCount'] - res['calculated']:,} groups were not "
+            f"calculated: an estimate fitted on the calculated ones (error allowed for: {err}) puts none of them in "
+            f"the top {top}. That is an estimate, not a proof; `--exact` calculates everything."
         )
     if check["mismatches"]:
         _echo(f"\n> [WARN] Seeds {check['mismatches']} differ from their group; please report this build and jewel.")

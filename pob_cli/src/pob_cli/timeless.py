@@ -5,9 +5,10 @@ Three things keep that fast:
 
 1. For the jewels whose lookup table is one byte per (notable, seed), seeds with identical bytes on the
    notables this build uses must produce the same build, so one seed per such group is calculated.
-2. When there are still many groups, a few hundred are calculated, the value of each single node change is
-   fitted from them, and that estimate only picks which further seeds to calculate. It stops once no
-   uncalculated seed is estimated - plus the largest estimate error seen - to reach the requested top list.
+2. When there are still many groups, a few hundred are calculated (every table byte of every node at least
+   twice), the value of each single node change is fitted from them, and that estimate only picks which
+   further seeds to calculate. It stops once no uncalculated seed is estimated - plus the largest estimate
+   error seen - to reach the requested top list. That is an estimate, not a proof; `exact` skips it.
 3. Calculations are spread over several throwaway PoB engines running at once.
 
 Jewel names, base types, seed ranges and conquerors are read from PoB's own `Data/Uniques/jewel.lua`,
@@ -49,6 +50,7 @@ STAT_KEYS = (
 )
 RESET_EVERY = 150  # each calculated seed leaves one more item in the build; reload before that slows PoB down
 MIN_SAMPLE = 200  # groups calculated before the first estimate
+MIN_SEEN = 2  # ... holding every (node, table byte) at least this often
 VERIFY_BATCH = 50  # estimated-best groups calculated per round
 _SEED_LINE = re.compile(r"^(?:\{variant:[\d,]+\})?(.*\((\d+)-(\d+)\).* (\w+))$")
 
@@ -160,16 +162,74 @@ def fit_pieces(samples: Sequence[tuple[bytes, float]], rounds: int = 25) -> Call
     return lambda sig: mean + sum(effects[p].get(sig[p], 0.0) for p in range(k))
 
 
+def narrow_down(
+    all_sigs: Sequence[bytes],
+    results: dict[bytes, dict[str, Any]],
+    calculate: Callable[[Sequence[bytes]], None],
+    stat: str,
+    top: int,
+    rng: random.Random,
+    say: Callable[[str], None],
+) -> dict[str, Any] | None:
+    """Calculate a sample, estimate the other groups from it, and keep calculating the estimated-best ones until
+    none of the rest is estimated to reach the `top` best. `calculate(sigs)` adds those groups to `results`.
+
+    Returns the estimate's summary, or None when every group ended up calculated.
+    """
+    k = len(all_sigs[0])
+    by_byte: list[dict[int, list[bytes]]] = [defaultdict(list) for _ in range(k)]
+    for sig in all_sigs:
+        for pos in range(k):
+            by_byte[pos][sig[pos]].append(sig)
+    sample_size = max(MIN_SAMPLE, 2 * sum(len(d) for d in by_byte))
+    if len(all_sigs) <= 3 * sample_size:
+        calculate(all_sigs)
+        return None
+    # The effect of a byte that was never calculated is a blind guess: a purely random sample was seen to leave
+    # seeds out of the top list. So take every (node, byte) MIN_SEEN times first, then fill up at random.
+    sample = dict.fromkeys(
+        sig for d in by_byte for members in d.values() for sig in rng.sample(members, min(MIN_SEEN, len(members)))
+    )
+    rest = [sig for sig in all_sigs if sig not in sample]
+    sample.update(dict.fromkeys(rng.sample(rest, max(0, sample_size - len(sample)))))
+    calculate(list(sample))
+    say(f"{len(results)} sampled of {len(all_sigs)} groups; estimating the rest")
+    use_log = all((results[sig].get(stat) or 0) > 0 for sig in results)
+
+    def value(sig: bytes) -> float:
+        raw = float(results[sig].get(stat) or 0)
+        return math.log(max(raw, 1e-9)) if use_log else raw
+
+    while True:
+        done = [(sig, value(sig)) for sig in results]
+        predict = fit_pieces(done)
+        # doubled: the fit has seen these samples, so its error on unseen groups runs higher
+        error = 2 * max(abs(predict(sig) - v) for sig, v in done)
+        cutoff = sorted((v for _, v in done), reverse=True)[min(top, len(done)) - 1]
+        open_sigs = sorted((s for s in all_sigs if s not in results and predict(s) + error >= cutoff),
+                           key=predict, reverse=True)
+        if not open_sigs:
+            return {"calculated": len(results), "maxError": (math.exp(error) - 1) if use_log else error,
+                    "relative": use_log}
+        if len(results) > 0.4 * len(all_sigs):  # the estimate is not narrowing things down: finish exactly
+            calculate([s for s in all_sigs if s not in results])
+            return None
+        calculate(open_sigs[:VERIFY_BATCH])
+        say(f"{len(results)} calculated; {max(0, len(open_sigs) - VERIFY_BATCH)} could still reach the top {top}")
+
+
 class Engine:
     """One throwaway PoB engine holding the build; recalculates it with a given seed socketed."""
 
-    def __init__(self, code: str, template: str, slot: str) -> None:
-        self.code, self.template, self.slot, self.count = code, template, slot, 0
+    def __init__(self, code: str, template: str, slot: str, clear: Sequence[str] = ()) -> None:
+        self.code, self.template, self.slot, self.clear, self.count = code, template, slot, clear, 0
         self.worker = BridgeWorker("test")  # "test" slots are never persisted to the runtime dir
         self.worker.start()
 
     def reset(self) -> None:
         self.worker.call("import_code", {"code": self.code, "mode": "replace"}, timeout=120)
+        for slot in self.clear:  # other Historic jewels: the game allows one, PoB would count them all
+            self.worker.call("unequip_slot", {"slotName": slot}, timeout=60)
         self.count = 0
 
     def read(self) -> dict[str, Any]:
@@ -180,9 +240,9 @@ class Engine:
         if self.count % RESET_EVERY == 0:
             self.reset()
         self.count += 1
-        self.worker.call(
-            "add_item", {"raw": self.template.format(seed=seed), "equip": True, "slotName": self.slot}, timeout=60
-        )
+        # not str.format: item lines may carry braces of their own, e.g. `{crafted}`
+        raw = self.template.replace("{seed}", str(seed))
+        self.worker.call("add_item", {"raw": raw, "equip": True, "slotName": self.slot}, timeout=60)
         return self.read()
 
     def stop(self) -> None:
@@ -259,9 +319,10 @@ def search(
 ) -> dict[str, Any]:
     """Find the seeds of a timeless jewel at `socket` that give the highest `stat`.
 
-    The jewel replaces whatever is in that socket; `baseline` is the build as loaded. With `exact` every
-    group is calculated; otherwise large searches calculate a sample, estimate the rest, and calculate the
-    estimated-best until none of the remaining can reach the top `top` (see module docstring).
+    The jewel replaces whatever is in that socket, and other Historic jewels are taken out (`removed`);
+    `baseline` is the build as loaded. With `exact` every group is calculated; otherwise large searches
+    calculate a sample, estimate the rest, and calculate the estimated-best until none of the remaining is
+    estimated to reach the top `top` (see `narrow_down`).
     """
     started = time.time()
     top = max(1, top)
@@ -277,9 +338,14 @@ def search(
         if conqueror and conqueror not in jewel["conquerors"]:
             raise ValueError(f"{name} conquerors: {', '.join(jewel['conquerors'])}")
         conqueror = conqueror or next(iter(jewel["conquerors"]))
-        allocated = {int(x) for x in first.worker.call("get_tree_state", {}, timeout=60)["allocatedNodes"]}
-        if socket not in allocated:
+        state = first.worker.call("get_tree_state", {}, timeout=60)
+        sockets = {int(s["nodeId"]): s for s in state["sockets"]}
+        # PoB puts a jewel aimed at a slot that does not exist into any free socket instead of refusing it
+        if socket not in sockets or socket not in {int(x) for x in state["allocatedNodes"]}:
             raise ValueError(f"Node {socket} is not an allocated jewel socket of this build (see `pob timeless list`).")
+        removed = [{"jewel": s["title"], "socket": node} for node, s in sockets.items()
+                   if node != socket and s.get("title") in jewels]
+        clear = first.clear = [f"Jewel {other['socket']}" for other in removed]
         template = first.template = jewel_text(jewel, name, conqueror, mods)
         seeds = list(jewel["seeds"])
         baseline = first.read()
@@ -305,7 +371,7 @@ def search(
             engines.extend([None] * (n - len(engines)))
 
             def work(i: int) -> None:
-                engine = engines[i] = engines[i] or Engine(code, template, slot)
+                engine = engines[i] = engines[i] or Engine(code, template, slot, clear)
                 for sig in sigs[i::n]:
                     stats = engine.stats(groups[sig][0])
                     with lock:
@@ -318,37 +384,11 @@ def search(
 
         rng = random.Random(1)
         all_sigs = list(groups)
-        sample_size = max(MIN_SAMPLE, 2 * sum(len({sig[p] for sig in all_sigs}) for p in range(len(nodes))))
         estimate: dict[str, Any] | None = None
-        if exact or not nodes or len(groups) <= 3 * sample_size:
+        if exact or not nodes:
             calculate(all_sigs)
         else:
-            calculate(rng.sample(all_sigs, sample_size))
-            say(f"{len(results)} sampled of {len(groups)} groups; estimating the rest")
-            use_log = all((results[sig].get(stat) or 0) > 0 for sig in results)
-
-            def value(sig: bytes) -> float:
-                raw = float(results[sig].get(stat) or 0)
-                return math.log(max(raw, 1e-9)) if use_log else raw
-
-            while True:
-                done = [(sig, value(sig)) for sig in results]
-                predict = fit_pieces(done)
-                # doubled: the fit has seen these samples, so its error on unseen groups runs higher
-                error = 2 * max(abs(predict(sig) - v) for sig, v in done)
-                cutoff = sorted((v for _, v in done), reverse=True)[min(top, len(done)) - 1]
-                open_sigs = sorted((s for s in all_sigs if s not in results and predict(s) + error >= cutoff),
-                                   key=predict, reverse=True)
-                estimate = {"calculated": len(results), "open": len(open_sigs),
-                            "maxError": (math.exp(error) - 1) if use_log else error, "relative": use_log}
-                if not open_sigs:
-                    break
-                if len(results) > 0.4 * len(groups):  # the estimate is not narrowing things down: finish exactly
-                    calculate([s for s in all_sigs if s not in results])
-                    estimate = None
-                    break
-                calculate(open_sigs[:VERIFY_BATCH])
-                say(f"{len(results)} calculated; {max(0, len(open_sigs) - VERIFY_BATCH)} could still reach the top {top}")
+            estimate = narrow_down(all_sigs, results, calculate, stat, top, rng, say)
 
         # Self-check: another member of a group must give the very same numbers as its representative.
         multi = [sig for sig in results if len(groups[sig]) > 1]
@@ -367,7 +407,7 @@ def search(
     for sig, stats in results.items():
         outcomes[tuple(stats[key] for key in STAT_KEYS)].extend(groups[sig])
     ranked = sorted(outcomes.items(), key=lambda kv: -(kv[0][STAT_KEYS.index(stat)] or 0))
-    # With an estimate, only seeds at or above the value of the `top`-th best calculated group are complete.
+    # The estimate only speaks for seeds at or above the value of the `top`-th best calculated group.
     cutoff = None
     if estimate:
         cutoff = sorted((float(s.get(stat) or 0) for s in results.values()), reverse=True)[min(top, len(results)) - 1]
@@ -377,6 +417,7 @@ def search(
         "conqueror": conqueror,
         "socket": socket,
         "mods": list(mods),
+        "removed": removed,
         "stat": stat,
         "seedCount": len(seeds),
         "groupCount": len(groups),
