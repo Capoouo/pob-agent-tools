@@ -969,24 +969,27 @@ def call_daemon(
             except OSError:
                 pass
 
-            creationflags = 0
+            popen_kwargs: dict[str, Any] = {
+                "cwd": str(rt_dir),
+                "stdin": subprocess.DEVNULL,
+            }
             if sys.platform == "win32":
-                creationflags = (
+                popen_kwargs["creationflags"] = (
                     subprocess.CREATE_NEW_PROCESS_GROUP
                     | subprocess.DETACHED_PROCESS
                     | subprocess.CREATE_NO_WINDOW
                 )
+            else:
+                popen_kwargs["start_new_session"] = True
 
             cmd = _build_daemon_spawn_cmd(rt_dir if runtime_dir is not None else None)
 
             with open(log_path, "a", encoding="utf-8") as log_fh:
                 spawned_proc = subprocess.Popen(
                     cmd,
-                    cwd=str(rt_dir),
                     stdout=log_fh,
                     stderr=log_fh,
-                    stdin=subprocess.DEVNULL,
-                    creationflags=creationflags,
+                    **popen_kwargs,
                 )
 
         # Wait up to 25 seconds for daemon.json to appear and respond (fast-failing on boot_error)

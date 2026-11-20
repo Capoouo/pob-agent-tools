@@ -15,7 +15,12 @@ import zlib
 from pathlib import Path
 from typing import Any
 
-from .updater import detect_source_checkout_root, get_runtime_dir, resolve_engine_root
+from .updater import (
+    build_engine_command,
+    detect_source_checkout_root,
+    get_runtime_dir,
+    resolve_engine_root,
+)
 
 DEFAULT_PROJECT_ROOT = (
     Path(os.environ["POB_HOME"].strip())
@@ -176,19 +181,25 @@ class BridgeWorker:
                 return
             self._kill_unlocked()
 
-            if not self.exe_path.is_file():
-                raise BridgeError(f"pob-zh.exe not found at {self.exe_path}")
             if not self.game_dir.is_dir():
                 raise BridgeError(f"PoE1 directory not found at {self.game_dir}")
+
+            try:
+                cmd, extra_env = build_engine_command(self.pob_root)
+            except Exception as exc:  # noqa: BLE001
+                raise BridgeError(str(exc)) from exc
 
             out_queue: queue.Queue[dict[str, Any] | Exception | None] = queue.Queue()
             self._stdout_queue = out_queue
             self._stderr_tail.clear()
 
             creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            proc_env = os.environ.copy()
+            proc_env.update(extra_env)
             self._proc = subprocess.Popen(
-                [str(self.exe_path), "--engine-headless", str(self.game_dir)],
+                cmd,
                 cwd=str(self.game_dir),
+                env=proc_env,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,

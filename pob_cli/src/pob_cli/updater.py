@@ -7,11 +7,16 @@ import concurrent.futures
 import hashlib
 import json
 import os
+import platform
 import queue
 import re
+import shlex
 import shutil
+import stat
 import subprocess
 import sys
+import tarfile
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -30,6 +35,14 @@ USER_AGENT = f"pob-cli/{__version__} (+https://github.com/exilemoulei/pob-agent-
 POBTOOLS_LATEST_URL = "https://github.com/Hsiung-Shao/PobTools-zh/releases/latest"
 POBTOOLS_DOWNLOAD_BASE = "https://github.com/Hsiung-Shao/PobTools-zh/releases/download"
 POB_MANIFEST_URL = "https://raw.githubusercontent.com/PathOfBuildingCommunity/PathOfBuilding/master/manifest.xml"
+POB_AGENT_RELEASES_LATEST_URL = "https://github.com/exilemoulei/pob-agent-tools/releases/latest"
+POB_AGENT_DOWNLOAD_BASE = "https://github.com/exilemoulei/pob-agent-tools/releases/download"
+
+# Exact upstream LuaJIT & luautf8 revisions matching PoB 2.68+ SimpleGraphic
+POSIX_LUAJIT_COMMIT = "2460b3ff93a1c955de3d62cfc825de7d68dc272e"
+POSIX_LUAJIT_TARBALL_URL = f"https://github.com/LuaJIT/LuaJIT/archive/{POSIX_LUAJIT_COMMIT}.tar.gz"
+POSIX_LUAUTF8_TAG = "0.1.6"
+POSIX_LUAUTF8_TARBALL_URL = f"https://github.com/starwing/luautf8/archive/refs/tags/{POSIX_LUAUTF8_TAG}.tar.gz"
 
 # Strict fast-fail budget for metadata checks (no retries on connect timeout)
 AUTO_CHECK_TIMEOUT = httpx.Timeout(connect=1.5, read=5.0, write=5.0, pool=1.5)
@@ -160,12 +173,137 @@ def _get_runtime_dir(runtime_dir: Path | None = None) -> Path:
     return get_runtime_dir(runtime_dir)
 
 
+def is_windows() -> bool:
+    """Return True when running on Windows."""
+    return sys.platform == "win32"
+
+
+def get_posix_platform_tag() -> str:
+    """Return canonical POSIX runtime tag such as 'darwin-arm64', 'darwin-x64', 'linux-x64', 'linux-arm64'."""
+    os_part = "darwin" if sys.platform == "darwin" else "linux"
+    machine = platform.machine().lower()
+    if machine in ("arm64", "aarch64"):
+        arch_part = "arm64"
+    elif machine in ("x86_64", "amd64", "x64"):
+        arch_part = "x64"
+    else:
+        arch_part = machine or "x64"
+    return f"{os_part}-{arch_part}"
+
+
+def get_bundled_headless_runner_path() -> Path:
+    """Return the path to the bundled POSIX LuaJIT headless_runner.lua script."""
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        cand = Path(meipass) / "pob_cli" / "lua" / "headless_runner.lua"
+        if cand.is_file():
+            return cand
+    return Path(__file__).resolve().parent / "lua" / "headless_runner.lua"
+
+
+def resolve_luajit_binary(engine_dir: Path | None = None) -> Path | None:
+    """Locate a runnable LuaJIT binary for macOS/Linux headless mode.
+
+    Priority:
+      1. `POB_LUAJIT` environment variable (explicit override).
+      2. Managed `<engine_dir>/bin/luajit` (built/downloaded by `pob bootstrap`).
+      3. `luajit` on `PATH`.
+    """
+    env_lj = os.environ.get("POB_LUAJIT", "").strip()
+    if env_lj:
+        p = Path(env_lj)
+        if p.is_file():
+            return p
+        found = shutil.which(env_lj)
+        if found:
+            return Path(found)
+        return None
+
+    if engine_dir is not None:
+        managed = Path(engine_dir) / "bin" / "luajit"
+        if managed.is_file():
+            return managed
+
+    which_lj = shutil.which("luajit")
+    if which_lj:
+        return Path(which_lj)
+    return None
+
+
+def build_engine_command(engine_dir: Path) -> tuple[list[str], dict[str, str]]:
+    """Build the headless engine subprocess command and extra environment variables for the current OS.
+
+    Windows uses `pob-zh.exe --engine-headless <PoE1>`.
+    macOS/Linux uses native LuaJIT + bundled `headless_runner.lua` mounting `Data/bridge/bridge.lua`.
+    Advanced users may override via `POB_ENGINE_CMD` (supporting `{engine_dir}`, `{game_dir}`,
+    `{bridge_lua}`, `{runner_lua}` placeholders).
+    """
+    eng = Path(engine_dir)
+    game_dir = eng / "PoE1"
+    bridge_lua = eng / "Data" / "bridge" / "bridge.lua"
+    runner_lua = get_bundled_headless_runner_path()
+
+    if not game_dir.is_dir():
+        raise UpdateError(f"PoE1 directory not found at {game_dir}")
+
+    override = os.environ.get("POB_ENGINE_CMD", "").strip()
+    if override:
+        rendered = override.format(
+            engine_dir=str(eng),
+            game_dir=str(game_dir),
+            bridge_lua=str(bridge_lua),
+            runner_lua=str(runner_lua),
+        )
+        cmd = shlex.split(rendered, posix=not is_windows())
+        if not cmd:
+            raise UpdateError("POB_ENGINE_CMD resolved to an empty command")
+        return cmd, {
+            "POB_ZH_HEADLESS": "1",
+            "POB_GAME": "poe1",
+            "POB_ENGINE_ROOT": str(eng),
+        }
+
+    if is_windows():
+        exe_path = eng / "pob-zh.exe"
+        if not exe_path.is_file():
+            raise UpdateError(f"pob-zh.exe not found at {exe_path}")
+        return [str(exe_path), "--engine-headless", str(game_dir)], {}
+
+    luajit_bin = resolve_luajit_binary(eng)
+    if luajit_bin is None:
+        raise UpdateError(
+            f"No compatible LuaJIT runtime found for macOS/Linux (checked {eng / 'bin' / 'luajit'} and PATH). "
+            "Run `pob bootstrap` to install/build the native POSIX LuaJIT runtime."
+        )
+    if not bridge_lua.is_file():
+        raise UpdateError(
+            f"bridge.lua not found at {bridge_lua}. Run `pob bootstrap` to download PobTools bridge files."
+        )
+    if not runner_lua.is_file():
+        raise UpdateError(f"Bundled headless_runner.lua not found at {runner_lua}")
+
+    extra_env = {
+        "POB_ZH_HEADLESS": "1",
+        "POB_GAME": "poe1",
+        "POB_ENGINE_ROOT": str(eng),
+    }
+    return [str(luajit_bin), str(runner_lua), str(game_dir), str(bridge_lua)], extra_env
+
+
 def is_valid_engine_dir(path: Path | None) -> bool:
-    """Return True if path contains a runnable pob-zh.exe and PoE1/ directory."""
+    """Return True if path contains a runnable headless PoB engine for the current OS."""
     if path is None:
         return False
     p = Path(path)
-    return (p / "pob-zh.exe").is_file() and (p / "PoE1").is_dir()
+    if not (p / "PoE1").is_dir():
+        return False
+    if is_windows():
+        return (p / "pob-zh.exe").is_file()
+    if not (p / "Data" / "bridge" / "bridge.lua").is_file():
+        return False
+    if os.environ.get("POB_ENGINE_CMD", "").strip():
+        return True
+    return resolve_luajit_binary(p) is not None
 
 
 def _find_legacy_dir(legacy_dir: Path | None = None) -> Path | None:
@@ -247,7 +385,7 @@ def seed_from_legacy_dir(legacy_dir: Path, target_dir: Path) -> bool:
         if src_file.is_file():
             shutil.copy2(src_file, dst / fname)
 
-    for dname in LEGACY_SEED_DIRS:
+    for dname in (*LEGACY_SEED_DIRS, "bin"):
         src_sub = src / dname
         if src_sub.is_dir():
             shutil.copytree(src_sub, dst / dname, dirs_exist_ok=True)
@@ -356,7 +494,7 @@ def verify_pob_sha1(data: bytes, expected_sha1: str) -> bool:
     return False
 
 
-def parse_pob_manifest(xml_text: str) -> PobManifest:
+def parse_pob_manifest(xml_text: str, *, include_win32_runtime: bool | None = None) -> PobManifest:
     """Parse a PathOfBuilding manifest.xml string into structured metadata & file entries."""
     root = ET.fromstring(xml_text)
     if root.tag != "PoBVersion":
@@ -368,7 +506,8 @@ def parse_pob_manifest(xml_text: str) -> PobManifest:
 
     version = ver_elem.attrib["number"].strip()
     branch = (ver_elem.attrib.get("branch") or "master").strip()
-    platform = (ver_elem.attrib.get("platform") or "win32").strip()
+    platform_str = (ver_elem.attrib.get("platform") or "win32").strip()
+    keep_win32 = is_windows() if include_win32_runtime is None else bool(include_win32_runtime)
 
     sources: dict[str, dict[str, str]] = {}
     for src_elem in root.findall("Source"):
@@ -387,10 +526,19 @@ def parse_pob_manifest(xml_text: str) -> PobManifest:
         runtime = f_elem.attrib.get("runtime")
         if not raw_name or not sha1:
             continue
-        if plat and plat != "win32":
-            continue
-        if runtime and runtime != "win32":
-            continue
+        if keep_win32:
+            if plat and plat != "win32":
+                continue
+            if runtime and runtime != "win32":
+                continue
+        else:
+            # POSIX (macOS/Linux) uses native LuaJIT + libz; skip Windows DLL/EXE runtime files
+            if plat and plat == "win32":
+                continue
+            if runtime and runtime == "win32":
+                continue
+            if plat and plat not in ("any", ""):
+                continue
         local_rel = raw_name.replace("{space}", " ")
         # Path traversal guard
         norm_parts = Path(local_rel).parts
@@ -411,7 +559,7 @@ def parse_pob_manifest(xml_text: str) -> PobManifest:
     return PobManifest(
         version=version,
         branch=branch,
-        platform=platform,
+        platform=platform_str,
         sources=sources,
         files=files,
         raw_xml=xml_text,
@@ -679,23 +827,25 @@ def format_stderr_update_alert(state: dict[str, Any] | None) -> str | None:
 
 
 def probe_engine_gate(engine_dir: Path, timeout_sec: float = 20.0) -> dict[str, Any]:
-    """Run headless `pob-zh.exe --engine-headless` smoke probe and verify gate_result + hello."""
+    """Run headless engine smoke probe (pob-zh.exe on Windows, LuaJIT runner on macOS/Linux) and verify gate_result + hello."""
     eng = Path(engine_dir)
-    exe_path = eng / "pob-zh.exe"
     game_dir = eng / "PoE1"
 
-    if not exe_path.is_file():
-        return {"ok": False, "error": f"pob-zh.exe not found at {exe_path}", "stderrTail": []}
-    if not game_dir.is_dir():
-        return {"ok": False, "error": f"PoE1 directory not found at {game_dir}", "stderrTail": []}
+    try:
+        cmd, extra_env = build_engine_command(eng)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "stderrTail": []}
 
     out_queue: queue.Queue[dict[str, Any] | Exception | None] = queue.Queue()
     stderr_tail: collections.deque[str] = collections.deque(maxlen=50)
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    proc_env = os.environ.copy()
+    proc_env.update(extra_env)
 
     proc = subprocess.Popen(
-        [str(exe_path), "--engine-headless", str(game_dir)],
+        cmd,
         cwd=str(game_dir),
+        env=proc_env,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -979,6 +1129,7 @@ def _extract_zip_safely(
     dest_dir: Path,
     *,
     skip_prefixes: tuple[str, ...] = (),
+    only_prefixes: tuple[str, ...] = (),
 ) -> dict[Path, Path]:
     """Extract a zip safely into dest_dir (guarding against Zip Slip and single wrapper dir)."""
     extracted: dict[Path, Path] = {}
@@ -1006,6 +1157,9 @@ def _extract_zip_safely(
             if rel.is_absolute():
                 raise UpdateError(f"Unsafe zip member path: {info.filename}")
             first_lower = rel.parts[0].lower()
+            if only_prefixes:
+                if not any(first_lower == op.lower() for op in only_prefixes):
+                    continue
             if any(first_lower == sp.lower() for sp in skip_prefixes):
                 continue
             out = (dest_dir / rel).resolve()
@@ -1060,6 +1214,7 @@ def _download_and_stage_release_zip(
     proxy: str | None = None,
     mirror: str | None = None,
     skip_prefixes: tuple[str, ...] = ("PoE1",),
+    only_prefixes: tuple[str, ...] = (),
 ) -> dict[Path, Path]:
     name = str(asset["name"])
     expected_sha256 = str(asset.get("sha256") or "").strip().lower()
@@ -1077,7 +1232,238 @@ def _download_and_stage_release_zip(
 
     extract_root = staging_dir / "_extract" / Path(name).stem
     extract_root.mkdir(parents=True, exist_ok=True)
-    return _extract_zip_safely(zip_tmp, extract_root, skip_prefixes=skip_prefixes)
+    return _extract_zip_safely(
+        zip_tmp,
+        extract_root,
+        skip_prefixes=skip_prefixes,
+        only_prefixes=only_prefixes,
+    )
+
+
+def _extract_tar_gz_safely(tar_path: Path, dest_dir: Path, *, strip_components: int = 0) -> None:
+    dest_resolved = dest_dir.resolve()
+    with tarfile.open(tar_path, "r:gz") as tf:
+        for member in tf.getmembers():
+            if not member.isfile():
+                continue
+            parts = Path(member.name).parts
+            if strip_components > 0:
+                if len(parts) <= strip_components:
+                    continue
+                parts = parts[strip_components:]
+            if not parts or any(p in ("..", "") for p in parts):
+                continue
+            rel = Path(*parts)
+            if rel.is_absolute():
+                raise UpdateError(f"Unsafe tar member path: {member.name}")
+            out = (dest_dir / rel).resolve()
+            try:
+                out.relative_to(dest_resolved)
+            except ValueError as exc:
+                raise UpdateError(f"Tar Slip detected: {member.name}") from exc
+            out.parent.mkdir(parents=True, exist_ok=True)
+            src_f = tf.extractfile(member)
+            if src_f is None:
+                continue
+            with src_f, open(out, "wb") as dst_f:
+                shutil.copyfileobj(src_f, dst_f)
+            if member.mode & 0o111:
+                os.chmod(out, 0o755)
+
+
+def _try_download_prebuilt_posix_runtime(
+    staging_dir: Path,
+    *,
+    proxy: str | None = None,
+    mirror: str | None = None,
+) -> dict[Path, Path] | None:
+    """Attempt to download a prebuilt pob-runtime-<os>-<arch>.tar.gz from pob-agent-tools releases."""
+    plat_tag = get_posix_platform_tag()
+    asset_name = f"pob-runtime-{plat_tag}.tar.gz"
+    latest_url = rewrite_github_url(POB_AGENT_RELEASES_LATEST_URL, mirror=mirror)
+    try:
+        with _make_http_client(timeout=CHECK_TIMEOUT, proxy=proxy, follow_redirects=False) as client:
+            resp = client.get(latest_url)
+            if resp.status_code in (301, 302, 303, 307, 308):
+                tag = _extract_tag_from_location(resp.headers.get("location", ""))
+            elif resp.status_code == 200 and "/tag/" in str(resp.url):
+                tag = _extract_tag_from_location(str(resp.url))
+            else:
+                return None
+
+        asset_url = rewrite_github_url(
+            f"{POB_AGENT_DOWNLOAD_BASE}/{tag}/{asset_name}",
+            mirror=mirror,
+        )
+        with _make_http_client(timeout=ASSET_TIMEOUT, proxy=proxy, follow_redirects=True) as client:
+            aresp = client.get(asset_url)
+            if aresp.status_code != 200:
+                return None
+            tar_tmp = staging_dir / "_downloads" / asset_name
+            tar_tmp.parent.mkdir(parents=True, exist_ok=True)
+            tar_tmp.write_bytes(aresp.content)
+
+        extract_root = staging_dir / "_posix_prebuilt"
+        extract_root.mkdir(parents=True, exist_ok=True)
+        _extract_tar_gz_safely(tar_tmp, extract_root)
+
+        luajit_src = extract_root / "bin" / "luajit"
+        utf8_src = extract_root / "bin" / "lua-utf8.so"
+        if not luajit_src.is_file():
+            luajit_src = extract_root / "luajit"
+            utf8_src = extract_root / "lua-utf8.so"
+        if not (luajit_src.is_file() and utf8_src.is_file()):
+            return None
+
+        os.chmod(luajit_src, 0o755)
+        os.chmod(utf8_src, 0o755)
+        return {
+            Path("bin") / "luajit": luajit_src,
+            Path("bin") / "lua-utf8.so": utf8_src,
+        }
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _build_posix_runtime_from_source(
+    staging_dir: Path,
+    *,
+    proxy: str | None = None,
+    mirror: str | None = None,
+) -> dict[Path, Path]:
+    """Compile minimal native LuaJIT 2.1 (PoB 2.68+ commit) and lua-utf8.so locally on macOS/Linux."""
+    cc_bin = os.environ.get("CC", "").strip() or shutil.which("cc") or shutil.which("clang") or shutil.which("gcc")
+    make_bin = shutil.which("make")
+    if not cc_bin or not make_bin:
+        hint = (
+            "Run `xcode-select --install` to install Apple Command Line Tools."
+            if sys.platform == "darwin"
+            else "Install build tools (`sudo apt install build-essential` or equivalent)."
+        )
+        raise UpdateError(
+            f"Cannot build native POSIX LuaJIT runtime (missing C compiler or make). {hint}"
+        )
+
+    build_timeout = httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=10.0)
+    lj_url = rewrite_github_url(POSIX_LUAJIT_TARBALL_URL, mirror=mirror)
+    u8_url = rewrite_github_url(POSIX_LUAUTF8_TARBALL_URL, mirror=mirror)
+
+    with tempfile.TemporaryDirectory(prefix="pob-posix-build-") as tmp_str:
+        tmp = Path(tmp_str)
+        lj_tar = tmp / "luajit.tar.gz"
+        u8_tar = tmp / "luautf8.tar.gz"
+        lj_src = tmp / "luajit-src"
+        u8_src = tmp / "luautf8-src"
+        lj_src.mkdir()
+        u8_src.mkdir()
+
+        with _make_http_client(timeout=build_timeout, proxy=proxy, follow_redirects=True) as client:
+            lj_tar.write_bytes(_download_bytes_with_retry(client, lj_url, retries=ASSET_MAX_RETRIES))
+            u8_tar.write_bytes(_download_bytes_with_retry(client, u8_url, retries=ASSET_MAX_RETRIES))
+
+        _extract_tar_gz_safely(lj_tar, lj_src, strip_components=1)
+        _extract_tar_gz_safely(u8_tar, u8_src, strip_components=1)
+
+        jobs = str(max(1, os.cpu_count() or 4))
+        env = os.environ.copy()
+        if sys.platform == "darwin":
+            env.setdefault("MACOSX_DEPLOYMENT_TARGET", "11.0")
+
+        lj_proc = subprocess.run(
+            [make_bin, "-C", str(lj_src / "src"), f"-j{jobs}", "BUILDMODE=static", "amalg"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        if lj_proc.returncode != 0:
+            tail = (lj_proc.stderr or lj_proc.stdout or "")[-600:]
+            raise UpdateError(f"Failed to compile LuaJIT 2.1 (exit {lj_proc.returncode}): {tail}")
+
+        out_bin_dir = staging_dir / "bin"
+        out_bin_dir.mkdir(parents=True, exist_ok=True)
+        luajit_out = out_bin_dir / "luajit"
+        utf8_out = out_bin_dir / "lua-utf8.so"
+
+        shutil.copy2(lj_src / "src" / "luajit", luajit_out)
+        os.chmod(luajit_out, 0o755)
+
+        if sys.platform == "darwin":
+            cc_cmd = [
+                cc_bin,
+                "-O2",
+                "-fPIC",
+                "-bundle",
+                "-undefined",
+                "dynamic_lookup",
+                f"-I{lj_src / 'src'}",
+                str(u8_src / "lutf8lib.c"),
+                "-o",
+                str(utf8_out),
+            ]
+        else:
+            cc_cmd = [
+                cc_bin,
+                "-O2",
+                "-fPIC",
+                "-shared",
+                f"-I{lj_src / 'src'}",
+                str(u8_src / "lutf8lib.c"),
+                "-o",
+                str(utf8_out),
+            ]
+
+        u8_proc = subprocess.run(cc_cmd, env=env, capture_output=True, text=True, timeout=120)
+        if u8_proc.returncode != 0:
+            tail = (u8_proc.stderr or u8_proc.stdout or "")[-600:]
+            raise UpdateError(f"Failed to compile lua-utf8.so (exit {u8_proc.returncode}): {tail}")
+        os.chmod(utf8_out, 0o755)
+
+        # Quick self-test: compound assignment (+= / ..=) + require("lua-utf8")
+        check_env = env.copy()
+        check_env["LUA_CPATH"] = f"{out_bin_dir}/?.so;;"
+        check_proc = subprocess.run(
+            [
+                str(luajit_out),
+                "-e",
+                'local c = 1; c += 41; assert(c == 42); local s = "po"; s ..= "b"; assert(s == "pob"); '
+                'local u = require("lua-utf8"); assert(u.len("流放") == 2)',
+            ],
+            env=check_env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if check_proc.returncode != 0:
+            tail = (check_proc.stderr or check_proc.stdout or "")[-400:]
+            raise UpdateError(f"Compiled POSIX LuaJIT runtime failed self-test: {tail}")
+
+        return {
+            Path("bin") / "luajit": luajit_out,
+            Path("bin") / "lua-utf8.so": utf8_out,
+        }
+
+
+def ensure_posix_runtime(
+    engine_dir: Path,
+    staging_dir: Path,
+    *,
+    proxy: str | None = None,
+    mirror: str | None = None,
+) -> dict[Path, Path]:
+    """Ensure macOS/Linux native LuaJIT + lua-utf8.so exist (prebuilt download or local source build)."""
+    if is_windows():
+        return {}
+    if os.environ.get("POB_ENGINE_CMD", "").strip() or os.environ.get("POB_LUAJIT", "").strip():
+        return {}
+    eng = Path(engine_dir)
+    if (eng / "bin" / "luajit").is_file() and (eng / "bin" / "lua-utf8.so").is_file():
+        return {}
+
+    prebuilt = _try_download_prebuilt_posix_runtime(staging_dir, proxy=proxy, mirror=mirror)
+    if prebuilt:
+        return prebuilt
+    return _build_posix_runtime_from_source(staging_dir, proxy=proxy, mirror=mirror)
 
 
 def _apply_staged_files_with_gate(
@@ -1187,12 +1573,13 @@ def bootstrap_engine(
     if from_dir is not None:
         src = Path(from_dir)
         if not is_valid_engine_dir(src):
-            raise UpdateError(f"Offline source directory is invalid (requires pob-zh.exe and PoE1/): {src}")
+            req_desc = "pob-zh.exe and PoE1/" if is_windows() else "PoE1/, Data/bridge/bridge.lua, and LuaJIT"
+            raise UpdateError(f"Offline source directory is invalid (requires {req_desc}): {src}")
         eng_dir.mkdir(parents=True, exist_ok=True)
         for fname in LEGACY_SEED_FILES:
             if (src / fname).is_file():
                 shutil.copy2(src / fname, eng_dir / fname)
-        for dname in LEGACY_SEED_DIRS:
+        for dname in (*LEGACY_SEED_DIRS, "bin"):
             if (src / dname).is_dir():
                 shutil.copytree(src / dname, eng_dir / dname, dirs_exist_ok=True)
 
@@ -1260,7 +1647,7 @@ def bootstrap_engine(
 
         staged_files: dict[Path, Path] = {}
 
-        # Download & stage PobTools-zh full host zip
+        # Download & stage PobTools-zh host zip (Windows: full host; POSIX: Data/bridge + Data/ only)
         tools_manifest = tools_info.get("manifest")
         if not isinstance(tools_manifest, dict):
             raise UpdateError("PobTools-zh release manifest JSON missing.")
@@ -1275,8 +1662,20 @@ def bootstrap_engine(
                 proxy=proxy,
                 mirror=mirror,
                 skip_prefixes=("PoE1",),
+                only_prefixes=() if is_windows() else ("Data",),
             )
         )
+
+        # Ensure native POSIX LuaJIT + lua-utf8.so runtime on macOS / Linux
+        if not is_windows():
+            staged_files.update(
+                ensure_posix_runtime(
+                    eng_dir,
+                    staging_dir,
+                    proxy=proxy,
+                    mirror=mirror,
+                )
+            )
 
         # Optional bilingual DataV2 pack (honoring minApp)
         installed_data_ver: str | None = None
@@ -1721,6 +2120,7 @@ def check_and_apply_updates(
                         proxy=proxy,
                         mirror=mirror,
                         skip_prefixes=("PoE1",),
+                        only_prefixes=() if is_windows() else ("Data",),
                     )
                 )
 

@@ -59,7 +59,16 @@ def _make_fake_engine(root: Path, version: str = "2.67.2", files: dict[str, byte
     (root / "pob-zh.ini").write_text("[PobTools]\nGame=poe1\n", encoding="utf-8")
     (root / "engine").mkdir(exist_ok=True)
     (root / "engine" / "lua51.dll").write_bytes(b"fake-dll")
+    (root / "bin").mkdir(exist_ok=True)
+    fake_lj = root / "bin" / "luajit"
+    fake_lj.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    try:
+        fake_lj.chmod(0o755)
+    except OSError:
+        pass
     (root / "Data").mkdir(exist_ok=True)
+    (root / "Data" / "bridge").mkdir(parents=True, exist_ok=True)
+    (root / "Data" / "bridge" / "bridge.lua").write_text("-- fake bridge\n", encoding="utf-8")
     (root / "Data" / "translations_version.json").write_text(
         json.dumps({"dataVersion": "data-19"}), encoding="utf-8"
     )
@@ -484,6 +493,10 @@ def test_clean_bootstrap_from_github_dual_upstream(tmp_path: Path, monkeypatch: 
         return httpx.Response(404)
 
     _patch_updater_http(monkeypatch, handler)
+    import pob_cli.updater as upd_mod
+
+    if not upd_mod.is_windows():
+        monkeypatch.setattr(upd_mod, "ensure_posix_runtime", lambda *_a, **_kw: {})
 
     res = bootstrap_engine(
         target_dir=target,
@@ -495,9 +508,73 @@ def test_clean_bootstrap_from_github_dual_upstream(tmp_path: Path, monkeypatch: 
     assert res["localPobVersion"] == "2.68.1"
     assert res["pobToolsVersion"] == "1.8.12"
     assert res["dataVersion"] == "data-24"
-    assert (target / "pob-zh.exe").read_bytes() == b"MZ-new-host"
+    if upd_mod.is_windows():
+        assert (target / "pob-zh.exe").read_bytes() == b"MZ-new-host"
+    else:
+        assert not (target / "pob-zh.exe").exists()
+        assert (target / "Data" / "bridge" / "bridge.lua").read_bytes() == b"-- bridge"
     assert (target / "Data" / "poe1" / "zh-rCN" / "gems.json").is_file()
     assert (target / "PoE1" / "Modules" / "Main.lua").read_bytes() == pob_main
+
+
+def test_posix_engine_validation_command_and_manifest_filtering(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import pob_cli.updater as upd_mod
+
+    # 1. Bundled headless_runner.lua must always be shipped inside package
+    runner_path = upd_mod.get_bundled_headless_runner_path()
+    assert runner_path.is_file()
+    assert "PobToolsBridgeSetDispatcher" in runner_path.read_text(encoding="utf-8")
+
+    # 2. Manifest filtering on POSIX skips win32 runtime DLLs while keeping pure Lua files
+    manifest_xml = (
+        "<?xml version='1.0' encoding='UTF-8'?>\n"
+        "<PoBVersion>\n"
+        '\t<Version number="2.68.1" />\n'
+        '\t<Source part="program" url="https://example.invalid/src/" />\n'
+        '\t<Source part="runtime" url="https://example.invalid/runtime/" />\n'
+        '\t<File name="Modules/Main.lua" part="program" sha1="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" />\n'
+        '\t<File name="lua/dkjson.lua" part="runtime" sha1="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" />\n'
+        '\t<File name="SimpleGraphic.dll" part="runtime" runtime="win32" sha1="cccccccccccccccccccccccccccccccccccccccc" />\n'
+        "</PoBVersion>\n"
+    )
+    win_man = parse_pob_manifest(manifest_xml, include_win32_runtime=True)
+    posix_man = parse_pob_manifest(manifest_xml, include_win32_runtime=False)
+    assert "SimpleGraphic.dll" in win_man.files
+    assert "SimpleGraphic.dll" not in posix_man.files
+    assert "Modules/Main.lua" in posix_man.files
+    assert "lua/dkjson.lua" in posix_man.files
+
+    # 3. Simulate macOS/Linux engine validation and command construction
+    monkeypatch.setattr(upd_mod, "is_windows", lambda: False)
+    monkeypatch.delenv("POB_ENGINE_CMD", raising=False)
+    monkeypatch.delenv("POB_LUAJIT", raising=False)
+    monkeypatch.setattr(upd_mod.shutil, "which", lambda _name: None)
+
+    eng = tmp_path / "posix_eng"
+    (eng / "PoE1").mkdir(parents=True)
+    assert upd_mod.is_valid_engine_dir(eng) is False
+
+    (eng / "Data" / "bridge").mkdir(parents=True)
+    (eng / "Data" / "bridge" / "bridge.lua").write_text("-- bridge\n", encoding="utf-8")
+    assert upd_mod.is_valid_engine_dir(eng) is False
+
+    (eng / "bin").mkdir(parents=True)
+    lj = eng / "bin" / "luajit"
+    lj.write_text("#!/bin/sh\n", encoding="utf-8")
+    assert upd_mod.is_valid_engine_dir(eng) is True
+
+    cmd, extra_env = upd_mod.build_engine_command(eng)
+    assert cmd == [
+        str(lj),
+        str(runner_path),
+        str(eng / "PoE1"),
+        str(eng / "Data" / "bridge" / "bridge.lua"),
+    ]
+    assert extra_env["POB_ZH_HEADLESS"] == "1"
+    assert extra_env["POB_GAME"] == "poe1"
+    assert extra_env["POB_ENGINE_ROOT"] == str(eng)
 
 
 # ---------------------------------------------------------------------------
