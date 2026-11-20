@@ -140,6 +140,7 @@ jobs:
           POB_RUNTIME_DIR: ${{ runner.temp }}/pob-e2e-rt
           POB_LEGACY_DIR: ""
         run: |
+          trap 'echo "=== daemon.log ==="; cat "$POB_RUNTIME_DIR/daemon.log" 2>/dev/null || true' ERR
           mkdir -p "$POB_RUNTIME_DIR/engine"
           cp -R runtime-dist/bin "$POB_RUNTIME_DIR/engine/bin"
 

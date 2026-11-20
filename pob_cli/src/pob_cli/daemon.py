@@ -54,6 +54,7 @@ from .mutators import (
 )
 from .snapshot import redo_build, undo_build
 from .updater import (
+    OK_STATES,
     STATE_BOOTSTRAP_MISSING,
     check_and_apply_updates,
     format_stderr_update_alert,
@@ -169,9 +170,16 @@ class DaemonManager:
         self._stopping = False
 
     def start(self) -> None:
-        """Check/apply updates before launching any pob-zh.exe worker, then start main_worker."""
+        """Check/apply updates before launching any engine worker, then start main_worker."""
         with self._lock:
-            if not self.skip_update_check:
+            checked_at = float(self.update_status.get("checkedAt") or 0.0)
+            fresh_ok = (
+                self.update_status.get("state") in OK_STATES
+                and (time.time() - checked_at) < UPDATE_RECHECK_INTERVAL_SEC
+                and is_valid_engine_dir(self.pob_dir)
+                and str(self.update_status.get("engineDir") or "") == str(self.pob_dir)
+            )
+            if not self.skip_update_check and not fresh_ok:
                 self.update_status = check_and_apply_updates(
                     engine_dir=self._explicit_pob_dir,
                     runtime_dir=self.runtime_dir,
@@ -992,8 +1000,8 @@ def call_daemon(
                     **popen_kwargs,
                 )
 
-        # Wait up to 25 seconds for daemon.json to appear and respond (fast-failing on boot_error)
-        deadline = time.monotonic() + 25.0
+        # Wait up to 60 seconds for daemon.json to appear and respond (fast-failing on boot_error)
+        deadline = time.monotonic() + 60.0
         with httpx.Client(timeout=5.0, trust_env=False) as ping_client:
             while time.monotonic() < deadline:
                 boot_err = _read_boot_error(rt_dir)
@@ -1032,7 +1040,15 @@ def call_daemon(
 
                 time.sleep(0.05)
             else:
-                raise RuntimeError(f"Timed out waiting for PoB daemon to start. Check {log_path}.")
+                tail = ""
+                try:
+                    if log_path.is_file():
+                        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                        if lines:
+                            tail = " | log tail: " + " ; ".join(lines[-8:])
+                except OSError:
+                    pass
+                raise RuntimeError(f"Timed out waiting for PoB daemon to start. Check {log_path}.{tail}")
     finally:
         if acquired_lock:
             try:
