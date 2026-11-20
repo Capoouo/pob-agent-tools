@@ -52,6 +52,7 @@ RESET_EVERY = 150  # each calculated seed leaves one more item in the build; rel
 MIN_SAMPLE = 200  # groups calculated before the first estimate
 MIN_SEEN = 2  # ... holding every (node, table byte) at least this often
 VERIFY_BATCH = 50  # estimated-best groups calculated per round
+SELF_CHECK = 10  # groups whose second seed is recalculated at the end to confirm the grouping
 _SEED_LINE = re.compile(r"^(?:\{variant:[\d,]+\})?(.*\((\d+)-(\d+)\).* (\w+))$")
 
 
@@ -121,18 +122,8 @@ def load_node_index(game_dir: Path) -> dict[int, int]:
 
 
 def load_table(game_dir: Path, stem: str) -> bytes:
-    """Decompressed lookup table. Reads PoB's files only; never writes next to them."""
-    folder = Path(game_dir) / "Data" / "TimelessJewelData"
-    packed = folder / f"{stem}.zip"
-    if packed.exists():
-        raw = packed.read_bytes()
-    else:
-        parts = sorted(folder.glob(f"{stem}.zip.part*"), key=lambda p: int(p.suffix[5:]))
-        raw = b"".join(p.read_bytes() for p in parts)
-    try:
-        return zlib.decompress(raw)
-    except zlib.error:
-        return zlib.decompress(raw, -15)
+    """Decompressed lookup table. Reads PoB's file only; never writes next to it."""
+    return zlib.decompress((Path(game_dir) / "Data" / "TimelessJewelData" / f"{stem}.zip").read_bytes())
 
 
 def group_seeds(seeds: Sequence[int], table: bytes, index: dict[int, int], nodes: Sequence[int]) -> dict[bytes, list[int]]:
@@ -314,7 +305,6 @@ def search(
     top: int = 15,
     workers: int | None = None,
     exact: bool = False,
-    verify: int = 10,
     progress: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     """Find the seeds of a timeless jewel at `socket` that give the highest `stat`.
@@ -366,21 +356,38 @@ def search(
         lock = threading.Lock()
         results: dict[bytes, dict[str, Any]] = {}
 
+        stop = threading.Event()  # the search cannot finish any more: engines must not work through their share
+
         def calculate(sigs: Sequence[bytes]) -> None:
             n = min(n_workers, len(sigs))
             engines.extend([None] * (n - len(engines)))
 
             def work(i: int) -> None:
-                engine = engines[i] = engines[i] or Engine(code, template, slot, clear)
-                for sig in sigs[i::n]:
-                    stats = engine.stats(groups[sig][0])
-                    with lock:
-                        results[sig] = stats
-                        if len(results) % 1000 == 0:
-                            say(f"{len(results)} calculated")
+                try:
+                    engine = engines[i] = engines[i] or Engine(code, template, slot, clear)
+                    for sig in sigs[i::n]:
+                        if stop.is_set():
+                            return
+                        stats = engine.stats(groups[sig][0])
+                        with lock:
+                            results[sig] = stats
+                            if len(results) % 1000 == 0:
+                                say(f"{len(results)} calculated")
+                except BaseException:
+                    stop.set()
+                    raise
 
             with ThreadPoolExecutor(n) as pool:
-                list(pool.map(work, range(n)))
+                futures = [pool.submit(work, i) for i in range(n)]
+                try:
+                    # polled: on Windows a plain wait on the pool sees Ctrl+C only after every engine is done
+                    while not all(future.done() for future in futures):
+                        time.sleep(0.1)
+                except BaseException:
+                    stop.set()
+                    raise
+                for future in futures:
+                    future.result()
 
         rng = random.Random(1)
         all_sigs = list(groups)
@@ -392,7 +399,7 @@ def search(
 
         # Self-check: another member of a group must give the very same numbers as its representative.
         multi = [sig for sig in results if len(groups[sig]) > 1]
-        picks = rng.sample(multi, min(verify, len(multi)))
+        picks = rng.sample(multi, min(SELF_CHECK, len(multi)))
         mismatches = []
         for sig in picks:
             other = rng.choice(groups[sig][1:])
@@ -406,11 +413,14 @@ def search(
     outcomes: dict[tuple[Any, ...], list[int]] = defaultdict(list)
     for sig, stats in results.items():
         outcomes[tuple(stats[key] for key in STAT_KEYS)].extend(groups[sig])
-    ranked = sorted(outcomes.items(), key=lambda kv: -(kv[0][STAT_KEYS.index(stat)] or 0))
-    # The estimate only speaks for seeds at or above the value of the `top`-th best calculated group.
+    rank = STAT_KEYS.index(stat)
+    ranked = sorted(outcomes.items(), key=lambda kv: -(kv[0][rank] or 0))
+    # The estimate only speaks for seeds at or above the value of the `top`-th best calculated group. What the
+    # sample happened to hit below that is left out: it would read as a ranking and is not one.
     cutoff = None
     if estimate:
         cutoff = sorted((float(s.get(stat) or 0) for s in results.values()), reverse=True)[min(top, len(results)) - 1]
+        ranked = [kv for kv in ranked if (kv[0][rank] or 0) >= cutoff]
     return {
         "cutoff": cutoff,
         "jewel": name,

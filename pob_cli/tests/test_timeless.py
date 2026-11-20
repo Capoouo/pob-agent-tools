@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+import random
+import signal
+import threading
+import time
 import zlib
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -123,8 +128,6 @@ def test_fit_pieces_recovers_additive_effects_for_unseen_combinations() -> None:
 
 
 def test_narrow_down_finds_a_rare_valuable_byte_without_calculating_everything() -> None:
-    import random
-
     # 3 nodes x 12 table bytes; byte 99 on node 0 is rare (5 groups of 1733) and worth far more than the rest
     sigs = [bytes([a, b, c]) for a in range(12) for b in range(12) for c in range(12)]
     sigs += [bytes([99, b, 0]) for b in range(5)]
@@ -158,19 +161,21 @@ def test_engine_keeps_braces_in_item_lines_and_takes_other_jewels_out_after_each
 
 
 class FakeEngine:
-    """Stands in for a PoB engine: sockets 7 (holding a Brutal Restraint) and 9 are allocated, socket 11 is not,
-    922 is an allocated notable."""
+    """Stands in for a PoB engine. Jewel sockets 7 (holding a Brutal Restraint) and 9 are allocated, socket 11 is
+    not; 101-103 are allocated notables inside the jewel's radius, 922 is one outside it. A seed is worth `value`."""
 
     game_dir: Path
-    made: list[FakeEngine] = []
+    made: list[FakeEngine]
+    value: Callable[[int], float]
 
     def __init__(self, code: str, template: str, slot: str, clear: object = ()) -> None:
         self.template, self.slot, self.clear, self.worker = template, slot, clear, self
-        FakeEngine.made.append(self)
+        self.made.append(self)
 
     def call(self, method: str, params: dict, timeout: float = 0) -> dict:
         assert method == "get_tree_state"
-        return {"allocatedNodes": [7, 9, 922], "overrides": {},
+        return {"allocatedNodes": [7, 9, 101, 102, 103, 922],
+                "overrides": {str(node): {"why": "conquered"} for node in (101, 102, 103)},
                 "sockets": [{"nodeId": 7, "title": "Brutal Restraint"}, {"nodeId": 9}, {"nodeId": 11}]}
 
     def reset(self) -> None:
@@ -179,37 +184,88 @@ class FakeEngine:
     stop = reset
 
     def read(self) -> dict:
-        return {}
+        return dict.fromkeys(timeless.STAT_KEYS, 0.0)
 
     def stats(self, seed: int) -> dict:
-        raise RuntimeError("reached PoB")
+        return dict.fromkeys(timeless.STAT_KEYS, type(self).value(seed))
 
 
-def test_search_rejects_non_sockets_and_takes_out_a_second_historic_jewel(game_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    FakeEngine.game_dir, FakeEngine.made = game_dir, []
+@pytest.fixture
+def fake_engine(game_dir: Path, monkeypatch: pytest.MonkeyPatch) -> type[FakeEngine]:
+    FakeEngine.game_dir, FakeEngine.made, FakeEngine.value = game_dir, [], lambda seed: 1.0
     monkeypatch.setattr(timeless, "Engine", FakeEngine)
+    return FakeEngine
+
+
+def test_search_rejects_non_sockets_and_takes_out_a_second_historic_jewel(fake_engine: type[FakeEngine]) -> None:
     for node in (922, 11, 5):  # an allocated notable, an unallocated socket, no such node
         with pytest.raises(ValueError, match="not an allocated jewel socket"):
-            timeless.search("code", "", node, "Militant Faith")
-    with pytest.raises(RuntimeError, match="reached PoB"):
-        timeless.search("code", "", 9, "Militant Faith")
-    assert FakeEngine.made[-1].clear == ["Jewel 7"]  # the game allows one Historic jewel
-    with pytest.raises(RuntimeError, match="reached PoB"):
-        timeless.search("code", "", 7, "Militant Faith")  # replaced in its own socket: nothing else to take out
-    assert FakeEngine.made[-1].clear == []
+            timeless.search("code", "", node, "Festering Vengeance")
+    res = timeless.search("code", "", 9, "Festering Vengeance", workers=2)
+    assert res["removed"] == [{"jewel": "Brutal Restraint", "socket": 7}]  # the game allows one Historic jewel
+    assert [engine.clear for engine in fake_engine.made[-2:]] == [["Jewel 7"]] * 2  # ... so no engine keeps it
+    # replacing it in its own socket leaves nothing else to take out
+    assert timeless.search("code", "", 7, "Festering Vengeance", workers=1)["removed"] == []
 
 
-def test_load_table_reads_single_file_and_numbered_parts(tmp_path: Path) -> None:
-    folder = tmp_path / "Data" / "TimelessJewelData"
-    folder.mkdir(parents=True)
-    payload = bytes(range(256)) * 50
-    packed = zlib.compress(payload)
-    (folder / "One.zip").write_bytes(packed)
-    cut = len(packed) // 3
-    for i, chunk in enumerate([packed[:cut], packed[cut:2 * cut], packed[2 * cut:]]):
-        (folder / f"Split.zip.part{i}").write_bytes(chunk)
-    assert timeless.load_table(tmp_path, "One") == payload
-    assert timeless.load_table(tmp_path, "Split") == payload
+def test_search_stops_every_engine_when_one_fails(fake_engine: type[FakeEngine], monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[int] = []
+
+    class Dying(FakeEngine):
+        def stats(self, seed: int) -> dict:
+            if self is not self.made[0]:
+                raise RuntimeError("engine died")
+            calls.append(seed)
+            time.sleep(0.001)
+            return {}
+
+    monkeypatch.setattr(timeless, "Engine", Dying)
+    with pytest.raises(RuntimeError, match="engine died"):
+        timeless.search("code", "", 9, "Festering Vengeance", workers=2)
+    assert len(calls) < 500  # the surviving engine's share is 3,950 seeds: it must not work through them
+
+
+def test_search_stops_on_ctrl_c(fake_engine: type[FakeEngine]) -> None:
+    calls: list[int] = []
+
+    def slow(seed: int) -> float:
+        calls.append(seed)
+        time.sleep(0.001)
+        return 1.0
+
+    fake_engine.value = slow
+    timer = threading.Timer(0.3, lambda: signal.raise_signal(signal.SIGINT))  # off the main thread, like Ctrl+C
+    timer.start()
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            timeless.search("code", "", 9, "Festering Vengeance", workers=2)
+    finally:
+        timer.cancel()
+    assert len(calls) < 4000  # of 7,901: on Windows a plain wait on the pool would have let them all finish first
+
+
+def test_estimated_search_misses_nothing_and_reports_only_what_it_covers(fake_engine: type[FakeEngine]) -> None:
+    seeds = range(2000, 10001)
+    rng = random.Random(0)
+    rows = [bytes(rng.randrange(12) for _ in seeds) for _ in range(3)]  # the table rows of notables 101-103
+    folder = fake_engine.game_dir / "Data" / "TimelessJewelData"
+    folder.mkdir()
+    (folder / "MilitantFaith.zip").write_bytes(zlib.compress(b"".join(rows)))
+    (folder / "NodeIndexMapping.lua").write_text(
+        'nodeIDList["sizeNotable"] = 3\n' + "".join(f"nodeIDList[{101 + i}] = {{ index = {i}, size = 1 }}\n" for i in range(3)),
+        encoding="utf-8",
+    )
+
+    def value(seed: int) -> float:
+        a, b, c = (row[seed - 2000] for row in rows)
+        return 1000.0 * (1 + a / 50) * (1 + b / 80) * (1 + c / 200)
+
+    fake_engine.value = value
+    res = timeless.search("code", "", 9, "Militant Faith", top=5, workers=2)
+    assert res["estimate"] and res["calculated"] < res["groupCount"] // 2
+    found = {seed: outcome["stats"]["CombinedDPS"] for outcome in res["outcomes"] for seed in outcome["seeds"]}
+    # every seed at or above the reported level and nothing below it: rows the sample merely hit are not a ranking
+    assert found == {seed: value(seed) for seed in seeds if value(seed) >= res["cutoff"]}
 
 
 def test_real_engine_tables_match_their_seed_ranges() -> None:

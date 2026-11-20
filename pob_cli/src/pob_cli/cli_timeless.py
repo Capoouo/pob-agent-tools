@@ -8,25 +8,17 @@ from typing import Any
 import click
 
 from . import timeless
+from .cli_trade import _echo_utf8, _err_utf8
 from .daemon import BootstrapMissingError, call_daemon
 from .formatters import render_table, to_json_str
 from .updater import format_stderr_update_alert
-
-
-def _echo(text: str, err: bool = False) -> None:
-    stream = sys.stderr if err else sys.stdout
-    try:
-        stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
-    except Exception:
-        pass
-    click.echo(text, err=err)
 
 
 def _export_build(target: str) -> dict[str, Any]:
     try:
         return call_daemon("export", {"target": target, "include_xml": True})
     except BootstrapMissingError as exc:
-        _echo(format_stderr_update_alert(exc.update_status) or str(exc), err=True)
+        _err_utf8(format_stderr_update_alert(exc.update_status) or str(exc))
         sys.exit(1)
 
 
@@ -48,14 +40,14 @@ def cmd_timeless_list(target: str, as_json: bool) -> None:
     """List timeless jewel types and the build's allocated jewel sockets."""
     info = timeless.describe(_export_build(target)["code"])
     if as_json:
-        _echo(to_json_str(info))
+        _echo_utf8(to_json_str(info))
         return
-    _echo("### Timeless jewels\n" + render_table(
+    _echo_utf8("### Timeless jewels\n" + render_table(
         ["Jewel", "Local Name", "Seeds", "Conquerors", "Search"],
         [[j["name"], j["nameLocal"], j["seeds"], ", ".join(j["conquerors"]),
           "grouped" if j["grouped"] else "every seed"] for j in info["jewels"]],
     ))
-    _echo(f"\n### Allocated jewel sockets (`{target}`)\n" + render_table(
+    _echo_utf8(f"\n### Allocated jewel sockets (`{target}`)\n" + render_table(
         ["--socket", "Near", "Local Name"],
         [[s["nodeId"], s["label"], s["labelLocal"]] for s in info["sockets"]],
     ))
@@ -73,7 +65,7 @@ def cmd_timeless_list(target: str, as_json: bool) -> None:
 @click.option("--idle", is_flag=True, help="Run at the lowest CPU priority.")
 @click.option("--exact", is_flag=True, help="Calculate every group instead of estimating which ones can reach the top.")
 @click.option("--target", type=click.Choice(["main", "ref"]), default="main")
-@click.option("--json", "as_json", is_flag=True, help="Output raw JSON (all outcomes).")
+@click.option("--json", "as_json", is_flag=True, help="Output raw JSON.")
 def cmd_timeless_search(
     jewel: str,
     socket: int,
@@ -95,21 +87,19 @@ def cmd_timeless_search(
         res = timeless.search(
             build["code"], build.get("xml") or "", socket, jewel,
             conqueror=conqueror, mods=mods, stat=stat, top=top, workers=workers, exact=exact,
-            progress=None if as_json else lambda msg: _echo(f"  {msg}", err=True),
+            progress=None if as_json else lambda msg: _err_utf8(f"  {msg}"),
         )
     except ValueError as exc:
-        _echo(str(exc), err=True)
+        _err_utf8(str(exc))
         sys.exit(1)
 
     if as_json:
-        _echo(to_json_str(res))
+        _echo_utf8(to_json_str(res))
         return
 
     base = res["baseline"]
     rows = [["now", f"{base['CombinedDPS']:,.0f}", "", f"{base['TotalEHP']:,.0f}", "", base["Life"], "-", "socket as loaded"]]
-    shown = res["outcomes"][:top]
-    if res["cutoff"] is not None:  # estimated search: list only the outcomes the estimate speaks for
-        shown = [o for o in res["outcomes"] if (o["stats"].get(stat) or 0) >= res["cutoff"]]
+    shown = res["outcomes"] if res["estimate"] else res["outcomes"][:top]  # an estimate returns only what it covers
     for i, outcome in enumerate(shown, 1):
         s, seeds = outcome["stats"], outcome["seeds"]
         rows.append([
@@ -118,21 +108,21 @@ def cmd_timeless_search(
             ", ".join(map(str, seeds[:6])) + (" ..." if len(seeds) > 6 else ""),
         ])
     check, est = res["selfCheck"], res["estimate"]
-    _echo(
+    _echo_utf8(
         f"### Timeless Search: `{res['jewel']}` ({res['conqueror']}) at socket `{res['socket']}` - "
         f"{res['seedCount']:,} seeds in {res['groupCount']:,} groups, {res['calculated']:,} calculated on "
         f"{res['workers']} engines in {res['seconds']}s, ranked by `{stat}`\n"
         + render_table(["#", "Combined DPS", "vs now", "Total EHP", "vs now", "Life", "Seeds", "Seed numbers"], rows)
     )
     for other in res["removed"]:
-        _echo(f"\n> `{other['jewel']}` at socket `{other['socket']}` was taken out for this search: "
+        _echo_utf8(f"\n> `{other['jewel']}` at socket `{other['socket']}` was taken out for this search: "
               "the game allows one Historic jewel.")
     if est:
         err = f"{est['maxError'] * 100:.2f}%" if est["relative"] else f"{est['maxError']:.3g}"
-        _echo(
+        _echo_utf8(
             f"\n> Rows are real PoB results. The other {res['groupCount'] - res['calculated']:,} groups were not "
             f"calculated: an estimate fitted on the calculated ones (error allowed for: {err}) puts none of them in "
             f"the top {top}. That is an estimate, not a proof; `--exact` calculates everything."
         )
     if check["mismatches"]:
-        _echo(f"\n> [WARN] Seeds {check['mismatches']} differ from their group; please report this build and jewel.")
+        _echo_utf8(f"\n> [WARN] Seeds {check['mismatches']} differ from their group; please report this build and jewel.")
