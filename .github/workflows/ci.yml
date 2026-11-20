@@ -85,3 +85,4 @@ jobs:
             throw "Expected bootstrap guidance in stderr. Output: $out"
           }
           Write-Host "Frozen pob.exe smoke test passed."
+          exit 0

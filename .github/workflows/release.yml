@@ -96,6 +96,7 @@ jobs:
             throw "Frozen daemon smoke test failed (exit $LASTEXITCODE): $out"
           }
           Write-Host "Standalone pob.exe smoke test passed ($ver)."
+          exit 0
 
       - name: Package Windows x64 zip and SHA256SUMS.txt
         id: pack
