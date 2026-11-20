@@ -49,6 +49,7 @@ from .mutators import (
     set_class_ascendancy,
     set_flask_active,
     switch_main,
+    trade_eval_items,
     try_item,
 )
 from .snapshot import redo_build, undo_build
@@ -682,6 +683,13 @@ class DaemonManager:
                 self.get_worker(target),
                 ops=params.get("ops") or [],
                 apply=bool(params.get("apply", False)),
+            )
+
+        if action == "trade_eval_items":
+            return trade_eval_items(
+                self.get_worker(target),
+                slot_name=params.get("slot") or params.get("slotName"),
+                items=list(params.get("items") or []),
             )
 
         if action == "matrix":

@@ -8,7 +8,7 @@ from typing import Any
 from .analyzer import resolve_skill_group_index, resolve_slot_name
 from .bridge_client import BridgeWorker
 from .formatters import strip_pob_escapes
-from .snapshot import run_mutation
+from .snapshot import capture_digest, diff_digest, run_mutation
 
 
 def try_item(
@@ -1480,3 +1480,80 @@ def run_batch(
         return {"steps": step_results}
 
     return run_mutation(worker, _do_batch, apply=apply)
+
+
+def trade_eval_items(
+    worker: BridgeWorker,
+    *,
+    slot_name: str | None,
+    items: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Read-only batch what-if evaluation of candidate items against a single build snapshot.
+
+    Captures `export_code` and `capture_digest` once under `worker.lock`, evaluates each
+    candidate item isolated against `snap_before` (preventing 2H/shield or item-granted
+    skill bleed between candidates), and always restores `snap_before` in `finally`.
+    """
+    if not items:
+        return {"slotName": slot_name, "before": None, "results": []}
+
+    with worker.lock:
+        resolved_slot = resolve_slot_name(worker, slot_name) if slot_name else None
+        snap_before = worker.call("export_code", {})["code"]
+        digest_before = capture_digest(worker)
+        before_summary = {
+            "primaryDpsKey": digest_before["primaryDpsKey"],
+            "primaryDps": digest_before["primaryDps"],
+            "totalEhp": digest_before["totalEhp"],
+            "life": digest_before["life"],
+            "points": digest_before.get("buildInfo", {}).get("points", {}),
+        }
+
+        results: list[dict[str, Any]] = []
+        dirty = False
+        try:
+            for entry in items:
+                item_id = entry.get("id")
+                raw_clean = str(entry.get("raw") or "").strip()
+                if not raw_clean:
+                    results.append({"id": item_id, "ok": False, "error": "Empty item text."})
+                    continue
+
+                if dirty:
+                    worker.call("import_code", {"code": snap_before, "mode": "replace"})
+                    dirty = False
+
+                try:
+                    add_params: dict[str, Any] = {"raw": raw_clean, "equip": True}
+                    if resolved_slot:
+                        add_params["slotName"] = resolved_slot
+                    dirty = True
+                    worker.call("add_item", add_params)
+                    digest_after = capture_digest(worker)
+                    diff = diff_digest(digest_before, digest_after)
+                    results.append(
+                        {
+                            "id": item_id,
+                            "ok": True,
+                            "before": before_summary,
+                            "after": {
+                                "primaryDpsKey": digest_after["primaryDpsKey"],
+                                "primaryDps": digest_after["primaryDps"],
+                                "totalEhp": digest_after["totalEhp"],
+                                "life": digest_after["life"],
+                                "points": digest_after.get("buildInfo", {}).get("points", {}),
+                            },
+                            "diff": diff,
+                        }
+                    )
+                except Exception as exc:
+                    results.append({"id": item_id, "ok": False, "error": str(exc)})
+        finally:
+            if dirty:
+                worker.call("import_code", {"code": snap_before, "mode": "replace"})
+
+        return {
+            "slotName": resolved_slot or slot_name,
+            "before": before_summary,
+            "results": results,
+        }

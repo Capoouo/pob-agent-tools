@@ -13,6 +13,7 @@ from typing import Any
 import click
 
 from . import __version__
+from .cli_trade import bench_group, trade_group
 from .daemon import (
     BootstrapMissingError,
     call_daemon,
@@ -163,6 +164,10 @@ def main(offline: bool) -> None:
     """Headless Path of Building (PoB) CLI for build inspection, what-if testing, and optimization."""
     if offline:
         os.environ["POB_OFFLINE"] = "1"
+
+
+main.add_command(trade_group)
+main.add_command(bench_group)
 
 
 @main.command("_daemon", hidden=True)

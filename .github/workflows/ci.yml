@@ -63,6 +63,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "pob.exe --help failed" }
           & $exe _daemon --help | Out-Null
           if ($LASTEXITCODE -ne 0) { throw "pob.exe _daemon --help failed" }
+          & $exe bench list --slot gloves --limit 3 | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "pob.exe bench list failed (missing bundled bench_costs.json?)" }
+          & $exe bench suggest --slot gloves --stat "to Cold Resistance" --json | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "pob.exe bench suggest failed" }
+          & $exe trade convert --text "Rarity: RARE`nDoom Hand`nSlink Gloves`nImplicits: 0`n+42% to Fire Resistance" --to cold --json | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "pob.exe trade convert failed" }
 
           # Verify frozen daemon subprocess spawns and fast-fails cleanly when no engine exists
           $rt = Join-Path $env:RUNNER_TEMP "pob-smoke-rt"

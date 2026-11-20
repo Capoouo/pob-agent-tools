@@ -3,11 +3,11 @@
 High-signal CLI, managed dual-upstream headless engine, offline Lua game-data SQLite index, and persistent dual-slot daemon for **Path of Building (PoE 1)**, purpose-built for AI Agents and power users.
 
 > **Acknowledgements & Lineage**  
-> Inspired by [**ianderse/pob-mcp**](https://github.com/ianderse/pob-mcp) (GPL-3.0) and [**shalayiding/POEMCP**](https://github.com/shalayiding/POEMCP), powered by [**Hsiung-Shao/PobTools-zh**](https://github.com/Hsiung-Shao/PobTools-zh) (`pob-zh.exe --engine-headless` + `bridge.lua`) and official [**PathOfBuildingCommunity/PathOfBuilding**](https://github.com/PathOfBuildingCommunity/PathOfBuilding).
+> Inspired by [**ianderse/pob-mcp**](https://github.com/ianderse/pob-mcp) (GPL-3.0) and [**shalayiding/POEMCP**](https://github.com/shalayiding/POEMCP), powered by [**Hsiung-Shao/PobTools-zh**](https://github.com/Hsiung-Shao/PobTools-zh) (`pob-zh.exe --engine-headless` + `bridge.lua`) and official [**PathOfBuildingCommunity/PathOfBuilding**](https://github.com/PathOfBuildingCommunity/PathOfBuilding). Trade upgrade workflow, Harvest same-tier conversion, and crafting-bench fallback design pioneered by [**ChangMenQAQ**](https://github.com/ChangMenQAQ) in [PR #1](https://github.com/exilemoulei/pob-agent-tools/pull/1).
 
 ---
 
-## Key Features (v0.2)
+## Key Features (v0.3)
 
 - **Managed Dual-Upstream Engine & Auto-Update (`pob bootstrap` / `pob update`)**:
   - Automatically resolves `POB_ROOT` -> `<POB_RUNTIME_DIR>/engine` (defaults to `%LOCALAPPDATA%\pob-agent-tools\engine` when installed, or `<repo>/.runtime/engine` in a source checkout).
@@ -20,6 +20,9 @@ High-signal CLI, managed dual-upstream headless engine, offline Lua game-data SQ
 - **External Economy, Meta, PoEDB & Wiki (`pob price` / `pob meta` / `pob poedb` / `pob wiki`)**:
   - `poe.ninja`: 52 overview categories, `--variant`, `--limit`, `--detailed` (corrupted/21-20 gems/links/listings via stash API), `pob meta` (`build-index-state`), and fixed character URL import (`Name-1234`).
   - `poedb.tw`: 24h CN/US autocomplete index + 12h cleaned pages with `DropChance` weights, `ModFamilyList`, and `fossil_no` tags.
+- **Official PoE1 Trade & Crafting Bench (`pob trade` / `pob bench`)**:
+  - Read-only official trade search with 0ms offline local `TradeSiteStats.lua` resolution (bilingual EN/ZH + slot-aware `(Local)` routing), GGG dynamic `X-Rate-Limit-*` persistence, 3.30 instant buyout (`--status available`) & `chaos_equiv` pricing, Harvest same-tier conversion (`--allow-conversion` with same-group conflict guards), and single-snapshot batch headless PoB DPS/EHP verification (`trade_eval_items`). See [docs/TRADE.md](docs/TRADE.md).
+  - Dual-source crafting bench lookup (`pob bench list|suggest`) driven by auto-updating `ModMaster.lua` (0 unknown affixes) with a compact offline cost/unlock overlay and ready-to-verify `{crafted}` lines.
 
 ---
 
@@ -65,8 +68,8 @@ Download `pob-vX.Y.Z-windows-x64.zip` from [GitHub Releases](https://github.com/
 uv tool install "git+https://github.com/exilemoulei/pob-agent-tools.git#subdirectory=pob_cli"
 
 # Or with pipx / pip (non-editable, from a release wheel or git tag)
-pipx install "git+https://github.com/exilemoulei/pob-agent-tools.git@v0.2.0#subdirectory=pob_cli"
-pip install "https://github.com/exilemoulei/pob-agent-tools/releases/download/v0.2.0/pob_cli-0.2.0-py3-none-any.whl"
+pipx install "git+https://github.com/exilemoulei/pob-agent-tools.git@v0.3.0#subdirectory=pob_cli"
+pip install "https://github.com/exilemoulei/pob-agent-tools/releases/download/v0.3.0/pob_cli-0.3.0-py3-none-any.whl"
 ```
 
 ### First-Time Engine Setup
@@ -122,6 +125,12 @@ pob price "Forbidden Flame" --variant "Necromancer" --limit 50
 pob price "Empower Support" --detailed
 pob meta --top 15
 pob wiki "Eldritch Battery"
+
+# 6. Official PoE1 trade search (read-only, PoB-verified) & crafting bench fallback
+pob trade stats "攻击速度" --slot weapon1
+pob trade search --slot gloves --budget 20 --stat "冰霜抗性=40" --want "Attack Speed" --allow-conversion --pob auto
+pob trade search --slot gloves --budget 10 --stat "最大生命=60" --open-suffix --pob auto
+pob bench suggest --slot gloves --stat "冰霜抗性"
 ```
 
 Pass `--json` to any command for structured, color-stripped JSON output. Pass `--offline` before a subcommand (or set `POB_OFFLINE=1`) to skip GitHub update checks. See [AGENTS.md](AGENTS.md) for the compact agent cheat-sheet.
@@ -143,8 +152,8 @@ pyinstaller --noconfirm --clean pob_cli/packaging/pob.spec
 
 **Tag-driven releases** (`.github/workflows/release.yml`):
 1. Bump `__version__` in `pob_cli/src/pob_cli/__init__.py` and commit to `main`.
-2. Tag and push: `git tag v0.2.0 && git push origin v0.2.0`.
-3. GitHub Actions (`windows-latest`) validates the tag, runs tests, builds & smoke-tests `pob-v0.2.0-windows-x64.zip` + wheel/sdist + `SHA256SUMS.txt`, publishes the GitHub Release, and auto-updates `bucket/pob.json` for Scoop.
+2. Tag and push: `git tag v0.3.0 && git push origin v0.3.0`.
+3. GitHub Actions (`windows-latest`) validates the tag, runs tests, builds & smoke-tests `pob-v0.3.0-windows-x64.zip` + wheel/sdist + `SHA256SUMS.txt`, publishes the GitHub Release, and auto-updates `bucket/pob.json` for Scoop.
 
 ## License
 
