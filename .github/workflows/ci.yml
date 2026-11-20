@@ -94,7 +94,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14
+          - os: macos-15
             label: macOS-arm64
             tag: darwin-arm64
           - os: ubuntu-latest
@@ -146,17 +146,38 @@ jobs:
           # Live bootstrap: fetches official PoB PoE1/ + PobTools Data/bridge/bridge.lua and passes gate_result!
           pob bootstrap --no-zh --json
 
-          # Verify persistent daemon auto-start, build calculation, mutation, matrix, and clean shutdown
+          # Load a minimal PoB XML build with a Fireball skill group to verify full calculation, Inflate/Deflate, mutation, and matrix
+          cat > "$RUNNER_TEMP/test_build.xml" <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <PathOfBuilding>
+            <Build level="90" targetVersion="3_0" className="Witch" ascendClassName="Elementalist" mainSocketGroup="1" viewMode="SKILLS"/>
+            <Tree activeSpec="1"><Spec title="Default" treeVersion="3_25" classId="3" ascendClassId="2" nodes="54447"/></Tree>
+            <Skills activeSkillSet="1">
+              <SkillSet id="1">
+                <Skill mainActiveSkill="1" enabled="true" label="Main">
+                  <Gem nameSpec="Fireball" level="20" quality="20" enabled="true"/>
+                </Skill>
+              </SkillSet>
+            </Skills>
+            <Items activeItemSet="1"><ItemSet id="1"/></Items>
+            <Config activeConfigSet="1"><ConfigSet id="1"/></Config>
+          </PathOfBuilding>
+          EOF
+
+          # Verify persistent daemon auto-start, build load, calculation, mutation, Inflate/Deflate roundtrip, matrix, and clean shutdown
           pob status --json
+          pob load "@$RUNNER_TEMP/test_build.xml" --json
           pob summary --json
           pob audit --json
           pob skills --json
           pob items --json
           pob tree --json
           pob tree set-class Witch Necromancer --apply --json
-          pob skill add --group main --gem "Fireball" --level 20 --quality 20 --apply --json
+          pob skill add --group main --gem "Added Fire Damage Support" --level 20 --quality 20 --apply --json
           pob summary --json
-          pob export-code --json
+          CODE="$(pob export-code --json | python3 -c 'import sys, json; print(json.load(sys.stdin)["code"])')"
+          test -n "$CODE"
+          pob load "$CODE" --json
           pob matrix Original Pinnacle --json
           pob bench list --slot gloves --limit 3 --json
           pob trade convert --text $'Rarity: RARE\nDoom Hand\nSlink Gloves\nImplicits: 0\n+42% to Fire Resistance' --to cold --json
