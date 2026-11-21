@@ -1,8 +1,8 @@
 # pob-agent-tools (`pob`)
 
-**简体中文**
+**简体中文** | [English](README_EN.md)
 
-`pob` 是给 AI Agent 和《流放之路》1 玩家用的 PoB 命令行工具。它能在后台运行 Path of Building（PoB），读取构筑、试配装备、比较天赋与技能，并查询游戏数据和交易价格。
+`pob-agent-tools` 是给 AI Agent 和《流放之路》1 玩家用的 Path of Building（PoB）命令行工具集，命令名为 `pob`。它能在后台运行 PoB，导入构筑、试配装备、比较天赋与技能，并查询游戏数据和交易价格。
 
 伤害（DPS）、有效生命池（TotalEHP）、最大承伤（MaxHit），以及换装、改点、换宝石和永恒珠宝种子的收益，都交给实际运行的 PoB 引擎计算；工具不会只凭构筑 XML 里的词缀自行估算。
 
