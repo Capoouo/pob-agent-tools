@@ -137,7 +137,7 @@ pob trade search --slot gloves --budget 20 --stat "冰霜抗性=40" --want "Atta
 pob trade search --slot gloves --budget 10 --stat "最大生命=60" --open-suffix --pob auto
 pob trade search --slot gloves --budget 20 --currency divine --stat "to Dexterity=55" --bench-craft "Area Damage" --pob on
 # --bench-craft is repeatable: inspect top --pob-limit listings, keep original and legal
-# minimum-roll craft variants, then rank by PoB by default. Craft/removal costs are
+# maximum-roll craft variants, then rank by PoB by default. Craft/removal costs are
 # additional to --budget (listing price cap); hard --stat filters apply before crafting.
 # JSON bench_craft includes action, cost, removed_lines and listed_item_text.
 pob bench suggest --slot gloves --stat "冰霜抗性"

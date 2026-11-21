@@ -9,7 +9,7 @@ from .trade_item import parse_item_text
 
 def expand_bench_candidates(candidates: list[Candidate], *, slot: str,
                             wants: tuple[str, ...]) -> list[Candidate]:
-    """Keep each listed item and add legal minimum-roll single-craft variants.
+    """Keep each listed item and add legal maximum-roll single-craft variants.
 
     Uncertain occupancy, special scaled rolls and multi-craft items are excluded.
     Listing price is preserved; crafting cost is reported separately by currency.
@@ -36,7 +36,7 @@ def expand_bench_candidates(candidates: list[Candidate], *, slot: str,
                            allow_engine=True) if r.recipe.id == suggestion['id']), None)
             if recipe is None:
                 continue
-            lines = recipe.crafted_lines(use_min=True)
+            lines = recipe.crafted_lines(use_min=False)
             if sorted(line.removeprefix('{crafted}') for line in lines) == sorted(removed):
                 continue
             raw = '\n'.join(base_lines + lines)
@@ -47,7 +47,7 @@ def expand_bench_candidates(candidates: list[Candidate], *, slot: str,
                 pob=None, pob_error=None, bench_craft={
                     'recipe_id': recipe.id, 'action': suggestion['status'],
                     'lines': lines, 'removed_lines': removed, 'cost': recipe.cost,
-                    'roll': 'minimum', 'listed_item_text': candidate.item_text,
-                    'cost_note': 'Crafting cost is additional to listing price; replacement also requires craft removal.',
+                    'roll': 'maximum', 'listed_item_text': candidate.item_text,
+                    'cost_note': 'Crafting cost is additional to listing price; replacement also requires craft removal. Maximum rolls may require repeated crafts; reroll costs are not included.',
                 }))
     return expanded

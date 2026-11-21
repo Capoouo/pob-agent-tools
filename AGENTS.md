@@ -64,7 +64,7 @@ pob wiki "<q1>" ["<q2>" ...] [--proxy <url>] [--json]
 pob trade stats "<text|中文>" [--slot S] [--limit 5] [--proxy U] [--json]              # Local TradeSiteStats.lua (0ms) or API fallback
 pob trade search --slot S [--stat "text|中文=min"]... [--want T]... [--budget N] [--currency chaos_equiv|chaos|divine] [--status available|securable|online|any] [--allow-conversion [--convert-to E]] [--open-prefix|--open-suffix|--open-affix] [--pob auto|on|off] [--target <slug>] [--dump-query] [--proxy U] [--json]
 pob trade convert (--text T | --file f) --to fire|cold|lightning [--out f] [--json]    # Harvest 3.30 swap preview (same tier, rerolled)
-pob trade search --slot gloves --bench-craft "Area Damage" --pob on [--bench-craft "maximum Life"] # Original + legal minimum-roll bench variants; PoB-ranked by default. --pob-limit counts source listings; --budget caps listing price, craft/removal costs are additional. Hard --stat filters apply before crafting.
+pob trade search --slot gloves --bench-craft "Area Damage" --pob on [--bench-craft "maximum Life"] # Original + legal maximum-roll bench variants; PoB-ranked by default. --pob-limit counts source listings; --budget caps listing price, craft/removal costs are additional. Hard --stat filters apply before crafting.
 pob bench list --slot S [--search "<text|中文>"] [--affix prefix|suffix] [--limit 25] [--json]
 pob bench suggest --slot S --stat "<text|中文>" [--affix prefix|suffix] [--limit 5] [--json]
 

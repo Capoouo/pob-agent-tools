@@ -921,8 +921,8 @@ def format_report(
         lines.append("")
         lines.append(
             "> Bench modifiers roll below high-tier natural mods and need the matching "
-            "open prefix/suffix. Preview with the `{crafted}` minimum-roll floor line in PoB "
-            "before buying the base, then craft and re-check."
+            "open prefix/suffix. Hints show minimum-roll reference lines; `--bench-craft` "
+            "simulates maximum rolls. Re-check the crafted result in PoB."
         )
         lines.append("")
 
@@ -933,9 +933,10 @@ def format_report(
         if candidate.bench_craft:
             craft = candidate.bench_craft
             lines.append(
-                f"Bench ({craft['action']}, minimum roll): {' / '.join(craft['lines'])}; "
+                f"Bench ({craft['action']}, maximum roll): {' / '.join(craft['lines'])}; "
                 f"cost: {craft['cost']}" + (" + remove existing craft" if craft['action'] == 'replace_craft' else "")
             )
+            lines.append("Maximum-roll target; repeated crafting/removal costs are not included.")
         lines.append("")
         if candidate.pob is not None:
             pob = candidate.pob
