@@ -1,12 +1,18 @@
 # PROGRESS
 
 ## ACTIVE
-- 目标：pob-agent-tools v0.3.0（官方只读交易检索 + Harvest 转换 + 双源工艺台）已发布并关闭 PR #1，待确认 GitHub Actions CI/Release 产物全绿
-- 已做：[x] 完成 v0.3.0 干净重构落地（0b5ffc7，含 Co-authored-by: ChangMenQAQ 与 README 致谢）并打 tag v0.3.0；[x] 用户已推送 main 与 v0.3.0 触发 GitHub Actions CI & Release，并在 PR #1 回复升级致谢说明后关闭 PR #1
-- 下一步：[ ] 关注 GitHub Actions CI 与 Release v0.3.0 流水线完成情况，验证 Windows 独立二进制与 Scoop bucket/pob.json 自动更新（禁踩：直接 merge PR #1（含 17,756 行爬虫脏数据 crafting_bench.json、吞 3.30 flags、漏代理/动态限流、劫持 AGENTS.md 且破坏 PyInstaller pob.spec））
-- 验证：git commit 0b5ffc7 + tag v0.3.0 已推送；pytest 179 passed (1 skipped)；PR #1 已回复并关闭（2026-11-20 23:13）
+- 目标：完成 PR #2 / #3 / #4 与 origin/main 向 feat/macos-support (84169b2) 的架构融合、性能优化对齐与真机验收（待提交推送与合入主干）
+- 已做：[x] 拉取并逐行深审 PR #2（restartgr 去水逐项归因与 --keep）、PR #3（Capoouo 永恒珠宝种子无头搜索）、PR #4（restartgr 区分请求拒绝 exit 1 与后台故障 exit 5）及 origin/main（9c55d11 Scoop v0.3.0）；[x] 调度 4 波共 17 名 Gemini 4 Neon (XHigh) Swarm（深审 -> 后端/CLI 并行融合 -> 3 路对抗复审+全量测试+真机 E2E -> 缺陷清零）完成全量融合与 call_batch 流水线适配；[x] 修复审计与真机发现的 2 项 P0（瓦尔 enableGlobal1/2 极性反转 + 非全局主技能 mainActiveSkill 切换与瓦尔正火/不净基础技能误关；POSIX stat 纳秒 mtime 消除并发 .bin 截断竞态）及全部 P1/P2（count 型配置 true->1、默认无操作配置跳过、树珠宝槽 Allocates XML 解析、PoB Finder 史实珠宝摘除、sweep restoreCheck 等）
+- 下一步：[ ] 审阅 git status / git diff，确认后附带 Co-authored-by 签名提交推送 feat/macos-support 触发三端 CI 并合并关闭 PR #2/#3/#4（禁踩：直接合入 PR #2 反向的瓦尔宝石开关（PoB 全部 52 颗瓦尔宝石 grantedEffectList[1]=enableGlobal1 才是瓦尔爆发、[2]=enableGlobal2 才是常驻基础技能，设反会导致瓦尔光环常开而基础光环关闭）；在 cli.py 顶层直接合入 PR #4 的 import httpx 或 PR #3 的 cli_trade 导入（会破坏 CLI 懒加载隔离门禁并漏捕 stdlib http.client 异常）；保留 POSIX headless_runner.lua GetFileModifiedTime() 返回 0 桩（会导致 pob timeless search 多进程并发 wb+ 截断写坏 51MB .bin 缓存）；仓库根目录含未跟踪子目录时对 swarm 传 workspace:share（Windows ReadFile 读未跟踪目录报 Incorrect function，应按文件所有权严格互不相交切片跑 inherit））
+- 验证：python -B -m pytest pob_cli/tests -> 364 passed, 0 failed, 0 skipped (221.08s, ec=0) + pob-zh.exe 隔离真机 E2E (audit 7.30s 0 幻影行 / timeless list 66ms / timeless search 中文名+史实冲突摘除 / CLI exit 1 vs 5) 全通（2026-11-21 15:32）
 
 ## LOG
+### 2026-11-21 4 波 17 路 Gemini 4 Neon (XHigh) Swarm 完成 PR #2（去水逐项归因/--keep/verify_restored）、PR #3（pob timeless 永恒珠宝无头搜索）、PR #4（errorKind 退出码 1/5 无堆栈）及 origin/main 融合，修复瓦尔 enableGlobal1/2 极性与主技能切换、POSIX stat mtime 并发竞态、count 型配置 true->1 等全部 P0/P1/P2 → 隔离全量 pytest 364 passed (0 failed, 0 skipped) + pob-zh.exe 真机 E2E 全通
+### 2026-11-21 3 路 Carbon 设计+终审 × 3 路 Neon 施工落地 F:/poe/poedb_wiki（Wraeclast Codex 无 script 暗黑攻略组件库、PFM <55ms 编译器、三层双语 [[English]] 消歧、五源适配器、双栏 SSE 热同步 Web Studio 与油猴/Bookmarklet 上传桥接） → pytest 67 passed (2.61s) + 编年史真机 markdown_parse CN/US 401/401 (100%) 零误差
+### 2026-11-21 4 路 Gemini 4 Carbon (High) 并行复审并全量清零 35 项缺陷（1 P0 .build.lock 死循环/抢锁 + 20 P1 + 14 P2，含并行重叠冷启更新检查、TradeRateLimiter 跨进程锁、translate 谚语隔离、tree BFS 邻近排序、source 技能组保护、POSIX headless_runner.lua arg={} 与 CLI 全命令 --compact/--out 对齐） → 隔离全量回归 249 passed (0 failed, 1 skipped)
+### 2026-11-21 Swarm 全栈剖析近 13 份真实 PoB 会话并落地引擎/守护进程/CLI 性能优化（call_batch 流水线、多命名槽位并发、<1ms 死 PID 清理、pob serve、延迟导入、共享 SQLite v5 缓存、19-op batch+sweep、matrix 脱水缓存与并发多查），Principal 复审 14 项 P0/P1/P2 清零 → 隔离全量 pytest 225 passed (0 failed, 1 skipped) + 真机基准 summary 5.4× / tree 14.4× / items 8.1× / matrix(6) 5.1× / CLI 启动 2.3× / 死 PID 1667× 提速
+### 2026-11-21 feat/macos-support（56d79cb）三端真机 CI 全绿（Run #44777911376）：macOS-15 (Apple Silicon)、Linux-x64 均完成原生 LuaJIT 2.1 + lua-utf8.so 编译与真实 pob bootstrap/load/summary/audit/skill add/export-code 回环/matrix/bench/trade/stop 全链路验收，Windows-x64 零回归 → 本地 pytest 186 passed + GitHub Actions 3/3 jobs success
+### 2026-11-21 在 feat/macos-support 分支落地 macOS/Linux 原生 LuaJIT 无头宿主（headless_runner.lua + build_posix_runtime.sh + 平台化 updater/bridge_client/daemon + macOS-14/Ubuntu 真机 E2E CI），复用 MIT bridge.lua 且不破坏 Windows 链路 → 本地 pytest 186 passed (0 failed)
 ### 2026-11-20 发布 pob-agent-tools v0.3.0（0b5ffc7，Co-authored-by: ChangMenQAQ），推送 main 与 v0.3.0 tag 触发 CI/Release 流水线，并在 PR #1 回复架构重构说明与致谢后关闭 → 本地 pytest 179 passed (1 skipped) + 零引擎/离线/YAML/Spec 全通
 ### 2026-11-20 Clean-Room 重构落地 PR #1 交易与工艺台工作流（pob trade / pob bench）：对齐 PoB 2.68.1 TradeSiteStats.lua 本地 0ms 槽位双语词缀路由、GGG 动态响应头持久化限流、3.30 高保真物品重建与 Harvest 同组冲突校验、ModMaster.lua 主源 + 30KB 级费用叠加层、daemon 单快照批验与 PyInstaller 打包门禁（排除直接合入 17,756 行爬虫脏快照与散文化 AGENTS.md） → pytest 179 passed (1 skipped) + 离线/零引擎/YAML/Spec 门禁全通
 ### 2026-11-20 落地 `pob-agent-tools` 打包 CI、tag 发版（PyInstaller `--onedir` + wheel/sdist + 仓内 Scoop bucket `bucket/pob.json`）与 Windows 一键安装 `install.ps1`，修复冻结版守护进程拉起（`pob _daemon`）与运行态目录（`%LOCALAPPDATA%/pob-agent-tools`） → 47 项单测/集成全通 + `install.ps1`/`bucket/pob.json`/YAML 校验全通

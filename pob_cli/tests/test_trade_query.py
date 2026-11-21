@@ -287,6 +287,37 @@ def test_tiny_entry_does_not_hijack_long_unrelated_query() -> None:
     assert tq.resolve_stat("Unicorn Rainbow Life Explosion", SAMPLE_ENTRIES) is None
 
 
+def test_translate_stat_query_ignores_partial_matches(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unaliased Chinese queries must never be rewritten using game_data `match_type == 'partial'` hits."""
+    from pob_cli import game_data
+
+    (tmp_path / "PoE1" / "Data").mkdir(parents=True)
+    monkeypatch.setattr(tq, "resolve_engine_root", lambda: tmp_path)
+    monkeypatch.setattr(
+        game_data,
+        "query_local_data",
+        lambda kind, query, limit=12: {
+            "results": [
+                {"en": "The First Ones exist,", "zh": "先祖存在", "category": "passive", "match_type": "partial"},
+            ]
+        },
+    )
+    assert tq.translate_stat_query("不存在的测试词缀") == "不存在的测试词缀"
+
+    # Exact/substring matches from SQLite still work normally
+    monkeypatch.setattr(
+        game_data,
+        "query_local_data",
+        lambda kind, query, limit=12: {
+            "results": [
+                {"en": "The First Ones exist,", "zh": "先祖存在", "category": "passive", "match_type": "partial"},
+                {"en": "+{0} to maximum Mana", "zh": "最大魔力词缀测试", "category": "mod", "match_type": "exact"},
+            ]
+        },
+    )
+    assert tq.translate_stat_query("最大魔力词缀测试") == "+# to maximum Mana"
+
+
 # ---------------------------------------------------------------------------
 # 4. Harvest conversion planning & official query builder
 # ---------------------------------------------------------------------------

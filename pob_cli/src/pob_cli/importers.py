@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import json
 import os
 import re
+import tempfile
 import time
 import urllib.parse
 import zlib
@@ -15,10 +17,13 @@ from typing import Any
 import httpx
 
 from . import __version__
+from . import updater as _updater
 from .bridge_client import BridgeError, BridgeWorker
+from .errors import DaemonRequestError
 from .updater import get_runtime_dir
 
 USER_AGENT = f"pob-cli/{__version__} (+https://github.com/exilemoulei/pob-agent-tools)"
+DEFAULT_HTTP_TIMEOUT = httpx.Timeout(connect=4.0, read=15.0, write=15.0, pool=4.0)
 
 POE_NINJA_CHAR_RE = re.compile(
     r"^https?://poe\.ninja/poe1/builds/(?P<league>[^/?#]+)/character/(?P<account>[^/?#]+)/(?P<name>[^/?#]+)",
@@ -48,27 +53,116 @@ def xml_to_share_code(xml_text: str) -> str:
 
 def share_code_to_xml(code: str) -> str:
     """Decompress a URL-safe Base64 PoB share code into raw PoB XML text."""
-    cleaned = code.lstrip("\ufeff").strip().replace("-", "+").replace("_", "/")
+    cleaned = re.sub(r"\s+", "", code.lstrip("\ufeff")).replace("-", "+").replace("_", "/")
+    if not cleaned:
+        raise ValueError("Invalid PoB share code: empty share code.")
     pad = (-len(cleaned)) % 4
     if pad:
         cleaned += "=" * pad
-    raw_bytes = base64.b64decode(cleaned)
     try:
-        decompressed = zlib.decompress(raw_bytes)
-    except zlib.error:
-        decompressed = zlib.decompress(raw_bytes, -15)
+        raw_bytes = base64.b64decode(cleaned, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError(f"Invalid PoB share code: {exc}") from exc
+    try:
+        try:
+            decompressed = zlib.decompress(raw_bytes)
+        except zlib.error:
+            decompressed = zlib.decompress(raw_bytes, -15)
+    except (zlib.error, ValueError) as exc:
+        raise ValueError(f"Invalid PoB share code: {exc}") from exc
     return decompressed.decode("utf-8-sig", errors="replace").lstrip("\ufeff")
 
 
-def _get_cache_dir() -> Path:
-    cache_dir = get_runtime_dir() / "cache"
+def _shared_cache_dir(runtime_dir: Path | None = None) -> Path:
+    """Resolve shared engine-scoped cache directory, delegating to updater.get_shared_cache_dir if present."""
     try:
+        fn = getattr(_updater, "get_shared_cache_dir", None)
+        if callable(fn):
+            cache_dir = Path(fn(runtime_dir))
+        else:
+            env_cache = os.environ.get("POB_CACHE_DIR", "").strip()
+            if env_cache:
+                cache_dir = Path(env_cache)
+            else:
+                rt = get_runtime_dir(runtime_dir)
+                env_root = os.environ.get("POB_ROOT", "").strip()
+                shared_candidate: Path | None = None
+                if env_root:
+                    try:
+                        eng_parent = Path(env_root).resolve().parent
+                        same_rt = eng_parent == rt.resolve()
+                    except OSError:
+                        eng_parent = Path(env_root).parent
+                        same_rt = False
+                    if not same_rt and (
+                        (eng_parent / "cache").is_dir()
+                        or eng_parent.name in (".runtime", "pob-agent-tools")
+                    ):
+                        shared_candidate = eng_parent / "cache"
+                cache_dir = shared_candidate or (rt / "cache")
         cache_dir.mkdir(parents=True, exist_ok=True)
         return cache_dir
     except OSError:
         fallback = Path.home() / ".cache" / "pob-cli"
         fallback.mkdir(parents=True, exist_ok=True)
         return fallback
+
+
+def _get_cache_dir(runtime_dir: Path | None = None) -> Path:
+    return _shared_cache_dir(runtime_dir)
+
+
+def _atomic_write_json(path: Path, payload: Any, *, ensure_ascii: bool = True) -> None:
+    """Atomically write JSON to ``path`` via sibling temp file + ``os.replace`` with Windows retry."""
+    tmp_path: Path | None = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            dir=str(path.parent),
+        )
+        tmp_path = Path(tmp_name)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=ensure_ascii)
+        for attempt in range(3):
+            try:
+                os.replace(tmp_path, path)
+                tmp_path = None
+                break
+            except PermissionError:
+                if attempt < 2:
+                    time.sleep(0.02 * (attempt + 1))
+    except OSError:
+        pass
+    finally:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def read_stale_cache(
+    cache_file: Path,
+    *,
+    data_key: str = "data",
+) -> tuple[Any | None, float | None]:
+    """Read an expired/stale JSON cache entry if present and parseable.
+
+    Returns ``(payload, age_seconds)`` or ``(None, None)`` if missing/unreadable.
+    """
+    if not cache_file.is_file():
+        return None, None
+    try:
+        cached = json.loads(cache_file.read_text(encoding="utf-8"))
+        if not isinstance(cached, dict) or data_key not in cached:
+            return None, None
+        ts = cached.get("_ts")
+        age = max(0.0, time.time() - float(ts)) if isinstance(ts, (int, float)) else None
+        return cached[data_key], age
+    except Exception:
+        return None, None
 
 
 def _resolve_proxy(proxy: str | None = None) -> str | None:
@@ -92,7 +186,7 @@ def _resolve_proxy(proxy: str | None = None) -> str | None:
 
 def _make_httpx_client(
     *,
-    timeout: float = 20.0,
+    timeout: float | httpx.Timeout | None = None,
     proxy: str | None = None,
     headers: dict[str, str] | None = None,
 ) -> httpx.Client:
@@ -101,8 +195,9 @@ def _make_httpx_client(
     if headers:
         merged_headers.update(headers)
     resolved_proxy = _resolve_proxy(proxy)
+    resolved_timeout = DEFAULT_HTTP_TIMEOUT if timeout is None else timeout
     kwargs: dict[str, Any] = {
-        "timeout": timeout,
+        "timeout": resolved_timeout,
         "follow_redirects": True,
         "headers": merged_headers,
     }
@@ -111,8 +206,13 @@ def _make_httpx_client(
     return httpx.Client(**kwargs)
 
 
-def _fetch_poe_ninja_index_state(ttl_sec: int = 900) -> dict[str, Any]:
-    cache_file = _get_cache_dir() / "poe_ninja_index_state.json"
+def _fetch_poe_ninja_index_state(
+    ttl_sec: int = 900,
+    *,
+    proxy: str | None = None,
+    client: httpx.Client | None = None,
+) -> dict[str, Any]:
+    cache_file = _shared_cache_dir() / "poe_ninja_index_state.json"
     now = time.time()
     if cache_file.exists():
         try:
@@ -123,21 +223,34 @@ def _fetch_poe_ninja_index_state(ttl_sec: int = 900) -> dict[str, Any]:
             pass
 
     url = "https://poe.ninja/poe1/api/data/index-state"
-    with _make_httpx_client(timeout=20.0) as client:
-        resp = client.get(url)
-        resp.raise_for_status()
-        data = resp.json()
-
     try:
-        cache_file.write_text(json.dumps({"_ts": now, "data": data}), encoding="utf-8")
-    except Exception:
-        pass
+        if client is not None:
+            resp = client.get(url)
+            resp.raise_for_status()
+            data = resp.json()
+        else:
+            with _make_httpx_client(timeout=DEFAULT_HTTP_TIMEOUT, proxy=proxy) as own_client:
+                resp = own_client.get(url)
+                resp.raise_for_status()
+                data = resp.json()
+    except (httpx.HTTPError, OSError):
+        stale_data, _ = read_stale_cache(cache_file, data_key="data")
+        if isinstance(stale_data, dict):
+            return stale_data
+        raise
+
+    _atomic_write_json(cache_file, {"_ts": now, "data": data})
     return data
 
 
-def _fetch_poe_ninja_build_index_state(ttl_sec: int = 900) -> dict[str, Any]:
+def _fetch_poe_ninja_build_index_state(
+    ttl_sec: int = 900,
+    *,
+    proxy: str | None = None,
+    client: httpx.Client | None = None,
+) -> dict[str, Any]:
     """Fetch poe.ninja build-index-state (leagueBuilds + meta statistics) with 15m disk cache."""
-    cache_file = _get_cache_dir() / "poe_ninja_build_index_state.json"
+    cache_file = _shared_cache_dir() / "poe_ninja_build_index_state.json"
     now = time.time()
     if cache_file.exists():
         try:
@@ -148,15 +261,23 @@ def _fetch_poe_ninja_build_index_state(ttl_sec: int = 900) -> dict[str, Any]:
             pass
 
     url = "https://poe.ninja/poe1/api/data/build-index-state"
-    with _make_httpx_client(timeout=20.0) as client:
-        resp = client.get(url)
-        resp.raise_for_status()
-        data = resp.json()
-
     try:
-        cache_file.write_text(json.dumps({"_ts": now, "data": data}), encoding="utf-8")
-    except Exception:
-        pass
+        if client is not None:
+            resp = client.get(url)
+            resp.raise_for_status()
+            data = resp.json()
+        else:
+            with _make_httpx_client(timeout=DEFAULT_HTTP_TIMEOUT, proxy=proxy) as own_client:
+                resp = own_client.get(url)
+                resp.raise_for_status()
+                data = resp.json()
+    except (httpx.HTTPError, OSError):
+        stale_data, _ = read_stale_cache(cache_file, data_key="data")
+        if isinstance(stale_data, dict):
+            return stale_data
+        raise
+
+    _atomic_write_json(cache_file, {"_ts": now, "data": data})
     return data
 
 
@@ -260,16 +381,17 @@ def fetch_poe_ninja_character_code(url: str) -> str:
 
     if not candidates:
         err_note = f" ({'; '.join(fetch_errs)})" if fetch_errs else ""
-        raise RuntimeError(
-            f"Could not find league slug '{league_slug}' in poe.ninja build-index-state or index-state{err_note}."
-        )
+        msg = f"Could not find league slug '{league_slug}' in poe.ninja build-index-state or index-state{err_note}."
+        if not fetch_errs:
+            raise DaemonRequestError(msg)
+        raise RuntimeError(msg)
 
     account_attempts = [raw_account]
     if hash_account != raw_account:
         account_attempts.append(hash_account)
 
     last_err: Exception | None = None
-    with _make_httpx_client(timeout=20.0) as client:
+    with _make_httpx_client(timeout=DEFAULT_HTTP_TIMEOUT) as client:
         for overview, snap_type in candidates:
             for acc_idx, acc in enumerate(account_attempts):
                 params: dict[str, str] = {
@@ -302,7 +424,7 @@ def fetch_share_url_code_fallback(url: str) -> str:
     if POE_NINJA_CHAR_RE.match(clean_url):
         return fetch_poe_ninja_character_code(clean_url)
 
-    with _make_httpx_client(timeout=20.0) as client:
+    with _make_httpx_client(timeout=DEFAULT_HTTP_TIMEOUT) as client:
         for pattern, template in SHARE_RAW_PATTERNS:
             m = pattern.match(clean_url)
             if m:
@@ -376,7 +498,10 @@ def load_build_into_worker(
                     res = worker.call("import_code", {"code": code, "mode": "replace"})
                     import_method = "url_fallback"
             else:
-                # Raw Base64 share code
+                # Raw Base64 share code: pre-validate before import_code so malformed share
+                # codes raise ValueError (errorKind="request", exit 1) while engine crashes
+                # stay BridgeError (errorKind="daemon", exit 5).
+                share_code_to_xml(src)
                 res = worker.call("import_code", {"code": src, "mode": "replace"})
                 import_method = "share_code"
         else:

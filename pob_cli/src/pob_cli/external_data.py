@@ -2,19 +2,29 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
 import html
 import json
 import re
+import threading
 import time
+from pathlib import Path
 from typing import Any
 
+import httpx
+
 from .importers import (
+    DEFAULT_HTTP_TIMEOUT,
+    _atomic_write_json,
     _fetch_poe_ninja_build_index_state,
     _fetch_poe_ninja_index_state,
-    _get_cache_dir,
     _make_httpx_client,
+    _shared_cache_dir,
+    read_stale_cache,
 )
+
+_LAST_STALE = threading.local()
 
 CURRENCY_TYPES = ("Currency", "Fragment")
 ITEM_TYPES = (
@@ -165,9 +175,9 @@ _AUTO_DETAIL_PATTERNS = (
 )
 
 
-def _extract_challenge_league_from_index_state() -> str | None:
+def _extract_challenge_league_from_index_state(*, proxy: str | None = None) -> str | None:
     try:
-        state = _fetch_poe_ninja_index_state()
+        state = _fetch_poe_ninja_index_state(proxy=proxy) if proxy is not None else _fetch_poe_ninja_index_state()
         econ_leagues = state.get("economyLeagues", [])
         if econ_leagues and econ_leagues[0].get("name"):
             return str(econ_leagues[0]["name"]).strip()
@@ -176,13 +186,13 @@ def _extract_challenge_league_from_index_state() -> str | None:
     return None
 
 
-def resolve_current_trade_league(ttl_sec: int = 3600) -> str:
+def resolve_current_trade_league(ttl_sec: int = 3600, *, proxy: str | None = None) -> str:
     """Resolve current primary softcore trade league name with 1h disk cache.
 
     Stale 'Standard' cache entries are automatically invalidated/replaced whenever
     poe.ninja index-state reports a non-Standard challenge league in economyLeagues[0].
     """
-    cache_file = _get_cache_dir() / "poe_trade_league.json"
+    cache_file = _shared_cache_dir() / "poe_trade_league.json"
     now = time.time()
     cached_league: str | None = None
 
@@ -197,23 +207,24 @@ def resolve_current_trade_league(ttl_sec: int = 3600) -> str:
     if cached_league and cached_league.lower() != "standard":
         return cached_league
 
-    ninja_league = _extract_challenge_league_from_index_state()
+    ninja_league = _extract_challenge_league_from_index_state(proxy=proxy)
     if ninja_league:
         if ninja_league.lower() != "standard" or not cached_league:
-            try:
-                cache_file.write_text(json.dumps({"_ts": now, "league": ninja_league}), encoding="utf-8")
-            except Exception:
-                pass
+            _atomic_write_json(cache_file, {"_ts": now, "league": ninja_league})
             return ninja_league
 
     if cached_league:
         return cached_league
 
-    resolved = "Standard"
+    resolved: str | None = None
+    got_http_200 = False
+    last_exc: Exception | None = None
     try:
-        with _make_httpx_client(timeout=10.0) as client:
+        with _make_httpx_client(timeout=DEFAULT_HTTP_TIMEOUT, proxy=proxy) as client:
             resp = client.get(POE_LEAGUES_URL)
             if resp.status_code == 200:
+                got_http_200 = True
+                resolved = "Standard"
                 leagues = resp.json()
                 for lg in leagues:
                     lid = str(lg.get("id") or "").strip()
@@ -221,19 +232,31 @@ def resolve_current_trade_league(ttl_sec: int = 3600) -> str:
                         if not any(tag in lid for tag in ("Hardcore", "SSF", "Ruthless")):
                             resolved = lid
                             break
-    except Exception:
-        pass
+    except Exception as exc:
+        last_exc = exc
 
-    try:
-        cache_file.write_text(json.dumps({"_ts": now, "league": resolved}), encoding="utf-8")
-    except Exception:
-        pass
-    return resolved
+    if got_http_200 and resolved:
+        _atomic_write_json(cache_file, {"_ts": now, "league": resolved})
+        return resolved
+
+    stale_lg, _ = read_stale_cache(cache_file, data_key="league")
+    if isinstance(stale_lg, str) and stale_lg.strip():
+        return stale_lg.strip()
+
+    if last_exc is not None:
+        raise RuntimeError(f"Failed to resolve current PoE trade league: {last_exc}") from last_exc
+    raise RuntimeError("Failed to resolve current PoE trade league (no HTTP 200 response).")
 
 
-def _fetch_dense_overviews(league: str, ttl_sec: int = 900) -> dict[str, list[dict[str, Any]]]:
+def _fetch_dense_overviews(
+    league: str,
+    ttl_sec: int = 900,
+    *,
+    proxy: str | None = None,
+    client: httpx.Client | None = None,
+) -> dict[str, list[dict[str, Any]]]:
     safe_key = re.sub(r"[^A-Za-z0-9_-]", "_", league)
-    cache_file = _get_cache_dir() / f"ninja_dense_{safe_key}.json"
+    cache_file = _shared_cache_dir() / f"ninja_dense_{safe_key}.json"
     now = time.time()
     if cache_file.exists():
         try:
@@ -244,47 +267,75 @@ def _fetch_dense_overviews(league: str, ttl_sec: int = 900) -> dict[str, list[di
             pass
 
     type_to_lines: dict[str, list[dict[str, Any]]] = {}
-    with _make_httpx_client(timeout=30.0) as client:
-        resp = client.get(NINJA_DENSE_URL, params={"league": league, "language": "en"})
-        resp.raise_for_status()
-        data = resp.json()
+    try:
+        if client is not None:
+            resp = client.get(NINJA_DENSE_URL, params={"league": league, "language": "en"})
+            resp.raise_for_status()
+            data = resp.json()
+        else:
+            with _make_httpx_client(timeout=DEFAULT_HTTP_TIMEOUT, proxy=proxy) as own_client:
+                resp = own_client.get(NINJA_DENSE_URL, params={"league": league, "language": "en"})
+                resp.raise_for_status()
+                data = resp.json()
         for section in ("itemOverviews", "currencyOverviews"):
             for ov in data.get(section, []):
                 ov_type = ov.get("type")
                 if ov_type:
                     type_to_lines[str(ov_type)] = ov.get("lines", [])
+    except (httpx.HTTPError, OSError):
+        stale_data, _ = read_stale_cache(cache_file, data_key="data")
+        if isinstance(stale_data, dict):
+            _LAST_STALE.value = True
+            return stale_data
+        raise
 
-    try:
-        cache_file.write_text(json.dumps({"_ts": now, "data": type_to_lines}), encoding="utf-8")
-    except Exception:
-        pass
+    _atomic_write_json(cache_file, {"_ts": now, "data": type_to_lines})
     return type_to_lines
 
 
-def _fetch_stash_overview(league: str, item_type: str, ttl_sec: int = 900) -> list[dict[str, Any]]:
-    """Fetch detailed poe.ninja stash overview for a single item/currency type (15m disk cache)."""
+def _stash_cache_path(league: str, item_type: str) -> Path:
     safe_league = re.sub(r"[^A-Za-z0-9_-]", "_", league)
     safe_type = re.sub(r"[^A-Za-z0-9_-]", "_", item_type)
-    cache_file = _get_cache_dir() / f"ninja_stash_{safe_league}_{safe_type}.json"
-    now = time.time()
-    if cache_file.exists():
-        try:
-            cached = json.loads(cache_file.read_text(encoding="utf-8"))
-            if now - cached.get("_ts", 0) < ttl_sec and "lines" in cached:
-                return cached["lines"]
-        except Exception:
-            pass
+    return _shared_cache_dir() / f"ninja_stash_{safe_league}_{safe_type}.json"
 
-    lines: list[dict[str, Any]] = []
-    with _make_httpx_client(timeout=30.0) as client:
+
+def _read_fresh_stash_cache(cache_file: Path, ttl_sec: int, now: float) -> list[dict[str, Any]] | None:
+    if not cache_file.exists():
+        return None
+    try:
+        cached = json.loads(cache_file.read_text(encoding="utf-8"))
+        if now - cached.get("_ts", 0) < ttl_sec and "lines" in cached:
+            return cached["lines"]
+    except Exception:
+        pass
+    return None
+
+
+def _fetch_stash_overview(
+    league: str,
+    item_type: str,
+    ttl_sec: int = 900,
+    *,
+    proxy: str | None = None,
+    client: httpx.Client | None = None,
+) -> list[dict[str, Any]]:
+    """Fetch detailed poe.ninja stash overview for a single item/currency type (15m disk cache)."""
+    cache_file = _stash_cache_path(league, item_type)
+    now = time.time()
+    fresh = _read_fresh_stash_cache(cache_file, ttl_sec, now)
+    if fresh is not None:
+        return fresh
+
+    def _do_fetch(http_client: httpx.Client) -> list[dict[str, Any]]:
         if item_type in CURRENCY_TYPES:
-            resp = client.get(NINJA_STASH_CURRENCY_URL, params={"league": league, "type": item_type})
+            resp = http_client.get(NINJA_STASH_CURRENCY_URL, params={"league": league, "type": item_type})
             resp.raise_for_status()
             payload = resp.json()
+            out: list[dict[str, Any]] = []
             for row in payload.get("lines", []) or []:
                 recv = row.get("receive") or {}
                 spark = row.get("receiveSparkLine") or {}
-                lines.append(
+                out.append(
                     {
                         "name": row.get("currencyTypeName") or row.get("name"),
                         "chaosValue": row.get("chaosEquivalent") or recv.get("value") or 0.0,
@@ -294,17 +345,91 @@ def _fetch_stash_overview(league: str, item_type: str, ttl_sec: int = 900) -> li
                         "detailsId": row.get("detailsId"),
                     }
                 )
-        else:
-            resp = client.get(NINJA_STASH_ITEM_URL, params={"league": league, "type": item_type})
-            resp.raise_for_status()
-            payload = resp.json()
-            lines = payload.get("lines", []) or []
+            return out
+        resp = http_client.get(NINJA_STASH_ITEM_URL, params={"league": league, "type": item_type})
+        resp.raise_for_status()
+        payload = resp.json()
+        return payload.get("lines", []) or []
 
     try:
-        cache_file.write_text(json.dumps({"_ts": now, "lines": lines}), encoding="utf-8")
-    except Exception:
-        pass
+        if client is not None:
+            lines = _do_fetch(client)
+        else:
+            with _make_httpx_client(timeout=DEFAULT_HTTP_TIMEOUT, proxy=proxy) as own_client:
+                lines = _do_fetch(own_client)
+    except (httpx.HTTPError, OSError):
+        stale_lines, _ = read_stale_cache(cache_file, data_key="lines")
+        if isinstance(stale_lines, list):
+            _LAST_STALE.value = True
+            return stale_lines
+        raise
+
+    _atomic_write_json(cache_file, {"_ts": now, "lines": lines})
     return lines
+
+
+def _fetch_stash_overviews_batch(
+    league: str,
+    item_types: tuple[str, ...] | list[str],
+    *,
+    ttl_sec: int = 900,
+    proxy: str | None = None,
+    max_workers: int = 6,
+) -> tuple[dict[str, list[dict[str, Any]]], set[str], set[str]]:
+    """Fetch multiple poe.ninja stash categories concurrently using ONE shared httpx.Client.
+
+    Returns ``(results_by_type, stale_types, failed_types)``; per-type HTTP/OS failures are
+    recorded in ``failed_types`` instead of aborting sibling queries in the batch.
+    """
+    now = time.time()
+    results: dict[str, list[dict[str, Any]]] = {}
+    stale_types: set[str] = set()
+    failed_types: set[str] = set()
+    missing: list[str] = []
+    seen: set[str] = set()
+    for ov_type in item_types:
+        if ov_type in seen:
+            continue
+        seen.add(ov_type)
+        fresh = _read_fresh_stash_cache(_stash_cache_path(league, ov_type), ttl_sec, now)
+        if fresh is not None:
+            results[ov_type] = fresh
+        else:
+            missing.append(ov_type)
+
+    if not missing:
+        return results, stale_types, failed_types
+
+    with _make_httpx_client(timeout=DEFAULT_HTTP_TIMEOUT, proxy=proxy) as shared_client:
+        def _worker(ov_type: str) -> tuple[str, list[dict[str, Any]] | None, bool, bool]:
+            _LAST_STALE.value = False
+            try:
+                lines = _fetch_stash_overview(
+                    league, ov_type, ttl_sec=ttl_sec, proxy=proxy, client=shared_client
+                )
+                return ov_type, lines, bool(getattr(_LAST_STALE, "value", False)), False
+            except (httpx.HTTPError, OSError):
+                return ov_type, None, False, True
+
+        if len(missing) == 1:
+            ov_type, lines, was_stale, failed = _worker(missing[0])
+            if failed or lines is None:
+                failed_types.add(ov_type)
+            else:
+                results[ov_type] = lines
+                if was_stale:
+                    stale_types.add(ov_type)
+        else:
+            workers = max(1, min(int(max_workers), len(missing)))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+                for ov_type, lines, was_stale, failed in pool.map(_worker, missing):
+                    if failed or lines is None:
+                        failed_types.add(ov_type)
+                    else:
+                        results[ov_type] = lines
+                        if was_stale:
+                            stale_types.add(ov_type)
+    return results, stale_types, failed_types
 
 
 def _should_auto_detail(query: str, variant: str | None) -> bool:
@@ -377,65 +502,44 @@ def _resolve_types_to_search(cat_key: str, available_keys: tuple[str, ...]) -> t
     return available_keys or ALL_OVERVIEW_TYPES
 
 
-def query_price(
+def _narrow_detailed_types(
+    q: str,
+    cat_key: str,
+    types_to_search: tuple[str, ...],
+    overviews: dict[str, list[dict[str, Any]]],
+) -> tuple[str, ...]:
+    if cat_key == "all" and overviews:
+        q_tokens = [tok for tok in re.split(r"\s+", q) if len(tok) >= 3]
+        narrowed: list[str] = []
+        for ov_type in types_to_search:
+            ov_lines = overviews.get(ov_type, [])
+            matched_type = False
+            for ln in ov_lines:
+                _, p_blob, _ = _build_searchable_fields(ln)
+                if _matches_text_or_tokens(q, p_blob) or (q_tokens and any(tok in p_blob for tok in q_tokens)):
+                    matched_type = True
+                    break
+            if matched_type:
+                narrowed.append(ov_type)
+        return tuple(narrowed)
+    return types_to_search
+
+
+def _score_price_matches(
     query: str,
     *,
-    league: str | None = None,
-    category: str = "all",
-    limit: int = 20,
-    variant: str | None = None,
-    detailed: bool = False,
+    resolved_league: str,
+    cat_key: str,
+    variant: str | None,
+    is_detailed: bool,
+    limit: int,
+    divine_chaos_rate: float | None,
+    target_types: tuple[str, ...],
+    source_by_type: dict[str, list[dict[str, Any]]],
+    is_stale: bool = False,
 ) -> dict[str, Any]:
-    """Search poe.ninja economy prices with 15-minute local disk cache.
-
-    Supports `--variant` substring filtering and `--detailed` (or auto-upgraded)
-    queries backed by `poe1/api/economy/stash/current/item/overview`.
-    """
     q = query.strip().lower()
-    if not q:
-        raise ValueError("Price query cannot be empty.")
-
     v_low = variant.strip().lower() if variant and variant.strip() else None
-    is_detailed = bool(detailed or _should_auto_detail(query, variant))
-
-    resolved_league = league or resolve_current_trade_league()
-    overviews = _fetch_dense_overviews(resolved_league)
-
-    cat_key = category.strip().lower()
-    types_to_search = _resolve_types_to_search(cat_key, tuple(overviews.keys()))
-
-    divine_chaos_rate: float | None = None
-    for line in overviews.get("Currency", []):
-        if str(line.get("name") or "").lower() == "divine orb":
-            divine_chaos_rate = float(line.get("chaos") or line.get("chaosValue") or 0.0)
-            break
-
-    if is_detailed:
-        # Narrow types using dense overview index when searching 'all' so we don't fire 52 stash requests.
-        if cat_key == "all" and overviews:
-            q_tokens = [tok for tok in re.split(r"\s+", q) if len(tok) >= 3]
-            narrowed: list[str] = []
-            for ov_type in types_to_search:
-                ov_lines = overviews.get(ov_type, [])
-                matched_type = False
-                for ln in ov_lines:
-                    _, p_blob, _ = _build_searchable_fields(ln)
-                    if _matches_text_or_tokens(q, p_blob) or (q_tokens and any(tok in p_blob for tok in q_tokens)):
-                        matched_type = True
-                        break
-                if matched_type:
-                    narrowed.append(ov_type)
-            target_types = tuple(narrowed)
-        else:
-            target_types = types_to_search
-
-        source_by_type: dict[str, list[dict[str, Any]]] = {}
-        for ov_type in target_types:
-            stash_lines = _fetch_stash_overview(resolved_league, ov_type)
-            source_by_type[ov_type] = stash_lines if stash_lines else overviews.get(ov_type, [])
-    else:
-        target_types = types_to_search
-        source_by_type = {ov_type: overviews.get(ov_type, []) for ov_type in target_types}
 
     matches: list[dict[str, Any]] = []
     for ov_type in target_types:
@@ -501,7 +605,7 @@ def query_price(
     for m in matches:
         m.pop("_score", None)
 
-    return {
+    out: dict[str, Any] = {
         "query": query,
         "league": resolved_league,
         "category": cat_key,
@@ -511,6 +615,173 @@ def query_price(
         "totalMatches": len(matches),
         "matches": matches[:limit],
     }
+    if is_stale:
+        out["stale"] = True
+    return out
+
+
+def query_price(
+    query: str,
+    *,
+    league: str | None = None,
+    category: str = "all",
+    limit: int = 20,
+    variant: str | None = None,
+    detailed: bool = False,
+    proxy: str | None = None,
+) -> dict[str, Any]:
+    """Search poe.ninja economy prices with 15-minute local disk cache.
+
+    Supports `--variant` substring filtering, `--detailed` (or auto-upgraded)
+    concurrent stash overview queries, explicit proxy, and stale-cache fallback.
+    """
+    q = query.strip().lower()
+    if not q:
+        raise ValueError("Price query cannot be empty.")
+
+    is_detailed = bool(detailed or _should_auto_detail(query, variant))
+
+    resolved_league = league or resolve_current_trade_league(proxy=proxy)
+    _LAST_STALE.value = False
+    overviews = (
+        _fetch_dense_overviews(resolved_league, proxy=proxy)
+        if proxy is not None
+        else _fetch_dense_overviews(resolved_league)
+    )
+    is_stale = bool(getattr(_LAST_STALE, "value", False))
+
+    cat_key = category.strip().lower()
+    types_to_search = _resolve_types_to_search(cat_key, tuple(overviews.keys()))
+
+    divine_chaos_rate: float | None = None
+    for line in overviews.get("Currency", []):
+        if str(line.get("name") or "").lower() == "divine orb":
+            divine_chaos_rate = float(line.get("chaos") or line.get("chaosValue") or 0.0)
+            break
+
+    if is_detailed:
+        target_types = _narrow_detailed_types(q, cat_key, types_to_search, overviews)
+        fetched_stash, stash_stale_types, stash_failed_types = _fetch_stash_overviews_batch(
+            resolved_league, target_types, proxy=proxy
+        )
+        if any(t in stash_stale_types or t in stash_failed_types for t in target_types):
+            is_stale = True
+        source_by_type = {
+            ov_type: (fetched_stash.get(ov_type) or overviews.get(ov_type, []))
+            for ov_type in target_types
+        }
+    else:
+        target_types = types_to_search
+        source_by_type = {ov_type: overviews.get(ov_type, []) for ov_type in target_types}
+
+    return _score_price_matches(
+        query,
+        resolved_league=resolved_league,
+        cat_key=cat_key,
+        variant=variant,
+        is_detailed=is_detailed,
+        limit=limit,
+        divine_chaos_rate=divine_chaos_rate,
+        target_types=target_types,
+        source_by_type=source_by_type,
+        is_stale=is_stale,
+    )
+
+
+def query_price_multi(
+    queries: list[str],
+    *,
+    league: str | None = None,
+    category: str = "all",
+    limit: int = 20,
+    variant: str | None = None,
+    detailed: bool = False,
+    proxy: str | None = None,
+    max_workers: int = 6,
+) -> dict[str, Any]:
+    """Search multiple poe.ninja economy queries sharing ONE dense/stash fetch batch."""
+    clean_queries = [q.strip() for q in queries if isinstance(q, str) and q.strip()]
+    if not clean_queries:
+        raise ValueError("Price queries cannot be empty.")
+
+    resolved_league = league or resolve_current_trade_league(proxy=proxy)
+    _LAST_STALE.value = False
+    overviews = (
+        _fetch_dense_overviews(resolved_league, proxy=proxy)
+        if proxy is not None
+        else _fetch_dense_overviews(resolved_league)
+    )
+    dense_stale = bool(getattr(_LAST_STALE, "value", False))
+
+    cat_key = category.strip().lower()
+    types_to_search = _resolve_types_to_search(cat_key, tuple(overviews.keys()))
+
+    divine_chaos_rate: float | None = None
+    for line in overviews.get("Currency", []):
+        if str(line.get("name") or "").lower() == "divine orb":
+            divine_chaos_rate = float(line.get("chaos") or line.get("chaosValue") or 0.0)
+            break
+
+    per_query_plan: list[tuple[str, bool, tuple[str, ...]]] = []
+    all_stash_types: list[str] = []
+    seen_stash: set[str] = set()
+    for q_raw in clean_queries:
+        q_det = bool(detailed or _should_auto_detail(q_raw, variant))
+        if q_det:
+            t_types = _narrow_detailed_types(q_raw.lower(), cat_key, types_to_search, overviews)
+            for ov_type in t_types:
+                if ov_type not in seen_stash:
+                    seen_stash.add(ov_type)
+                    all_stash_types.append(ov_type)
+        else:
+            t_types = types_to_search
+        per_query_plan.append((q_raw, q_det, t_types))
+
+    fetched_stash: dict[str, list[dict[str, Any]]] = {}
+    stash_stale_types: set[str] = set()
+    stash_failed_types: set[str] = set()
+    if all_stash_types:
+        fetched_stash, stash_stale_types, stash_failed_types = _fetch_stash_overviews_batch(
+            resolved_league, all_stash_types, proxy=proxy, max_workers=max_workers
+        )
+
+    results: list[dict[str, Any]] = []
+    for q_raw, q_det, t_types in per_query_plan:
+        q_stale = dense_stale
+        if q_det:
+            if any(t in stash_stale_types or t in stash_failed_types for t in t_types):
+                q_stale = True
+            src = {ov_type: (fetched_stash.get(ov_type) or overviews.get(ov_type, [])) for ov_type in t_types}
+        else:
+            src = {ov_type: overviews.get(ov_type, []) for ov_type in t_types}
+        results.append(
+            _score_price_matches(
+                q_raw,
+                resolved_league=resolved_league,
+                cat_key=cat_key,
+                variant=variant,
+                is_detailed=q_det,
+                limit=limit,
+                divine_chaos_rate=divine_chaos_rate,
+                target_types=t_types,
+                source_by_type=src,
+                is_stale=q_stale,
+            )
+        )
+
+    out: dict[str, Any] = {
+        "queries": clean_queries,
+        "league": resolved_league,
+        "category": cat_key,
+        "variant": variant,
+        "detailed": any(r["detailed"] for r in results),
+        "divineChaosRate": divine_chaos_rate,
+        "count": len(results),
+        "results": results,
+    }
+    if dense_stale or any(bool(r.get("stale")) for r in results):
+        out["stale"] = True
+    return out
 
 
 def query_meta(
@@ -519,9 +790,39 @@ def query_meta(
     skill: str | None = None,
     class_name: str | None = None,
     top: int = 20,
+    proxy: str | None = None,
 ) -> dict[str, Any]:
     """Query poe.ninja build-index-state meta snapshot (total builds, ascendancies, top skills)."""
-    data = _fetch_poe_ninja_build_index_state(ttl_sec=900)
+    cache_file = _shared_cache_dir() / "poe_ninja_build_index_state.json"
+    is_stale = False
+    pre_ts: float | None = None
+    if cache_file.exists():
+        try:
+            pre_ts = float(json.loads(cache_file.read_text(encoding="utf-8")).get("_ts", 0))
+        except Exception:
+            pre_ts = None
+
+    try:
+        data = (
+            _fetch_poe_ninja_build_index_state(ttl_sec=900, proxy=proxy)
+            if proxy is not None
+            else _fetch_poe_ninja_build_index_state(ttl_sec=900)
+        )
+        # Detect if importers._fetch_poe_ninja_build_index_state silently fell back to an expired cache
+        if pre_ts is not None and (time.time() - pre_ts) >= 900 and cache_file.exists():
+            try:
+                post_ts = float(json.loads(cache_file.read_text(encoding="utf-8")).get("_ts", 0))
+                if post_ts == pre_ts:
+                    is_stale = True
+            except Exception:
+                pass
+    except (httpx.HTTPError, OSError):
+        stale_data, _ = read_stale_cache(cache_file, data_key="data")
+        if isinstance(stale_data, dict):
+            data = stale_data
+            is_stale = True
+        else:
+            raise
     league_builds = data.get("leagueBuilds", []) or []
     if not league_builds:
         raise RuntimeError("poe.ninja build-index-state returned no leagueBuilds entries.")
@@ -619,7 +920,7 @@ def query_meta(
 
     combinations.sort(key=lambda x: x["percentage"], reverse=True)
 
-    return {
+    out: dict[str, Any] = {
         "league": target_lb.get("leagueName"),
         "leagueUrl": target_lb.get("leagueUrl"),
         "totalBuilds": total_builds,
@@ -630,6 +931,9 @@ def query_meta(
         "combinations": combinations[:top],
         "availableLeagues": [x.get("leagueName") for x in league_builds[:12] if x.get("leagueName")],
     }
+    if is_stale:
+        out["stale"] = True
+    return out
 
 
 def _strip_html(raw_html: str) -> str:
@@ -643,14 +947,20 @@ def _strip_html(raw_html: str) -> str:
     return "\n".join(cleaned)
 
 
-def query_wiki(topic: str, *, ttl_sec: int = 86400) -> dict[str, Any]:
+def query_wiki(
+    topic: str,
+    *,
+    ttl_sec: int = 86400,
+    proxy: str | None = None,
+    client: httpx.Client | None = None,
+) -> dict[str, Any]:
     """Query poewiki.net MediaWiki API for mechanics/uniques/keystones with 24h local disk cache."""
     q = topic.strip()
     if not q:
         raise ValueError("Wiki topic cannot be empty.")
 
     slug_hash = hashlib.sha1(q.lower().encode("utf-8")).hexdigest()[:12]
-    cache_file = _get_cache_dir() / f"poewiki_{slug_hash}.json"
+    cache_file = _shared_cache_dir() / f"poewiki_{slug_hash}.json"
     now = time.time()
     if cache_file.exists():
         try:
@@ -661,8 +971,9 @@ def query_wiki(topic: str, *, ttl_sec: int = 86400) -> dict[str, Any]:
             pass
 
     api_url = "https://www.poewiki.net/w/api.php"
-    with _make_httpx_client(timeout=20.0) as client:
-        s_resp = client.get(
+
+    def _fetch_with_client(http_client: httpx.Client) -> dict[str, Any]:
+        s_resp = http_client.get(
             api_url,
             params={
                 "action": "opensearch",
@@ -678,7 +989,7 @@ def query_wiki(topic: str, *, ttl_sec: int = 86400) -> dict[str, Any]:
         urls: list[str] = s_json[3] if len(s_json) > 3 else []
 
         if not titles:
-            q_resp = client.get(
+            q_resp = http_client.get(
                 api_url,
                 params={
                     "action": "query",
@@ -699,7 +1010,7 @@ def query_wiki(topic: str, *, ttl_sec: int = 86400) -> dict[str, Any]:
         page_title = titles[0]
         page_url = urls[0] if urls else f"https://www.poewiki.net/wiki/{page_title.replace(' ', '_')}"
 
-        p_resp = client.get(
+        p_resp = http_client.get(
             api_url,
             params={
                 "action": "parse",
@@ -715,7 +1026,7 @@ def query_wiki(topic: str, *, ttl_sec: int = 86400) -> dict[str, Any]:
         raw_html = p_data.get("text", {}).get("*", "")
         clean_text = _strip_html(raw_html)
 
-        result = {
+        return {
             "query": topic,
             "title": resolved_title,
             "url": page_url,
@@ -724,7 +1035,76 @@ def query_wiki(topic: str, *, ttl_sec: int = 86400) -> dict[str, Any]:
         }
 
     try:
-        cache_file.write_text(json.dumps({"_ts": now, "data": result}), encoding="utf-8")
-    except Exception:
-        pass
+        if client is not None:
+            result = _fetch_with_client(client)
+        else:
+            with _make_httpx_client(timeout=DEFAULT_HTTP_TIMEOUT, proxy=proxy) as own_client:
+                result = _fetch_with_client(own_client)
+    except (httpx.HTTPError, OSError):
+        stale_data, _ = read_stale_cache(cache_file, data_key="data")
+        if isinstance(stale_data, dict):
+            return {**stale_data, "stale": True}
+        raise
+
+    _atomic_write_json(cache_file, {"_ts": now, "data": result})
     return result
+
+
+def query_wiki_multi(
+    queries: list[str],
+    *,
+    ttl_sec: int = 86400,
+    proxy: str | None = None,
+    max_workers: int = 4,
+) -> dict[str, Any]:
+    """Query multiple poewiki.net topics concurrently using ONE shared httpx.Client."""
+    clean_queries = [q.strip() for q in queries if isinstance(q, str) and q.strip()]
+    if not clean_queries:
+        raise ValueError("Wiki queries cannot be empty.")
+
+    now = time.time()
+    cached_hits: dict[str, dict[str, Any]] = {}
+    uncached: list[str] = []
+    for q in clean_queries:
+        slug_hash = hashlib.sha1(q.lower().encode("utf-8")).hexdigest()[:12]
+        cache_file = _shared_cache_dir() / f"poewiki_{slug_hash}.json"
+        if cache_file.exists():
+            try:
+                cached = json.loads(cache_file.read_text(encoding="utf-8"))
+                if now - cached.get("_ts", 0) < ttl_sec and "data" in cached:
+                    cached_hits[q] = cached["data"]
+                    continue
+            except Exception:
+                pass
+        if q not in uncached:
+            uncached.append(q)
+
+    fetched: dict[str, dict[str, Any]] = {}
+    if uncached:
+        with _make_httpx_client(timeout=DEFAULT_HTTP_TIMEOUT, proxy=proxy) as shared_client:
+            def _run_one(topic: str) -> tuple[str, dict[str, Any]]:
+                try:
+                    return topic, query_wiki(
+                        topic, ttl_sec=ttl_sec, proxy=proxy, client=shared_client
+                    )
+                except Exception as exc:
+                    return topic, {"query": topic, "error": str(exc)}
+
+            if len(uncached) == 1:
+                t, res = _run_one(uncached[0])
+                fetched[t] = res
+            else:
+                workers = max(1, min(int(max_workers), len(uncached)))
+                with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+                    for t, res in pool.map(_run_one, uncached):
+                        fetched[t] = res
+
+    results = [cached_hits[q] if q in cached_hits else fetched[q] for q in clean_queries]
+    out: dict[str, Any] = {
+        "queries": clean_queries,
+        "count": len(results),
+        "results": results,
+    }
+    if any(bool(r.get("stale")) for r in results):
+        out["stale"] = True
+    return out

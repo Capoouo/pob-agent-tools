@@ -8,6 +8,8 @@ build mutations.
 from __future__ import annotations
 
 import json
+import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -15,9 +17,10 @@ from typing import Any
 import click
 
 from . import bench as bench_mod
+from .cli import _emit_json, _emit_text, _output_options, _resolve_output_flags
 from .daemon import BootstrapMissingError, call_daemon
 from .external_data import resolve_current_trade_league
-from .formatters import render_table, render_update_warning, to_json_str
+from .formatters import emit_json, render_table, render_update_warning
 from .importers import _get_cache_dir
 from .trade_client import (
     CookieRequired,
@@ -68,6 +71,30 @@ SLOT_HINT = (
     "ring1, ring2, ring3, weapon1, weapon2, bow, wand, claw, dagger, "
     "sceptre, staff, flask1..5, jewel"
 )
+
+_TARGET_SLUG_RE = re.compile(r"^[a-zA-Z0-9._-]{1,48}$")
+
+
+class _TargetSlotType(click.ParamType):
+    name = "slot"
+
+    def convert(self, value: Any, param: Any, ctx: Any) -> str:
+        s = str(value or "").strip()
+        if s in (".", "..") or not _TARGET_SLUG_RE.match(s):
+            self.fail(
+                f"Invalid build slot slug {value!r}; expected 1-48 chars of [a-zA-Z0-9._-] (not '.' or '..').",
+                param,
+                ctx,
+            )
+        return s
+
+
+_TARGET_SLOT_TYPE = _TargetSlotType()
+
+
+def _default_target_slot() -> str:
+    val = (os.environ.get("POB_SLOT") or "main").strip()
+    return val or "main"
 
 
 def _echo_utf8(text: str) -> None:
@@ -128,19 +155,23 @@ def _resolve_league(
     *,
     offline_only: bool = False,
     proxy: str | None = None,
+    client: TradeClient | None = None,
 ) -> str:
     if explicit and explicit.strip():
         return explicit.strip()
     if offline_only:
         return _cached_league_offline() or "Standard"
     try:
-        league = resolve_current_trade_league()
+        league = resolve_current_trade_league(proxy=proxy)
         if league:
             return league
     except Exception:
         pass
     try:
-        return TradeClient(proxy=proxy).default_league()
+        if client is not None:
+            return client.default_league()
+        with TradeClient(proxy=proxy) as fallback_client:
+            return fallback_client.default_league()
     except TradeError:
         return "Standard"
 
@@ -156,40 +187,38 @@ def _daemon_call_safe(
     return call_daemon(action, params, auto_start=auto_start, timeout=timeout)
 
 
-def _read_build_label_and_warning() -> tuple[str, dict[str, Any] | None]:
-    try:
-        status = _daemon_call_safe("status")
-    except Exception:
-        return "unknown", None
-    warn = status.get("updateWarning") if isinstance(status, dict) else None
-    info = (status.get("main") or {}).get("buildInfo") or {}
-    parts = [
-        str(info.get("classNameZh") or info.get("className") or "").strip(),
-        str(info.get("ascendClassNameZh") or info.get("ascendClassName") or "").strip(),
-    ]
-    label = " ".join(part for part in parts if part)
-    level = info.get("level")
-    if level:
-        label = f"{label} (level {level})" if label else f"level {level}"
-    return label or "unknown", warn
+def _build_label_from_info(info: dict[str, Any] | None, target: str) -> str:
+    if isinstance(info, dict) and info:
+        parts = [
+            str(info.get("classNameZh") or info.get("className") or "").strip(),
+            str(info.get("ascendClassNameZh") or info.get("ascendClassName") or "").strip(),
+        ]
+        label = " ".join(part for part in parts if part)
+        level = info.get("level")
+        if level:
+            label = f"{label} (level {level})" if label else f"level {level}"
+        if label:
+            return label
+    return f"slot:{target}"
 
 
-def _read_current_item(slot: str, target: str) -> tuple[Any, str | None, dict[str, Any] | None]:
+def _read_current_item(slot: str, target: str) -> tuple[Any, str | None, dict[str, Any] | None, str | None]:
     try:
         payload = _daemon_call_safe("items", {"target": target, "slot": slot, "raw": True})
     except BootstrapMissingError as exc:
         alert = format_stderr_update_alert(exc.update_status) or str(exc)
-        return None, sanitize_text(alert, 300), None
+        return None, sanitize_text(alert, 300), None, None
     except Exception as exc:
-        return None, sanitize_text(exc, 300), None
+        return None, sanitize_text(exc, 300), None, None
     warn = payload.get("updateWarning") if isinstance(payload, dict) else None
+    label = _build_label_from_info(payload.get("buildInfo") if isinstance(payload, dict) else None, target)
     raw = payload.get("raw")
     if not raw:
-        return None, None, warn
+        return None, None, warn, label
     try:
-        return parse_item_text(raw), None, warn
+        return parse_item_text(raw), None, warn, label
     except ValueError as exc:
-        return None, sanitize_text(exc, 300), warn
+        return None, sanitize_text(exc, 300), warn, label
 
 
 def _price_of(row: dict[str, Any]) -> tuple[float | None, str | None]:
@@ -226,7 +255,7 @@ def _conversion_payload(plan: Any) -> dict[str, Any]:
     }
 
 
-def _prepend_warning(body: str, update_warning: dict[str, Any] | None) -> str:
+def _prepend_warning(body: str, update_warning: str | None) -> str:
     banner = render_update_warning(update_warning)
     return f"{banner}{body}" if banner else body
 
@@ -248,6 +277,7 @@ def trade_group() -> None:
 @click.option("--proxy", help="HTTP/SOCKS5 proxy URL (overrides POB_PROXY).")
 @click.option("--refresh", is_flag=True, help="Force refresh remote trade stats cache.")
 @click.option("--json", "as_json", is_flag=True, help="Output raw JSON.")
+@_output_options
 def cmd_trade_stats(
     text: str,
     slot: str | None,
@@ -255,22 +285,24 @@ def cmd_trade_stats(
     proxy: str | None,
     refresh: bool,
     as_json: bool,
+    compact: bool,
+    out_path: str | None,
 ) -> None:
     """Resolve an English or Chinese modifier to an official PoE1 trade stat ID."""
     ctx = click.get_current_context()
-    client = TradeClient(proxy=proxy)
-    try:
-        entries, source = load_trade_stats(
-            remote_fetcher=lambda: client.stats(force_refresh=refresh),
-            force_refresh=refresh,
-        )
-    except TradeError as exc:
-        _trade_error(ctx, exc)
-        return
-    except Exception as exc:
-        _err_utf8(str(exc))
-        ctx.exit(5)
-        return
+    with TradeClient(proxy=proxy) as client:
+        try:
+            entries, source = load_trade_stats(
+                remote_fetcher=lambda: client.stats(force_refresh=refresh),
+                force_refresh=refresh,
+            )
+        except TradeError as exc:
+            _trade_error(ctx, exc)
+            return
+        except Exception as exc:
+            _err_utf8(str(exc))
+            ctx.exit(5)
+            return
 
     match = resolve_stat(text, entries, slot=slot)
     suggestions = suggest_stats(text, entries, limit=limit, slot=slot)
@@ -286,21 +318,23 @@ def cmd_trade_stats(
                 {"id": item.id, "text": item.text, "score": item.score} for item in suggestions
             ],
         }
-        _echo_utf8(to_json_str(payload, sanitize=True))
+        _emit_json(payload, compact=compact, out_path=out_path, sanitize=True)
     else:
+        lines: list[str] = []
         if match:
-            _echo_utf8(
+            lines.append(
                 f"Resolved (`{source}`): `{match.text}` -> `{match.id}` (score {match.score:.3f})"
             )
         else:
-            _echo_utf8(f"No confident match for `{text}` (source: `{source}`).")
+            lines.append(f"No confident match for `{text}` (source: `{source}`).")
         if suggestions:
-            _echo_utf8(
+            lines.append(
                 render_table(
                     ["Text", "Stat ID", "Score"],
                     [[item.text, item.id, f"{item.score:.3f}"] for item in suggestions],
                 )
             )
+        _emit_text("\n".join(lines), out_path=out_path)
     if match is None:
         ctx.exit(1)
 
@@ -383,7 +417,12 @@ def cmd_trade_stats(
     help="Verify top candidates via headless PoB.",
 )
 @click.option("--pob-limit", type=int, default=5, show_default=True, help="Candidates to PoB-verify.")
-@click.option("--target", type=click.Choice(["main", "ref"]), default="main", show_default=True)
+@click.option(
+    "--target",
+    type=_TARGET_SLOT_TYPE,
+    default=_default_target_slot,
+    help="Target build slot slug (defaults to POB_SLOT or 'main').",
+)
 @click.option(
     "--current-item-file",
     type=click.Path(exists=True, dir_okay=False),
@@ -393,6 +432,7 @@ def cmd_trade_stats(
 @click.option("--dump-query", is_flag=True, help="Print official trade query JSON offline and exit.")
 @click.option("--proxy", help="HTTP/SOCKS5 proxy URL (overrides POB_PROXY).")
 @click.option("--json", "as_json", is_flag=True, help="Output RFC-8259 JSON.")
+@_output_options
 @click.option("--verbose", is_flag=True, help="Log HTTP request paths to stderr (never cookies).")
 def cmd_trade_search(
     slot: str | None,
@@ -426,6 +466,8 @@ def cmd_trade_search(
     dump_query: bool,
     proxy: str | None,
     as_json: bool,
+    compact: bool,
+    out_path: str | None,
     verbose: bool,
 ) -> None:
     """Search official PoE1 trade listings, compare against equipped gear, and verify in PoB."""
@@ -453,7 +495,8 @@ def cmd_trade_search(
     # Load current item early (when not --dump-query) so weapon1/weapon2 can infer exact category
     current = None
     current_error: str | None = None
-    update_warning: dict[str, Any] | None = None
+    update_warning: str | None = None
+    build_label = f"slot:{target}"
     pob_slot = pob_slot_for_slot(slot or "") if slot else None
 
     if not dump_query:
@@ -466,7 +509,9 @@ def cmd_trade_search(
                 current_error = sanitize_text(exc, 300)
         elif not no_compare:
             if pob_slot:
-                current, current_error, update_warning = _read_current_item(pob_slot, target)
+                current, current_error, update_warning, item_label = _read_current_item(pob_slot, target)
+                if item_label:
+                    build_label = item_label
             elif slot:
                 current_error = f"no PoB slot mapping for {slot!r}"
 
@@ -476,123 +521,124 @@ def cmd_trade_search(
         if resolved_category is None and slot and current is not None and current.base_type:
             resolved_category = infer_weapon_category_from_base(current.base_type)
 
-    client = TradeClient(
+    with TradeClient(
         proxy=proxy,
         logger=(lambda line: _err_utf8(line)) if verbose else None,
-    )
-    league_name = _resolve_league(league, offline_only=dump_query, proxy=proxy)
+    ) as client:
+        league_name = _resolve_league(league, offline_only=dump_query, proxy=proxy, client=client)
 
-    try:
-        entries, stats_source = load_trade_stats(
-            remote_fetcher=None if dump_query else client.stats,
-        )
-    except TradeError as exc:
-        _trade_error(ctx, exc)
-        return
-    except Exception as exc:
-        if dump_query:
-            # If local TradeSiteStats.lua is missing (e.g. CI), allow remote fetch only if explicitly needed
-            try:
-                entries, stats_source = load_trade_stats(remote_fetcher=client.stats)
-            except TradeError as trade_exc:
-                _trade_error(ctx, trade_exc)
-                return
-            except Exception as inner_exc:
-                _err_utf8(str(inner_exc))
+        try:
+            entries, stats_source = load_trade_stats(
+                remote_fetcher=None if dump_query else client.stats,
+            )
+        except TradeError as exc:
+            _trade_error(ctx, exc)
+            return
+        except Exception as exc:
+            if dump_query:
+                # If local TradeSiteStats.lua is missing (e.g. CI), allow remote fetch only if explicitly needed
+                try:
+                    entries, stats_source = load_trade_stats(remote_fetcher=client.stats)
+                except TradeError as trade_exc:
+                    _trade_error(ctx, trade_exc)
+                    return
+                except Exception as inner_exc:
+                    _err_utf8(str(inner_exc))
+                    ctx.exit(5)
+                    return
+            else:
+                _err_utf8(str(exc))
                 ctx.exit(5)
                 return
-        else:
+
+        pseudo_filters: list[dict[str, Any]] = []
+        if open_prefix:
+            pseudo_filters.append({"id": OPEN_PREFIX_ID, "value": {"min": 1}, "disabled": False})
+        if open_suffix:
+            pseudo_filters.append({"id": OPEN_SUFFIX_ID, "value": {"min": 1}, "disabled": False})
+        if open_affix and not (open_prefix or open_suffix):
+            pseudo_filters.append({"id": OPEN_AFFIX_ID, "value": {"min": 1}, "disabled": False})
+        open_flags = {
+            "prefix": bool(open_prefix),
+            "suffix": bool(open_suffix),
+            "any": bool(open_affix and not (open_prefix or open_suffix)),
+        }
+
+        bench_options: list[dict[str, Any]] = []
+        if bench_hint and slot:
+            seen_ids: set[str] = set()
+            affix_filter = (
+                "prefix"
+                if open_prefix and not open_suffix
+                else ("suffix" if open_suffix and not open_prefix else None)
+            )
+            for text in [req.text for req in requests] + list(wants):
+                for result in bench_mod.search(slot, text, limit=2, affix=affix_filter):
+                    recipe = result.recipe
+                    if recipe.id in seen_ids:
+                        continue
+                    seen_ids.add(recipe.id)
+                    bench_options.append(recipe.as_dict())
+
+        try:
+            plan = plan_stats(
+                requests,
+                entries,
+                slot=slot,
+                allow_conversion=allow_conversion,
+                convert_to=convert_to,
+                rarity=rarity,
+            )
+            query = build_query(
+                plan=plan,
+                category=resolved_category,
+                rarity=rarity,
+                item_level_min=ilvl_min,
+                status=status,
+                currency=currency,
+                budget=budget,
+                search_sort=search_sort,
+                pseudo_filters=pseudo_filters or None,
+                allow_corrupted=allow_corrupted,
+            )
+        except ValueError as exc:
             _err_utf8(str(exc))
-            ctx.exit(5)
+            ctx.exit(1)
             return
 
-    pseudo_filters: list[dict[str, Any]] = []
-    if open_prefix:
-        pseudo_filters.append({"id": OPEN_PREFIX_ID, "value": {"min": 1}, "disabled": False})
-    if open_suffix:
-        pseudo_filters.append({"id": OPEN_SUFFIX_ID, "value": {"min": 1}, "disabled": False})
-    if open_affix and not (open_prefix or open_suffix):
-        pseudo_filters.append({"id": OPEN_AFFIX_ID, "value": {"min": 1}, "disabled": False})
-    open_flags = {
-        "prefix": bool(open_prefix),
-        "suffix": bool(open_suffix),
-        "any": bool(open_affix and not (open_prefix or open_suffix)),
-    }
+        if dump_query:
+            payload = {
+                "league": league_name,
+                "slot": slot,
+                "category": resolved_category,
+                "statsSource": stats_source,
+                "conversion": _conversion_payload(plan),
+                "openAffixes": open_flags,
+                "benchOptions": bench_options,
+                "query": query,
+            }
+            _emit_json(payload, compact=compact, out_path=out_path, sanitize=True)
+            return
 
-    bench_options: list[dict[str, Any]] = []
-    if bench_hint and slot:
-        seen_ids: set[str] = set()
-        affix_filter = (
-            "prefix"
-            if open_prefix and not open_suffix
-            else ("suffix" if open_suffix and not open_prefix else None)
-        )
-        for text in [req.text for req in requests] + list(wants):
-            for result in bench_mod.search(slot, text, limit=2, affix=affix_filter):
-                recipe = result.recipe
-                if recipe.id in seen_ids:
-                    continue
-                seen_ids.add(recipe.id)
-                bench_options.append(recipe.as_dict())
+        try:
+            search_res = client.search(league_name, query)
+        except TradeError as exc:
+            _trade_error(ctx, exc)
+            return
 
-    try:
-        plan = plan_stats(
-            requests,
-            entries,
-            slot=slot,
-            allow_conversion=allow_conversion,
-            convert_to=convert_to,
-            rarity=rarity,
-        )
-        query = build_query(
-            plan=plan,
-            category=resolved_category,
-            rarity=rarity,
-            item_level_min=ilvl_min,
-            status=status,
-            currency=currency,
-            budget=budget,
-            search_sort=search_sort,
-            pseudo_filters=pseudo_filters or None,
-            allow_corrupted=allow_corrupted,
-        )
-    except ValueError as exc:
-        _err_utf8(str(exc))
-        ctx.exit(1)
-        return
+        query_id = str(search_res.get("id") or "")
+        ids = [str(item) for item in search_res.get("result") or []]
+        total = int(search_res.get("total") or len(ids))
 
-    if dump_query:
-        payload = {
-            "league": league_name,
-            "slot": slot,
-            "category": resolved_category,
-            "statsSource": stats_source,
-            "conversion": _conversion_payload(plan),
-            "openAffixes": open_flags,
-            "benchOptions": bench_options,
-            "query": query,
-        }
-        _echo_utf8(to_json_str(payload, sanitize=True))
-        return
+        try:
+            rows = client.fetch_many(ids, query_id, limit=max(0, min(fetch_limit, 20)))
+        except TradeError as exc:
+            _trade_error(ctx, exc)
+            return
 
-    try:
-        search_res = client.search(league_name, query)
-    except TradeError as exc:
-        _trade_error(ctx, exc)
-        return
-
-    query_id = str(search_res.get("id") or "")
-    ids = [str(item) for item in search_res.get("result") or []]
-    total = int(search_res.get("total") or len(ids))
-
-    try:
-        rows = client.fetch_many(ids, query_id, limit=max(0, min(fetch_limit, 20)))
-    except TradeError as exc:
-        _trade_error(ctx, exc)
-        return
+        search_url = client.search_url(league_name, query_id) if query_id else ""
 
     candidates: list[Candidate] = []
-    search_url = client.search_url(league_name, query_id) if query_id else ""
     for row in rows:
         raw_item = row.get("item") or {}
         try:
@@ -700,12 +746,6 @@ def cmd_trade_search(
             )
         conversion_note = "; ".join(parts)
 
-    build_label = "unknown"
-    if not as_json and (current is not None or not no_compare):
-        build_label, status_warn = _read_build_label_and_warning()
-        if update_warning is None:
-            update_warning = status_warn
-
     if as_json:
         payload: dict[str, Any] = {
             "league": league_name,
@@ -730,7 +770,7 @@ def cmd_trade_search(
         }
         if update_warning:
             payload["updateWarning"] = update_warning
-        _echo_utf8(to_json_str(payload, sanitize=True))
+        _emit_json(payload, compact=compact, out_path=out_path, sanitize=True)
         return
 
     body = format_report(
@@ -749,7 +789,7 @@ def cmd_trade_search(
         open_affixes=open_flags,
         bench_options=bench_options,
     )
-    _echo_utf8(_prepend_warning(body, update_warning))
+    _emit_text(_prepend_warning(body, update_warning), out_path=out_path)
     if current_error:
         _err_utf8(f"Equipped item could not be read: {current_error}")
 
@@ -771,6 +811,12 @@ def cmd_trade_search(
     help="Bypass unique/corrupted/mirrored item-level guards (what-if preview only).",
 )
 @click.option("--json", "as_json", is_flag=True, help="Output raw JSON.")
+@click.option(
+    "--compact",
+    is_flag=True,
+    default=False,
+    help="Emit compact single-line JSON (when --json is used).",
+)
 def cmd_trade_convert(
     file_path: str | None,
     raw_text: str | None,
@@ -778,6 +824,7 @@ def cmd_trade_convert(
     out_path: str | None,
     force: bool,
     as_json: bool,
+    compact: bool,
 ) -> None:
     """Preview PoE1 3.30 Harvest same-tier element conversion on item text."""
     ctx = click.get_current_context()
@@ -796,7 +843,9 @@ def cmd_trade_convert(
         return
 
     if out_path:
-        Path(out_path).write_text(converted.text + "\n", encoding="utf-8")
+        out_file = Path(out_path)
+        out_file.parent.mkdir(parents=True, exist_ok=True)
+        out_file.write_text(converted.text + "\n", encoding="utf-8", newline="\n")
 
     if as_json:
         payload = {
@@ -806,35 +855,46 @@ def cmd_trade_convert(
             "warnings": list(converted.warnings),
             "skipped": list(converted.skipped),
         }
-        _echo_utf8(to_json_str(payload, sanitize=True))
+        eff_compact, root_out = _resolve_output_flags(compact=compact, out_path=None)
+        json_out = None if out_path else root_out
+        text = emit_json(payload, compact=eff_compact, out=json_out, sanitize=True)
+        if json_out is not None:
+            _echo_utf8(f"Saved JSON to `{json_out}` ({len(text.encode('utf-8')):,} bytes).")
         return
 
-    _echo_utf8(f"### Converted item text (target: {target})")
-    _echo_utf8("```text")
-    _echo_utf8(converted.text)
-    _echo_utf8("```")
+    lines = [
+        f"### Converted item text (target: {target})",
+        "```text",
+        converted.text,
+        "```",
+    ]
     if converted.conversions:
-        _echo_utf8("\nConverted modifiers:")
+        lines.append("\nConverted modifiers:")
         for c in converted.conversions:
             tier_info = f"tier {c.tier}; " if c.tier else ""
-            _echo_utf8(
+            lines.append(
                 f"- {c.template} -> {c.converted_template} "
                 f"(cost: {c.cost}; {tier_info}{c.patch} rules; same tier, roll re-rolled)"
             )
     else:
-        _echo_utf8("\nNo convertible modifiers were found.")
+        lines.append("\nNo convertible modifiers were found.")
     if converted.warnings:
-        _echo_utf8("\nWarnings:")
+        lines.append("\nWarnings:")
         for w in converted.warnings:
-            _echo_utf8(f"- {w}")
+            lines.append(f"- {w}")
     if converted.skipped:
-        _echo_utf8("\nSkipped:")
+        lines.append("\nSkipped:")
         for reason in converted.skipped:
-            _echo_utf8(f"- {reason}")
-    _echo_utf8(
+            lines.append(f"- {reason}")
+    lines.append(
         "\n> Harvest keeps the tier but re-rolls the value inside that tier. "
         "Listed values are best-case references; verify with `pob item try --slot <slot>`."
     )
+    rendered = "\n".join(lines)
+    if out_path:
+        _echo_utf8(rendered)
+    else:
+        _emit_text(rendered)
 
 
 # ---------------------------------------------------------------------------
@@ -853,12 +913,15 @@ def bench_group() -> None:
 @click.option("--affix", type=click.Choice(["prefix", "suffix"]), help="Filter by affix type.")
 @click.option("--limit", default=25, show_default=True, help="Maximum rows to show.")
 @click.option("--json", "as_json", is_flag=True, help="Output raw JSON.")
+@_output_options
 def cmd_bench_list(
     slot: str,
     text: str | None,
     affix: str | None,
     limit: int,
     as_json: bool,
+    compact: bool,
+    out_path: str | None,
 ) -> None:
     """List crafting bench modifiers available for a slot."""
     if text:
@@ -876,11 +939,11 @@ def cmd_bench_list(
             "source": meta,
             "recipes": [recipe.as_dict() for recipe in items],
         }
-        _echo_utf8(to_json_str(payload, sanitize=True))
+        _emit_json(payload, compact=compact, out_path=out_path, sanitize=True)
         return
 
     if not items:
-        _echo_utf8(f"No bench modifiers matched for `{slot}`.")
+        _emit_text(f"No bench modifiers matched for `{slot}`.", out_path=out_path)
         return
 
     rows = [
@@ -894,11 +957,12 @@ def cmd_bench_list(
         ]
         for recipe in items
     ]
-    _echo_utf8(
+    _emit_text(
         render_table(
             ["Affix", "Modifier", "中文", "Roll", "Cost", "Unlock"],
             rows,
-        )
+        ),
+        out_path=out_path,
     )
 
 
@@ -908,18 +972,21 @@ def cmd_bench_list(
 @click.option("--affix", type=click.Choice(["prefix", "suffix"]), help="Filter by affix type.")
 @click.option("--limit", default=5, show_default=True, help="Maximum suggestions.")
 @click.option("--json", "as_json", is_flag=True, help="Output raw JSON.")
+@_output_options
 def cmd_bench_suggest(
     slot: str,
     text: str,
     affix: str | None,
     limit: int,
     as_json: bool,
+    compact: bool,
+    out_path: str | None,
 ) -> None:
     """Suggest the strongest crafting bench craft for a desired modifier."""
     ctx = click.get_current_context()
     results = bench_mod.search(slot, text, limit=limit, affix=affix)
     if not results:
-        _echo_utf8(f"No bench modifier for `{slot}` matched `{text}`.")
+        _emit_text(f"No bench modifier for `{slot}` matched `{text}`.", out_path=out_path)
         ctx.exit(1)
         return
 
@@ -934,24 +1001,27 @@ def cmd_bench_suggest(
             "alternatives": [r.recipe.as_dict() for r in results[1:]],
             "source": meta,
         }
-        _echo_utf8(to_json_str(payload, sanitize=True))
+        _emit_json(payload, compact=compact, out_path=out_path, sanitize=True)
         return
 
-    _echo_utf8(f"Best bench craft for `{slot}` / `{text}` (source: `{meta.get('mode', 'unknown')}`):")
-    _echo_utf8(f"- affix: {best_recipe.affix}")
     zh_part = f" ({best_recipe.text_zh})" if best_recipe.text_zh and best_recipe.text_zh != best_recipe.text else ""
-    _echo_utf8(f"- modifier: {best_recipe.text}{zh_part}")
-    _echo_utf8(f"- roll: {best_recipe.roll_text or '-'} (minimum {best_recipe.min_value:g} is the safe floor)")
-    _echo_utf8(f"- crafted line (min): `{' | '.join(best_recipe.crafted_lines(use_min=True))}`")
-    _echo_utf8(f"- cost: {best_recipe.cost}")
+    lines = [
+        f"Best bench craft for `{slot}` / `{text}` (source: `{meta.get('mode', 'unknown')}`):",
+        f"- affix: {best_recipe.affix}",
+        f"- modifier: {best_recipe.text}{zh_part}",
+        f"- roll: {best_recipe.roll_text or '-'} (minimum {best_recipe.min_value:g} is the safe floor)",
+        f"- crafted line (min): `{' | '.join(best_recipe.crafted_lines(use_min=True))}`",
+        f"- cost: {best_recipe.cost}",
+    ]
     if best_recipe.unlock:
-        _echo_utf8(f"- unlock: {best_recipe.unlock}")
-    _echo_utf8(
+        lines.append(f"- unlock: {best_recipe.unlock}")
+    lines.append(
         f"- note: bench mods roll lower than high-tier natural mods; requires an open {best_recipe.affix}. "
         "Append the `{crafted}` line and verify with `pob item try`."
     )
     if len(results) > 1:
-        _echo_utf8("\nAlternatives:")
+        lines.append("\nAlternatives:")
         for r in results[1:]:
             rec = r.recipe
-            _echo_utf8(f"- [{rec.affix}] {rec.text} ({rec.roll_text or '-'}; {rec.cost})")
+            lines.append(f"- [{rec.affix}] {rec.text} ({rec.roll_text or '-'}; {rec.cost})")
+    _emit_text("\n".join(lines), out_path=out_path)

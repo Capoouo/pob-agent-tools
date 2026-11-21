@@ -14,7 +14,7 @@ High-signal CLI, managed dual-upstream headless engine, offline Lua game-data SQ
   - Checks upstream on daemon startup (and every 30m with zero-loss slot hot-reload) via `PobTools-zh` `302` release tags (never `api.github.com`) + official PoB `manifest.xml` SHA1 incremental diff with `gate_result` smoke probe & `.bak/` rollback.
   - Fast-fails (`connect=3s`) when GitHub is unreachable, degrades cleanly to local engine, and emits dual-channel alerts (`stderr` + JSON `updateWarning` / Markdown `> [WARN]`).
 - **Zero-Residue `what-if` Simulation & 30-Step Undo/Redo**: Every mutation (`item try/edit/db/flask/anoint`, `skill set/add/rm`, `tree change/set-class`, `config set [--append-mods]`, `batch`, `borrow`) runs inside an in-memory `export_code`/`import_code` transaction and rolls back unless `--apply` is passed.
-- **Multi-Scenario Matrix (`pob matrix`) & 4-Dim Inflation Audit (`pob audit`)**: Compare `Original`, `Pinnacle`, `Uber`, `FlasksOff`, and custom `Label:Pinnacle,key=val` scenarios in one atomic pass, or strip Config/Flask/Skill/Party water automatically.
+- **Multi-Scenario Matrix (`pob matrix`) & 4-Dim Inflation Audit (`pob audit`)**: Compare `Original`, `Pinnacle`, `Uber`, `FlasksOff`, and custom `Label:Pinnacle,key=val` scenarios in one atomic pass, or strip Config/Flask/Skill/Party water with per-item PoB attribution; pass `--keep <spec>` (e.g. `pob audit --keep conditionStationary`, `pob matrix Original Pinnacle --keep flasks`) to preserve build-guaranteed conditions.
 - **3-Baseline A/B Comparison (`pob compare`) & Transplant (`pob borrow`)**: Compare `main` vs `ref` across Original, Target-Env-Aligned, and Dewatered Pinnacle baselines with tree/skill/gear diffs.
 - **0ms Local Offline Game Data (`pob data`)**: Pure-Python PoB Lua parser + SQLite/FTS5 index (`gem`, `unique` incl. Foulborn, `mod` incl. Bench/Eldritch/Corrupted, `base`, `translate` EN<->ZH) running daemon-free in `<15ms`.
 - **External Economy, Meta, PoEDB & Wiki (`pob price` / `pob meta` / `pob poedb` / `pob wiki`)**:
@@ -23,6 +23,7 @@ High-signal CLI, managed dual-upstream headless engine, offline Lua game-data SQ
 - **Official PoE1 Trade & Crafting Bench (`pob trade` / `pob bench`)**:
   - Read-only official trade search with 0ms offline local `TradeSiteStats.lua` resolution (bilingual EN/ZH + slot-aware `(Local)` routing), GGG dynamic `X-Rate-Limit-*` persistence, 3.30 instant buyout (`--status available`) & `chaos_equiv` pricing, Harvest same-tier conversion (`--allow-conversion` with same-group conflict guards), and single-snapshot batch headless PoB DPS/EHP verification (`trade_eval_items`). See [docs/TRADE.md](docs/TRADE.md).
   - Dual-source crafting bench lookup (`pob bench list|suggest`) driven by auto-updating `ModMaster.lua` (0 unknown affixes) with a compact offline cost/unlock overlay and ready-to-verify `{crafted}` lines.
+- **Timeless Jewel Seed Search (`pob timeless list|search`)**: Finds the best seeds across PoB's 11 timeless jewels at any allocated socket, with every reported row calculated by headless PoB (no hand-set weights). Seeds matching on allocated notables are deduplicated, large searches fit per-node contributions to narrow candidates (`--exact` evaluates all seeds), and work runs across parallel throwaway engines (`--workers`, `--idle`). Accepts English or Chinese jewel names.
 
 ---
 
@@ -98,6 +99,7 @@ pob load "https://poedb.tw/pob/AWqOLSSmyG"
 # 2. Inspect summary, water audit, config, all equipped items/jewels, skills, tree, and calcs
 pob summary
 pob audit
+pob audit --keep conditionStationary
 pob config list
 pob items --all --raw
 pob skills --group main
@@ -108,7 +110,7 @@ pob item edit --slot "Ring 1" --replace-mod "Cold Resistance" "+45% to Lightning
 pob item db "Mageblood" --equip
 pob config set --append-mods "+100 to maximum Life"
 pob tree set-class Witch Necromancer
-pob matrix Original Pinnacle Uber FlasksOff
+pob matrix Original Pinnacle Uber FlasksOff --keep flasks
 
 # 4. Rankings, 3-baseline comparison, and gear/skill transplant
 pob rank-nodes --stat CombinedDPS --max-dist 4 --top 10
@@ -131,6 +133,10 @@ pob trade stats "攻击速度" --slot weapon1
 pob trade search --slot gloves --budget 20 --stat "冰霜抗性=40" --want "Attack Speed" --allow-conversion --pob auto
 pob trade search --slot gloves --budget 10 --stat "最大生命=60" --open-suffix --pob auto
 pob bench suggest --slot gloves --stat "冰霜抗性"
+
+# 7. Timeless jewel seed search (PoB-verified; ranks real headless PoB results)
+pob timeless list
+pob timeless search --jewel "Lethal Pride" --socket 61419 --stat CombinedDPS --idle
 ```
 
 Pass `--json` to any command for structured, color-stripped JSON output. Pass `--offline` before a subcommand (or set `POB_OFFLINE=1`) to skip GitHub update checks. See [AGENTS.md](AGENTS.md) for the compact agent cheat-sheet.
@@ -154,6 +160,12 @@ pyinstaller --noconfirm --clean pob_cli/packaging/pob.spec
 1. Bump `__version__` in `pob_cli/src/pob_cli/__init__.py` and commit to `main`.
 2. Tag and push: `git tag v0.3.0 && git push origin v0.3.0`.
 3. GitHub Actions (`windows-latest`) validates the tag, runs tests, builds & smoke-tests `pob-v0.3.0-windows-x64.zip` + wheel/sdist + `SHA256SUMS.txt`, publishes the GitHub Release, and auto-updates `bucket/pob.json` for Scoop.
+
+## Acknowledgements
+
+- **[@ChangMenQAQ](https://github.com/ChangMenQAQ)** ([PR #1](https://github.com/exilemoulei/pob-agent-tools/pull/1)) — Official PoE1 trade search, Harvest conversion, and crafting bench fallback workflow.
+- **[@restartgr](https://github.com/restartgr)** ([PR #2](https://github.com/exilemoulei/pob-agent-tools/pull/2), [PR #4](https://github.com/exilemoulei/pob-agent-tools/pull/4)) — Per-item headless PoB water attribution, `--keep` & rollback verification, and clean CLI vs. daemon error classification.
+- **[@Capoouo](https://github.com/Capoouo)** ([PR #3](https://github.com/exilemoulei/pob-agent-tools/pull/3)) — Headless PoB-verified timeless jewel seed search (`pob timeless list|search`) with notable-signature grouping and log-space estimation.
 
 ## License
 

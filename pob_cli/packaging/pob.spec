@@ -10,11 +10,15 @@ entry_script = os.path.join(spec_dir, "pyinstaller_entry.py")
 
 datas = collect_data_files("certifi") + [
     (os.path.join(src_dir, "pob_cli", "data", "bench_costs.json"), os.path.join("pob_cli", "data")),
+    (os.path.join(src_dir, "pob_cli", "lua", "headless_runner.lua"), os.path.join("pob_cli", "lua")),
 ]
 hiddenimports = [
     "socksio",
+    "pob_cli.errors",
     "pob_cli.daemon",
     "pob_cli.cli_trade",
+    "pob_cli.timeless",
+    "pob_cli.cli_timeless",
 ]
 
 a = Analysis(

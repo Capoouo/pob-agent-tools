@@ -2,12 +2,23 @@
 
 from __future__ import annotations
 
+from collections import deque
+import difflib
+import math
 import re
-from typing import Any
+from typing import Any, Iterable
 
 from .bridge_client import BridgeWorker
-from .formatters import strip_pob_escapes
-from .snapshot import capture_digest, diff_digest
+from .formatters import _parse_numeric_or_none, strip_pob_escapes
+from .snapshot import (
+    _call_batch,
+    _finite_float,
+    _json_safe_stat,
+    _safe_min_ele_max_hit,
+    _stat_float,
+    capture_digest,
+    diff_digest,
+)
 
 # Config variables that represent permanent character choices and must NEVER be stripped in de-watering
 PERMANENT_CONFIG_VARS = frozenset({
@@ -49,8 +60,6 @@ TEMPORARY_SKILL_PATTERNS = (
     "sigil of power",
     "focus",
     "vaal breach",
-    "vaal impurity",
-    "vaal righteous fire",
     "熔岩护盾",
     "钢铁之肤",
     "不朽怒嚎",
@@ -59,28 +68,40 @@ TEMPORARY_SKILL_PATTERNS = (
     "冰霜护盾",
     "威能法印",
     "瓦尔裂隙",
-    "瓦尔不净",
-    "瓦尔正义之火",
 )
+
+# PoB NewConfigSet truthy defaultState values (Modules/ConfigOptions.lua) for inflation-matching
+# vars. bridge.lua's list_config does not serialize defaultState/isDefault, and reset_config
+# restores these to their defaultState (a no-op when already at defaultState).
+_POB_TRUTHY_CONFIG_DEFAULTS: dict[str, Any] = {
+    "conditionCorruptingCryStages": 1,
+    "conditionChampionIntimidate": True,
+    "conditionSacrificeMinion": True,
+}
 
 
 def extract_summary(worker: BridgeWorker) -> dict[str, Any]:
-    """Extract a complete structured summary of the currently loaded build."""
+    """Extract a complete structured summary of the currently loaded build in one pipelined batch."""
     with worker.lock:
-        info = worker.call("get_build_info", {})
-        header = worker.call("get_build_header", {})
-        stats_res = worker.call("get_stats", {})
-        sidebar = worker.call("get_sidebar", {})
-        skills_res = worker.call("list_skills", {})
-        specs_res = worker.call("list_specs", {})
-        items_res = worker.call("list_items", {})
-        config_res = worker.call("list_config", {})
+        stats_res, sidebar, info, header, skills_res, specs_res, items_res = _call_batch(
+            worker,
+            [
+                ("get_stats", {}),
+                ("get_sidebar", {}),
+                ("get_build_info", {}),
+                ("get_build_header", {}),
+                ("list_skills", {}),
+                ("list_specs", {}),
+                ("list_items", {}),
+            ],
+        )
 
-    stats = stats_res.get("stats", {})
+    stats = stats_res.get("stats", {}) if isinstance(stats_res, dict) else {}
+    sidebar_warnings = sidebar.get("warnings", []) if isinstance(sidebar, dict) else []
     warnings = [
         strip_pob_escapes(w.get("text") or w.get("raw") or "")
-        for w in sidebar.get("warnings", [])
-        if (w.get("text") or w.get("raw"))
+        for w in sidebar_warnings
+        if isinstance(w, dict) and (w.get("text") or w.get("raw"))
     ]
 
     # Identify main skill group & gems
@@ -103,7 +124,7 @@ def extract_summary(worker: BridgeWorker) -> dict[str, Any]:
                 }
             )
 
-    has_minion_stats = bool(minion_sidebar) or float(stats.get("MinionCombinedDPS") or 0) > 0
+    has_minion_stats = bool(minion_sidebar) or _stat_float(stats.get("MinionCombinedDPS")) > 0
 
     offence = {
         "FullDPS": stats.get("FullDPS"),
@@ -193,14 +214,15 @@ def extract_summary(worker: BridgeWorker) -> dict[str, Any]:
         "itemSets": items_res.get("itemSets", []),
         "activeSkillSetId": skills_res.get("activeSkillSetId"),
         "skillSets": skills_res.get("skillSets", []),
-        "activeConfigSetId": config_res.get("activeConfigSetId"),
-        "configSets": config_res.get("configSets", []),
         "mainGroup": main_group,
         "offence": offence,
         "minionOffence": minion_offence,
         "defence": defence,
         "warnings": warnings,
     }
+
+
+get_summary = extract_summary
 
 
 def _has_mageblood_equipped(items_res: dict[str, Any]) -> bool:
@@ -218,21 +240,127 @@ def _has_mageblood_equipped(items_res: dict[str, Any]) -> bool:
     return False
 
 
-def dewater_build_in_place(worker: BridgeWorker) -> dict[str, list[str]]:
+_KEEP_KEYWORDS = ("flasks", "custommods", "party")
+DEWATER_SENTINEL_TITLE = "pob-cli dewater"
+
+
+def _normalize_keep(keep: Iterable[str] | str | None) -> set[str]:
+    """Normalize user keep tokens (config vars, 'Flask N', 'flasks', gem names, 'customMods', 'party')."""
+    if keep is None:
+        return set()
+    tokens: Iterable[str] = (keep,) if isinstance(keep, str) else keep
+    out: set[str] = set()
+    for tok in tokens:
+        for part in str(tok).split(","):
+            p = part.strip().lower()
+            if p:
+                out.add(p)
+    return out
+
+
+def _unmatched_keep(keep_set: set[str], known: dict[str, str]) -> list[str]:
+    """Keep tokens that name nothing in this build, with a close-match hint.
+
+    pob-mcp rejects an unknown config key per key instead of silently ignoring it;
+    a mistyped ``--keep`` would otherwise strip the item it meant to protect.
+    """
+    out: list[str] = []
+    for tok in sorted(keep_set):
+        if tok in known:
+            continue
+        hint = difflib.get_close_matches(tok, list(known), n=1, cutoff=0.8)
+        msg = f"{tok}: not a config var, flask slot, skill gem, or flasks/customMods/party"
+        if hint:
+            msg += f" (did you mean {known[hint[0]]}?)"
+        out.append(msg)
+    return out
+
+
+def _normalize_custom_mod_blocks(custom_mods: Any) -> list[dict[str, Any]]:
+    """Normalize PoB customMods block list (matching bridge.lua's ``enabled ~= false`` semantics)."""
+    return [
+        {
+            "title": b.get("title") or "Default",
+            "text": b.get("text") or "",
+            "enabled": bool(b.get("enabled", True) is not False),
+        }
+        for b in (custom_mods or [])
+        if isinstance(b, dict)
+    ]
+
+
+def _is_vaal_text(text: str) -> bool:
+    low = strip_pob_escapes(text or "").strip().lower()
+    if not low:
+        return False
+    return low.startswith("vaal ") or " vaal " in low or "瓦尔" in low
+
+
+def _is_vaal_skill_entry(entry: Any) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    for key in ("name", "nameZh"):
+        if _is_vaal_text(str(entry.get(key) or "")):
+            return True
+    sid = strip_pob_escapes(str(entry.get("skillId") or "")).strip().lower()
+    return sid.startswith("vaal")
+
+
+def dewater_build_in_place(
+    worker: BridgeWorker,
+    keep: Iterable[str] | str | None = None,
+) -> dict[str, list[str]]:
     """Strip PoB inflation ('water') in place and set enemyIsBoss='Pinnacle'.
 
     Must be called inside a snapshot wrapper if non-destructive behavior is desired.
-    Returns a dictionary of stripped inflation items across the 4 audit dimensions.
+    Returns a dictionary of stripped inflation items across the 4 audit dimensions,
+    plus ``kept`` (items left untouched because the user listed them in ``keep``)
+    and ``keepRejected`` (unmatched ``keep`` tokens with close-match hints).
     """
+    stripped, _records = dewater_build_with_records(worker, keep=keep)
+    return stripped
+
+
+def dewater_build_with_records(
+    worker: BridgeWorker,
+    keep: Iterable[str] | str | None = None,
+) -> tuple[dict[str, list[str]], list[dict[str, Any]]]:
+    """De-water in place (2 pipelined RPC batches) and return reversible per-item records.
+
+    Each record carries the exact bridge calls that ``restore`` the original state of
+    that single item and ``revert`` it back to the de-watered state, so callers can
+    measure every stripped item's real PoB contribution one at a time
+    (see :func:`attribute_water`). ``keep`` tokens are matched case-insensitively
+    against config var names, flask slot names (``Flask 1``) or ``flasks`` (all),
+    skill gem names, ``customMods`` / ``customMods:<title>``, and ``party``.
+    """
+    keep_set = _normalize_keep(keep)
     stripped: dict[str, list[str]] = {
         "config": [],
         "flasks": [],
         "skills": [],
         "party": [],
+        "kept": [],
+        "keepRejected": [],
     }
+    records: list[dict[str, Any]] = []
+    # Every name a keep token may legitimately refer to (lowercase -> display form).
+    known: dict[str, str] = {k: k for k in _KEEP_KEYWORDS}
+
+    # Pipeline all 4 read-only inspections in ONE batch
+    cfg_res, items_res, skills_res, party_res = _call_batch(
+        worker,
+        [
+            ("list_config", {}),
+            ("list_items", {}),
+            ("list_skills", {}),
+            ("get_party", {}),
+        ],
+    )
+
+    mutations: list[tuple[str, dict[str, Any]]] = []
 
     # 1. Config inflation & enemyIsBoss = Pinnacle
-    cfg_res = worker.call("list_config", {})
     current_boss = None
     had_preset_boss_skills = False
 
@@ -240,6 +368,8 @@ def dewater_build_in_place(worker: BridgeWorker) -> dict[str, list[str]]:
         for item in sec.get("items", []):
             var = item.get("var")
             val = item.get("value")
+            if var:
+                known[str(var).lower()] = str(var)
             if not var or var in PERMANENT_CONFIG_VARS:
                 continue
             if var == "enemyIsBoss":
@@ -247,67 +377,172 @@ def dewater_build_in_place(worker: BridgeWorker) -> dict[str, list[str]]:
                 continue
             if val in (None, False, "", 0):
                 continue
+            if item.get("isDefault") is True:
+                continue
+            if "defaultState" in item and _same_state(val, item.get("defaultState")):
+                continue
+            if var == "presetBossSkills" and val == "None":
+                continue
+            if var in _POB_TRUTHY_CONFIG_DEFAULTS and _same_state(val, _POB_TRUTHY_CONFIG_DEFAULTS[var]):
+                continue
 
+            is_inflation = (
+                var == "presetBossSkills"
+                or var.startswith(INFLATION_CONFIG_PREFIXES)
+                or var in INFLATION_CONFIG_EXACT
+            )
+            if not is_inflation:
+                continue
+            if var.lower() in keep_set:
+                stripped["kept"].append(f"{var}={val!r} (kept)")
+                continue
             if var == "presetBossSkills":
                 had_preset_boss_skills = True
-                stripped["config"].append(f"{var}={val!r} -> reset")
-                worker.call("reset_config", {"var": var})
-            elif var.startswith(INFLATION_CONFIG_PREFIXES) or var in INFLATION_CONFIG_EXACT:
-                stripped["config"].append(f"{var}={val!r} -> reset")
-                worker.call("reset_config", {"var": var})
+            stripped["config"].append(f"{var}={val!r} -> reset")
+            mutations.append(("reset_config", {"var": var}))
+            records.append(
+                {
+                    "dimension": "config",
+                    "key": var,
+                    "label": f"{var}={val!r}",
+                    "restore": [("set_config", {"var": var, "value": val})],
+                    "revert": [("reset_config", {"var": var})],
+                    "probe": {"kind": "config", "var": var},
+                    "original": val,
+                }
+            )
 
-    if current_boss not in ("Pinnacle", "Uber"):
-        stripped["config"].append(f"enemyIsBoss={current_boss!r} -> 'Pinnacle'")
-    worker.call("set_config", {"var": "enemyIsBoss", "value": "Pinnacle"})
-    if had_preset_boss_skills:
-        # Second call ensures ConfigTab BuildModList sees updated enemyIsBoss selIndex
-        worker.call("set_config", {"var": "enemyIsBoss", "value": "Pinnacle"})
+    if "enemyisboss" in keep_set:
+        stripped["kept"].append(f"enemyIsBoss={current_boss!r} (kept)")
+    else:
+        if current_boss != "Pinnacle":
+            stripped["config"].append(f"enemyIsBoss={current_boss!r} -> 'Pinnacle'")
+        mutations.append(("set_config", {"var": "enemyIsBoss", "value": "Pinnacle"}))
+        if had_preset_boss_skills:
+            # Second call ensures ConfigTab BuildModList sees updated enemyIsBoss selIndex
+            mutations.append(("set_config", {"var": "enemyIsBoss", "value": "Pinnacle"}))
 
-    # Check customMods (use '# disabled' comment block so ConfigTab.lua doesn't fall back to legacy input.customMods)
+    # Disable each active customMods group in place (title and text preserved) and attribute
+    # each group on its own. A trailing comment-only sentinel keeps an enabled block with text,
+    # so ConfigTab:BuildModList does not fall back to legacy input.customMods.
     custom_mods = cfg_res.get("customMods", [])
-    active_custom_lines: list[str] = []
-    for block in custom_mods:
-        if block.get("enabled", True):
-            text = (block.get("text") or "").strip()
-            for line in text.splitlines():
-                s = line.strip()
-                if s and not s.startswith("#"):
-                    active_custom_lines.append(s)
-    if active_custom_lines:
-        stripped["config"].append(f"customMods ({len(active_custom_lines)} active lines: {'; '.join(active_custom_lines[:3])}) -> disabled")
-        worker.call(
-            "set_custom_mods",
-            {"list": [{"title": "Default", "text": "# disabled", "enabled": True}]},
+    blocks = _normalize_custom_mod_blocks(custom_mods)
+    for b in blocks:
+        raw_title = str(b["title"])
+        clean_title = strip_pob_escapes(raw_title).strip()
+        display_title = clean_title or raw_title
+        known[f"custommods:{raw_title.lower()}"] = f"customMods:{display_title}"
+        if clean_title:
+            known[f"custommods:{clean_title.lower()}"] = f"customMods:{display_title}"
+
+    dewatered_blocks = [dict(b) for b in blocks]
+    group_records: list[tuple[int, str, str]] = []
+    for i, b in enumerate(blocks):
+        lines = [
+            s
+            for ln in b["text"].splitlines()
+            if (s := strip_pob_escapes(ln).strip()) and not s.startswith("#")
+        ]
+        if not b["enabled"] or not lines:
+            continue
+        raw_title = str(b["title"])
+        clean_title = strip_pob_escapes(raw_title).strip()
+        display_title = clean_title or raw_title
+        label = f"customMods[{display_title}] ({len(lines)} active lines: {'; '.join(lines[:3])})"
+        keep_keys = {f"custommods:{raw_title.lower()}"}
+        if clean_title:
+            keep_keys.add(f"custommods:{clean_title.lower()}")
+        if "custommods" in keep_set or bool(keep_keys & keep_set):
+            stripped["kept"].append(f"{label} (kept)")
+            continue
+        dewatered_blocks[i]["enabled"] = False
+        stripped["config"].append(f"{label} -> disabled")
+        group_records.append((i, display_title, label))
+
+    if group_records:
+        has_sentinel = any(
+            b["title"] == DEWATER_SENTINEL_TITLE
+            and b["enabled"]
+            and bool(b["text"].strip())
+            and all(
+                not (s := strip_pob_escapes(ln).strip()) or s.startswith("#")
+                for ln in b["text"].splitlines()
+            )
+            for b in dewatered_blocks
         )
+        if not has_sentinel:
+            dewatered_blocks.append({"title": DEWATER_SENTINEL_TITLE, "text": "# disabled", "enabled": True})
+        mutations.append(("set_custom_mods", {"list": dewatered_blocks}))
+        for i, display_title, label in group_records:
+            restored_blocks = [dict(b) for b in dewatered_blocks]
+            restored_blocks[i]["enabled"] = True
+            records.append(
+                {
+                    "dimension": "config",
+                    "key": f"customMods:{display_title}",
+                    "label": label,
+                    "restore": [("set_custom_mods", {"list": restored_blocks})],
+                    "revert": [("set_custom_mods", {"list": dewatered_blocks})],
+                    "probe": {"kind": "customMods"},
+                    "original": restored_blocks,
+                }
+            )
 
     # 2. Flask inflation (active flasks without Mageblood)
-    items_res = worker.call("list_items", {})
     has_mb = _has_mageblood_equipped(items_res)
     items_by_id = {it["id"]: it for it in items_res.get("items", [])}
+    for slot in items_res.get("slots", []):
+        if slot.get("isFlask") and slot.get("name"):
+            known[str(slot["name"]).lower()] = str(slot["name"])
     if not has_mb:
         for slot in items_res.get("slots", []):
             if slot.get("isFlask") and slot.get("active"):
                 slot_name = slot["name"]
                 item = items_by_id.get(slot.get("selItemId") or 0, {})
                 item_title = strip_pob_escapes(item.get("titleZh") or item.get("title") or item.get("name") or slot_name)
+                if "flasks" in keep_set or slot_name.lower() in keep_set:
+                    stripped["kept"].append(f"{slot_name} ({item_title}) (kept)")
+                    continue
                 stripped["flasks"].append(f"{slot_name} ({item_title}) -> active=False")
-                worker.call("set_slot_active", {"slotName": slot_name, "active": False})
+                mutations.append(("set_slot_active", {"slotName": slot_name, "active": False}))
+                records.append(
+                    {
+                        "dimension": "flasks",
+                        "key": slot_name,
+                        "label": f"{slot_name} ({item_title})",
+                        "restore": [("set_slot_active", {"slotName": slot_name, "active": True})],
+                        "revert": [("set_slot_active", {"slotName": slot_name, "active": False})],
+                        "probe": {"kind": "flask", "slot": slot_name},
+                        "original": True,
+                    }
+                )
 
     # 3. Temporary guard / burst / Vaal skills
-    skills_res = worker.call("list_skills", {})
+    # In PoB Data/Gems.lua & CalcSetup.lua:1831, grantedEffectList[1] (enableGlobal1) is the
+    # VAAL burst skill and grantedEffectList[2] (enableGlobal2) is the BASE skill.
+    # For non-hasGlobalEffect Vaal main skills (e.g. Vaal Ice Nova, Vaal Lightning Strike,
+    # Vaal Spark), CalcSetup.lua:1831 ignores enableGlobal1 and CalcSetup.lua:1963 selects
+    # socketGroupSkillList[group.mainActiveSkill], so we also switch mainActiveSkill to the base skill.
+    main_socket_group = skills_res.get("mainSocketGroup")
     for group in skills_res.get("groups", []):
-        if not group.get("enabled", True):
-            continue
         g_idx = group["index"]
+        group_enabled = group.get("enabled", True)
+        is_main_group = bool(group.get("isMain")) or (main_socket_group is not None and g_idx == main_socket_group)
+        skills_list = group.get("skills") or []
+        orig_active = int(group.get("mainActiveSkill") or 1)
         for gem in group.get("gems", []):
-            if not gem.get("enabled", True) or gem.get("support"):
-                continue
-            names = [
+            raw_names = [
                 str(gem.get("nameSpec") or ""),
                 str(gem.get("name") or ""),
                 str(gem.get("nameZh") or ""),
                 str(gem.get("skillId") or ""),
             ]
+            names = [strip_pob_escapes(n).strip() for n in raw_names]
+            for n in names:
+                if n:
+                    known[n.lower()] = n
+            if not group_enabled or not gem.get("enabled", True) or gem.get("support"):
+                continue
             combined_lower = " ".join(names).lower()
             is_vaal = (
                 combined_lower.startswith("vaal ")
@@ -315,245 +550,741 @@ def dewater_build_in_place(worker: BridgeWorker) -> dict[str, list[str]]:
                 or "瓦尔" in combined_lower
             )
             is_temp = any(pat in combined_lower for pat in TEMPORARY_SKILL_PATTERNS)
+            original_vaal_g1 = bool(gem.get("enableGlobal1", False))
+            is_active_vaal = is_vaal and original_vaal_g1
+
+            selected_main_is_vaal = False
+            next_skill: dict[str, Any] = {}
+            if (
+                is_vaal
+                and not is_temp
+                and not gem.get("hasGlobalEffect")
+                and is_main_group
+                and 1 <= orig_active
+                and orig_active + 1 <= len(skills_list)
+            ):
+                cur_skill = skills_list[orig_active - 1]
+                cand_next = skills_list[orig_active]
+                if _is_vaal_skill_entry(cur_skill) and not _is_vaal_skill_entry(cand_next):
+                    cur_names = {
+                        strip_pob_escapes(str(cur_skill.get(k) or "")).strip().lower()
+                        for k in ("name", "nameZh", "skillId")
+                        if cur_skill.get(k)
+                    }
+                    gem_names = {n.lower() for n in names if n}
+                    if not cur_names or bool(cur_names & gem_names) or any(
+                        cn in gn or gn in cn
+                        for cn in cur_names
+                        for gn in gem_names
+                        if len(cn) >= 4 and len(gn) >= 4
+                    ):
+                        selected_main_is_vaal = True
+                        next_skill = cand_next
+
             disp = strip_pob_escapes(gem.get("nameZh") or gem.get("name") or gem.get("nameSpec") or "")
+            if not (is_temp or is_active_vaal or selected_main_is_vaal):
+                continue
+            if any(n.lower() in keep_set for n in names if n):
+                stripped["kept"].append(f"Group #{g_idx} Gem #{gem['index']} ({disp}) (kept)")
+                continue
+            gem_ref = {"group": g_idx, "index": gem["index"]}
             if is_temp:
                 stripped["skills"].append(f"Group #{g_idx} Gem #{gem['index']} ({disp}) -> enabled=False")
-                worker.call("set_gem", {"group": g_idx, "index": gem["index"], "enabled": False})
-            elif is_vaal and gem.get("enableGlobal2", False):
-                stripped["skills"].append(
-                    f"Group #{g_idx} Gem #{gem['index']} ({disp}) -> enableGlobal2=False (base skill kept)"
-                )
-                worker.call(
-                    "set_gem",
+                mutations.append(("set_gem", {**gem_ref, "enabled": False}))
+                records.append(
                     {
-                        "group": g_idx,
-                        "index": gem["index"],
-                        "enableGlobal1": True,
-                        "enableGlobal2": False,
-                    },
+                        "dimension": "skills",
+                        "key": disp,
+                        "label": f"Group #{g_idx} {disp}",
+                        "restore": [("set_gem", {**gem_ref, "enabled": True})],
+                        "revert": [("set_gem", {**gem_ref, "enabled": False})],
+                        "probe": {"kind": "gem", **gem_ref, "fields": ["enabled"]},
+                        "original": {"enabled": True},
+                    }
+                )
+            else:
+                original_base_enabled = bool(gem.get("enableGlobal2", True))
+                dewater_calls: list[tuple[str, dict[str, Any]]] = [
+                    (
+                        "set_gem",
+                        {
+                            **gem_ref,
+                            "enableGlobal1": False,
+                            "enableGlobal2": original_base_enabled,
+                        },
+                    )
+                ]
+                restore_calls: list[tuple[str, dict[str, Any]]] = [
+                    (
+                        "set_gem",
+                        {
+                            **gem_ref,
+                            "enableGlobal1": original_vaal_g1,
+                            "enableGlobal2": original_base_enabled,
+                        },
+                    )
+                ]
+                probe_fields = ["enabled", "enableGlobal1", "enableGlobal2"]
+                orig_state: dict[str, Any] = {
+                    "enabled": True,
+                    "enableGlobal1": original_vaal_g1,
+                    "enableGlobal2": original_base_enabled,
+                }
+                if selected_main_is_vaal:
+                    dewater_calls.append(("set_group", {"index": g_idx, "mainActiveSkill": orig_active + 1}))
+                    restore_calls.append(("set_group", {"index": g_idx, "mainActiveSkill": orig_active}))
+                    probe_fields.append("mainActiveSkill")
+                    orig_state["mainActiveSkill"] = orig_active
+                    next_name = strip_pob_escapes(
+                        str(next_skill.get("nameZh") or next_skill.get("name") or f"skill #{orig_active + 1}")
+                    )
+                    stripped["skills"].append(
+                        f"Group #{g_idx} Gem #{gem['index']} ({disp}) -> enableGlobal1=False, "
+                        f"mainActiveSkill={orig_active + 1} ({next_name})"
+                    )
+                else:
+                    stripped["skills"].append(
+                        f"Group #{g_idx} Gem #{gem['index']} ({disp}) -> enableGlobal1=False (base skill kept)"
+                    )
+                mutations.extend(dewater_calls)
+                records.append(
+                    {
+                        "dimension": "skills",
+                        "key": disp,
+                        "label": f"Group #{g_idx} {disp} (Vaal)",
+                        "restore": restore_calls,
+                        "revert": list(dewater_calls),
+                        "probe": {
+                            "kind": "gem",
+                            **gem_ref,
+                            "fields": probe_fields,
+                        },
+                        "original": orig_state,
+                    }
                 )
 
-    # 4. PartyTab buffs
-    party_res = worker.call("get_party", {})
+    # 4. PartyTab buffs (cleared wholesale; not individually reversible, so no attribution record)
     party_fields = party_res.get("fields", {})
     non_empty_party = [k for k, v in party_fields.items() if str(v or "").strip()]
     if non_empty_party or party_res.get("enableExportBuffs"):
-        stripped["party"].append(f"PartyTab fields ({', '.join(non_empty_party or ['enableExportBuffs'])}) -> cleared & disabled")
-        worker.call("party_action", {"action": "disable"})
-        worker.call("party_action", {"action": "clear"})
+        label = f"PartyTab fields ({', '.join(non_empty_party or ['enableExportBuffs'])})"
+        if "party" in keep_set:
+            stripped["kept"].append(f"{label} (kept)")
+        else:
+            stripped["party"].append(f"{label} -> cleared & disabled")
+            mutations.append(("party_action", {"action": "disable"}))
+            mutations.append(("party_action", {"action": "clear"}))
 
-    return stripped
+    if mutations:
+        _call_batch(worker, mutations)
+
+    stripped["keepRejected"] = _unmatched_keep(keep_set, known)
+    return stripped, records
 
 
-def audit_build(worker: BridgeWorker) -> dict[str, Any]:
-    """Run static build health checks + non-destructive 4-part PoB inflation ('water') audit."""
-    with worker.lock:
-        snap_code = worker.call("export_code", {})["code"]
-        digest_before = capture_digest(worker)
-        stats = digest_before["stats"]
-        info = digest_before["buildInfo"]
-        items_res = worker.call("list_items", {})
+def _probe_rpc_method(probe: dict[str, Any]) -> str:
+    kind = probe.get("kind")
+    if kind in ("config", "customMods"):
+        return "list_config"
+    if kind == "flask":
+        return "list_items"
+    if kind == "gem":
+        return "list_skills"
+    raise ValueError(f"unknown probe kind {kind!r}")
 
-        # Static health checks
-        health_issues: list[dict[str, str]] = []
 
-        # 1. Elemental & Chaos resistances
-        for elem in ("Fire", "Cold", "Lightning"):
-            val = float(stats.get(f"{elem}Resist") or 0)
-            over = float(stats.get(f"{elem}ResistOverCap") or 0)
-            if val < 75:
-                health_issues.append(
-                    {
-                        "category": "Resistance",
-                        "severity": "HIGH",
-                        "message": f"{elem} Resist is uncapped: {val:.0f}% (gap: {75 - val:.0f}%)",
-                    }
-                )
-            elif over < 15:
-                health_issues.append(
-                    {
-                        "category": "Resistance",
-                        "severity": "LOW",
-                        "message": f"{elem} Resist overcap is thin: +{over:.0f}% over cap (vulnerable to curses/exposure)",
-                    }
-                )
+def _extract_probe_state(probe: dict[str, Any], res: dict[str, Any]) -> Any:
+    kind = probe.get("kind")
+    if kind == "customMods":
+        return _normalize_custom_mod_blocks(res.get("customMods", []))
+    if kind == "config":
+        for sec in res.get("sections", []):
+            for item in sec.get("items", []):
+                if item.get("var") == probe["var"]:
+                    return item.get("value")
+        return None
+    if kind == "flask":
+        for slot in res.get("slots", []):
+            if slot.get("name") == probe["slot"]:
+                return bool(slot.get("active"))
+        return None
+    if kind == "gem":
+        for group in res.get("groups", []):
+            if group.get("index") != probe["group"]:
+                continue
+            for gem in group.get("gems", []):
+                if gem.get("index") == probe["index"]:
+                    state: dict[str, Any] = {}
+                    for f in probe["fields"]:
+                        if f == "mainActiveSkill":
+                            state[f] = int(group.get("mainActiveSkill") or 1)
+                        else:
+                            state[f] = bool(gem.get(f, f == "enabled"))
+                    return state
+        return None
+    raise ValueError(f"unknown probe kind {kind!r}")
 
-        chaos_res = float(stats.get("ChaosResist") or 0)
-        if chaos_res < 0:
-            health_issues.append(
-                {
-                    "category": "Resistance",
-                    "severity": "MEDIUM",
-                    "message": f"Chaos Resist is negative: {chaos_res:.0f}%",
-                }
-            )
 
-        # 2. Attributes vs Requirements
-        for attr in ("Str", "Dex", "Int"):
-            cur = float(stats.get(attr) or 0)
-            req = float(stats.get(f"Req{attr}") or 0)
-            if req > cur:
-                health_issues.append(
-                    {
-                        "category": "Attribute",
-                        "severity": "HIGH",
-                        "message": f"{attr} insufficient: have {cur:.0f}, require {req:.0f}",
-                    }
-                )
+def _probe_state(worker: BridgeWorker, probe: dict[str, Any]) -> Any:
+    """Read back from PoB the live state a record's restore/revert is meant to set."""
+    method = _probe_rpc_method(probe)
+    return _extract_probe_state(probe, worker.call(method, {}))
 
-        # 3. Accuracy / Hit Chance
-        hit_chance = stats.get("HitChance")
-        if hit_chance is not None and float(hit_chance) < 100.0:
-            health_issues.append(
-                {
-                    "category": "Offence",
-                    "severity": "MEDIUM",
-                    "message": f"Hit Chance is {float(hit_chance):.1f}% (< 100%)",
-                }
-            )
 
-        # 4. Mana Cost vs Unreserved Mana & Regen
-        mana_cost = float(stats.get("ManaCost") or 0)
-        mana_unres = float(stats.get("ManaUnreserved") or 0)
-        raw_mana_regen = (
-            stats.get("ManaRegenRecovery")
-            if stats.get("ManaRegenRecovery") is not None
-            else stats.get("ManaRegen")
-        )
-        mana_regen = float(raw_mana_regen or 0)
-        mana_leech = float(stats.get("ManaLeechGainRate") or 0)
-        speed = float(stats.get("Speed") or 0)
-        if mana_cost > 0 and mana_cost > mana_unres and float(stats.get("LifeUnreserved") or 0) > 0:
-            health_issues.append(
-                {
-                    "category": "Sustain",
-                    "severity": "HIGH",
-                    "message": f"Skill Mana Cost ({mana_cost:.0f}) exceeds Unreserved Mana ({mana_unres:.0f})",
-                }
-            )
-        elif mana_cost > 0 and mana_regen < 0:
-            health_issues.append(
-                {
-                    "category": "Sustain",
-                    "severity": "MEDIUM",
-                    "message": f"Net Mana Regen is negative ({mana_regen:.1f}/s) with Mana Cost {mana_cost:.0f}",
-                }
-            )
-        elif (
-            mana_cost > 0
-            and speed > 0
-            and (mana_cost * speed) > (max(0.0, mana_regen) + mana_leech)
-            and float(stats.get("LifeUnreserved") or 0) > 0
-        ):
-            spend_rate = mana_cost * speed
-            rec_rate = max(0.0, mana_regen) + mana_leech
-            health_issues.append(
-                {
-                    "category": "Sustain",
-                    "severity": "LOW",
-                    "message": (
-                        f"Mana spend rate ({spend_rate:.1f}/s = {mana_cost:.0f} * {speed:.2f}/s) "
-                        f"exceeds net Mana recovery + leech ({rec_rate:.1f}/s)"
-                    ),
-                }
-            )
+def _same_state(a: Any, b: Any) -> bool:
+    """Compare a read-back value with the expected one (PoB stores unset checks as nil)."""
+    if isinstance(a, (dict, list)) or isinstance(b, (dict, list)):
+        return a == b
+    if isinstance(a, bool) or isinstance(b, bool) or a is None or b is None:
+        return bool(a) == bool(b)
+    try:
+        fa = float(a)
+        fb = float(b)
+    except (TypeError, ValueError):
+        return a == b
+    if math.isnan(fa) or math.isnan(fb):
+        return math.isnan(fa) and math.isnan(fb)
+    if math.isinf(fa) or math.isinf(fb):
+        return fa == fb
+    return abs(fa - fb) <= 1e-9 * max(1.0, abs(fa))
 
-        # 5. Unallocated points
-        pts = info.get("points", {})
-        used, used_max = int(pts.get("used") or 0), int(pts.get("usedMax") or 0)
-        asc_used, asc_max = int(pts.get("ascUsed") or 0), int(pts.get("ascMax") or 0)
-        if used > used_max:
-            health_issues.append(
-                {
-                    "category": "Points",
-                    "severity": "HIGH",
-                    "message": f"Over-allocated passive points: {used}/{used_max}",
-                }
-            )
-        if asc_used < asc_max:
-            health_issues.append(
-                {
-                    "category": "Points",
-                    "severity": "LOW",
-                    "message": f"Unallocated Ascendancy points: {asc_used}/{asc_max}",
-                }
-            )
 
-        # 6. Sidebar warnings
-        for w in digest_before["warnings"]:
-            health_issues.append(
-                {
-                    "category": "EngineWarning",
-                    "severity": "HIGH",
-                    "message": w,
-                }
-            )
+def _metric_val(raw: Any) -> float | str | None:
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return None
+    parsed = _parse_numeric_or_none(raw)
+    if parsed is None or math.isnan(parsed):
+        return None
+    if math.isinf(parsed):
+        return _json_safe_stat(parsed)
+    return parsed
 
-        # 7. Empty primary equipment slots
-        primary_slots = {"Weapon 1", "Body Armour", "Helmet", "Gloves", "Boots", "Amulet", "Ring 1", "Ring 2", "Belt"}
-        for slot in items_res.get("slots", []):
-            if slot.get("name") in primary_slots and not slot.get("inactive") and not slot.get("selItemId"):
-                health_issues.append(
-                    {
-                        "category": "Equipment",
-                        "severity": "MEDIUM",
-                        "message": f"Equipment slot '{slot['name']}' is empty",
-                    }
-                )
 
-        # Run non-destructive de-watering snapshot
+def _digest_metrics(digest: dict[str, Any], dps_key: str) -> dict[str, float | str | None]:
+    stats = digest.get("stats", {}) if isinstance(digest, dict) else {}
+    return {
+        "dps": _metric_val(stats.get(dps_key)),
+        "totalEhp": _metric_val(stats.get("TotalEHP")),
+        "physMaxHit": _metric_val(stats.get("PhysicalMaximumHitTaken")),
+        "eleMaxHit": _safe_min_ele_max_hit(stats),
+    }
+
+
+def _parse_stat_for_compare(val: Any) -> float | None:
+    if val is None or isinstance(val, bool):
+        return None
+    if isinstance(val, str) and not val.strip():
+        return None
+    return _parse_numeric_or_none(val)
+
+
+def verify_restored(
+    worker: BridgeWorker,
+    before_code: str,
+    before_digest: dict[str, Any],
+) -> dict[str, Any]:
+    """Check that rolling back to ``before_code`` really reproduced the original build.
+
+    Mirrors pob-mcp's batch_modify rollback check: the restored build must export the
+    same code, or at least recalculate to the same stats. Anything else is reported,
+    because every later command would otherwise run on a silently modified build.
+    """
+    after_code = worker.call("export_code", {}).get("code")
+    if before_code and after_code == before_code:
+        return {"verified": True, "detail": "restored build exports identical code"}
+    after = capture_digest(worker).get("stats") or {}
+    before = (before_digest.get("stats") or {}) if isinstance(before_digest, dict) else {}
+    differing: list[str] = []
+    for k in set(before.keys()) | set(after.keys()):
+        b = _parse_stat_for_compare(before.get(k))
+        a = _parse_stat_for_compare(after.get(k))
+        if b is None and a is None:
+            continue
+        if b is None or a is None:
+            differing.append(k)
+            continue
+        if math.isnan(b) or math.isnan(a):
+            if not (math.isnan(b) and math.isnan(a)):
+                differing.append(k)
+            continue
+        if math.isinf(b) or math.isinf(a):
+            if a != b:
+                differing.append(k)
+            continue
+        if abs(a - b) > 1e-6 * max(1.0, abs(b)):
+            differing.append(k)
+    if differing:
+        differing.sort()
+        return {
+            "verified": False,
+            "detail": f"{len(differing)} stat(s) differ from before the run (e.g. {', '.join(differing[:5])})",
+            "differing": differing,
+        }
+    return {"verified": True, "detail": "export code differs, but every stat recalculates identical"}
+
+
+def _rpc_error_text(res: Any) -> str | None:
+    if not isinstance(res, dict):
+        return None
+    if res.get("ok") is False or res.get("_error"):
+        return str(res.get("error") or res.get("_error") or "RPC failed")
+    return None
+
+
+def attribute_water(
+    worker: BridgeWorker,
+    records: list[dict[str, Any]],
+    dewatered_digest: dict[str, Any],
+    dps_key: str,
+) -> list[dict[str, Any]]:
+    """Measure each stripped item's real PoB contribution, one at a time (pipelined per item).
+
+    Starting from the de-watered state, every record is restored alone, verified by
+    read-back, recalculated by PoB (`get_stats`), and reverted again with read-back
+    verification. Deltas are relative to the de-watered baseline, so they answer
+    "how much does keeping only this item add?". No value is estimated.
+    """
+    if not records:
+        return []
+
+    base = _digest_metrics(dewatered_digest, dps_key)
+
+    # Pre-validate probe kinds and batch unique read RPCs ONCE to capture all `before` states
+    needed_probe_rpcs: list[str] = []
+    rec_probe_rpcs: list[str | None] = []
+    rec_probe_errors: list[str | None] = []
+    for rec in records:
+        probe = rec.get("probe")
+        if not probe:
+            rec_probe_rpcs.append(None)
+            rec_probe_errors.append(None)
+            continue
         try:
-            stripped = dewater_build_in_place(worker)
-            digest_dewatered = capture_digest(worker)
-            dewater_diff = diff_digest(digest_before, digest_dewatered)
-        finally:
-            worker.call("import_code", {"code": snap_code, "mode": "replace"})
+            rpc_name = _probe_rpc_method(probe)
+        except Exception as exc:  # noqa: BLE001
+            rec_probe_rpcs.append(None)
+            rec_probe_errors.append(f"cannot read state before restore: {exc}")
+            continue
+        rec_probe_rpcs.append(rpc_name)
+        rec_probe_errors.append(None)
+        if rpc_name not in needed_probe_rpcs:
+            needed_probe_rpcs.append(rpc_name)
 
+    pre_probe_results: dict[str, dict[str, Any]] = {}
+    pre_probe_batch_err: str | None = None
+    if needed_probe_rpcs:
+        try:
+            raw_pre = _call_batch(
+                worker,
+                [(m, {}) for m in needed_probe_rpcs],
+                raise_on_error=False,
+            )
+            for m, r in zip(needed_probe_rpcs, raw_pre):
+                pre_probe_results[m] = r
+        except Exception as exc:  # noqa: BLE001
+            pre_probe_batch_err = str(exc)
+
+    rows: list[dict[str, Any]] = []
+    broken_after: str | None = None
+
+    for idx, rec in enumerate(records):
+        row: dict[str, Any] = {
+            "dimension": rec["dimension"],
+            "key": rec["key"],
+            "label": rec["label"],
+        }
+        if broken_after is not None:
+            # The de-watered baseline is no longer trustworthy: never measure on it.
+            row["error"] = f"skipped: baseline not restored after {broken_after}"
+            rows.append(row)
+            continue
+
+        probe = rec.get("probe")
+        probe_rpc = rec_probe_rpcs[idx]
+        if rec_probe_errors[idx] is not None:
+            row["error"] = rec_probe_errors[idx]
+            rows.append(row)
+            continue
+
+        before: Any = None
+        if probe and probe_rpc is not None:
+            if pre_probe_batch_err is not None:
+                row["error"] = f"cannot read state before restore: {pre_probe_batch_err}"
+                rows.append(row)
+                continue
+            pre_res = pre_probe_results.get(probe_rpc)
+            pre_err = _rpc_error_text(pre_res)
+            if pre_err is not None:
+                row["error"] = f"cannot read state before restore: {pre_err}"
+                rows.append(row)
+                continue
+            try:
+                before = _extract_probe_state(probe, pre_res or {})
+            except Exception as exc:  # noqa: BLE001
+                row["error"] = f"cannot read state before restore: {exc}"
+                rows.append(row)
+                continue
+            if probe.get("kind") == "config" and _same_state(before, rec.get("original")):
+                # reset_config left the var at its PoB defaultState (no-op); skip phantom 0-delta row.
+                continue
+
+        restore_calls = list(rec.get("restore") or [])
+        revert_calls = list(rec.get("revert") or [])
+
+        batch_calls: list[tuple[str, dict[str, Any]]] = []
+        restore_start = len(batch_calls)
+        batch_calls.extend(restore_calls)
+        restore_end = len(batch_calls)
+
+        probe_after_idx: int | None = None
+        if probe and probe_rpc is not None:
+            probe_after_idx = len(batch_calls)
+            batch_calls.append((probe_rpc, {}))
+
+        stats_idx = len(batch_calls)
+        batch_calls.append(("get_stats", {}))
+
+        revert_start = len(batch_calls)
+        batch_calls.extend(revert_calls)
+        revert_end = len(batch_calls)
+
+        probe_back_idx: int | None = None
+        if probe and probe_rpc is not None:
+            probe_back_idx = len(batch_calls)
+            batch_calls.append((probe_rpc, {}))
+
+        try:
+            batch_res = _call_batch(worker, batch_calls, raise_on_error=False)
+        except Exception as exc:  # noqa: BLE001
+            row["error"] = str(exc)
+            broken_after = rec["key"]
+            rows.append(row)
+            continue
+
+        if len(batch_res) < len(batch_calls):
+            row["error"] = (
+                f"incomplete batch response ({len(batch_res)}/{len(batch_calls)} RPCs)"
+            )
+            broken_after = rec["key"]
+            rows.append(row)
+            continue
+
+        # 1. Verify restore RPCs + post-restore read-back before trusting get_stats
+        restore_err: str | None = None
+        for r_i in range(restore_start, restore_end):
+            err_txt = _rpc_error_text(batch_res[r_i])
+            if err_txt is not None:
+                restore_err = err_txt
+                break
+
+        if restore_err is None and probe and probe_after_idx is not None:
+            p_err = _rpc_error_text(batch_res[probe_after_idx])
+            if p_err is not None:
+                restore_err = p_err
+            else:
+                try:
+                    got = _extract_probe_state(probe, batch_res[probe_after_idx])
+                    if not _same_state(got, rec.get("original")):
+                        restore_err = (
+                            f"restore not applied: expected {rec.get('original')!r}, PoB reads {got!r}"
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    restore_err = str(exc)
+
+        if restore_err is None:
+            stats_res = batch_res[stats_idx]
+            s_err = _rpc_error_text(stats_res)
+            if s_err is not None:
+                restore_err = s_err
+            else:
+                m = _digest_metrics({"stats": stats_res.get("stats", {})}, dps_key)
+                for k in ("dps", "totalEhp", "physMaxHit", "eleMaxHit"):
+                    mv = m[k]
+                    bv = base[k]
+                    row[k] = mv
+                    if (
+                        isinstance(mv, (int, float))
+                        and isinstance(bv, (int, float))
+                        and math.isfinite(mv)
+                        and math.isfinite(bv)
+                    ):
+                        delta = mv - bv
+                        row[f"{k}Delta"] = delta
+                        row[f"{k}Pct"] = (delta / abs(bv) * 100.0) if abs(bv) > 0.0 else None
+                    else:
+                        row[f"{k}Delta"] = None
+                        row[f"{k}Pct"] = None
+        else:
+            row["error"] = restore_err
+
+        # 2. Always verify revert RPCs + post-revert read-back; halt remaining items if baseline is dirty
+        revert_err: str | None = None
+        for r_i in range(revert_start, revert_end):
+            err_txt = _rpc_error_text(batch_res[r_i])
+            if err_txt is not None:
+                revert_err = err_txt
+                break
+
+        if revert_err is None and probe and probe_back_idx is not None:
+            pb_err = _rpc_error_text(batch_res[probe_back_idx])
+            if pb_err is not None:
+                revert_err = pb_err
+            else:
+                try:
+                    back = _extract_probe_state(probe, batch_res[probe_back_idx])
+                    if not _same_state(back, before):
+                        revert_err = f"revert not applied: expected {before!r}, PoB reads {back!r}"
+                except Exception as exc:  # noqa: BLE001
+                    revert_err = str(exc)
+
+        if revert_err is not None:
+            broken_after = rec["key"]
+            prev = row.get("error")
+            row["error"] = f"{prev}; {revert_err}" if prev else revert_err
+
+        rows.append(row)
+
+    return rows
+
+
+def audit_build(
+    worker: BridgeWorker,
+    keep: Iterable[str] | str | None = None,
+    attribution: bool = True,
+) -> dict[str, Any]:
+    """Run static build health checks + non-destructive 4-part PoB inflation ('water') audit.
+
+    ``keep`` lists inflation items the user asserts are real for this build (e.g. an
+    ascendancy that needs ``conditionStationary``); they are left untouched. With
+    ``attribution`` every stripped item is restored alone and re-measured by PoB.
+    """
+    with worker.lock:
+        prev_last_good = getattr(worker, "last_good_code", None)
+        try:
+            export_res, items_res = _call_batch(
+                worker,
+                [("export_code", {}), ("list_items", {})],
+            )
+            snap_code = export_res["code"]
+            digest_before = capture_digest(worker)
+            stats = digest_before["stats"]
+            info = digest_before["buildInfo"]
+
+            # Static health checks
+            health_issues: list[dict[str, str]] = []
+
+            # 1. Elemental & Chaos resistances
+            for elem in ("Fire", "Cold", "Lightning"):
+                val = _finite_float(stats.get(f"{elem}Resist"))
+                over = _finite_float(stats.get(f"{elem}ResistOverCap"))
+                if val < 75:
+                    health_issues.append(
+                        {
+                            "category": "Resistance",
+                            "severity": "HIGH",
+                            "message": f"{elem} Resist is uncapped: {val:.0f}% (gap: {75 - val:.0f}%)",
+                        }
+                    )
+                elif over < 15:
+                    health_issues.append(
+                        {
+                            "category": "Resistance",
+                            "severity": "LOW",
+                            "message": f"{elem} Resist overcap is thin: +{over:.0f}% over cap (vulnerable to curses/exposure)",
+                        }
+                    )
+
+            chaos_res = _finite_float(stats.get("ChaosResist"))
+            if chaos_res < 0:
+                health_issues.append(
+                    {
+                        "category": "Resistance",
+                        "severity": "MEDIUM",
+                        "message": f"Chaos Resist is negative: {chaos_res:.0f}%",
+                    }
+                )
+
+            # 2. Attributes vs Requirements
+            for attr in ("Str", "Dex", "Int"):
+                cur = _finite_float(stats.get(attr))
+                req = _finite_float(stats.get(f"Req{attr}"))
+                if req > cur:
+                    health_issues.append(
+                        {
+                            "category": "Attribute",
+                            "severity": "HIGH",
+                            "message": f"{attr} insufficient: have {cur:.0f}, require {req:.0f}",
+                        }
+                    )
+
+            # 3. Accuracy / Hit Chance
+            hit_chance = stats.get("HitChance")
+            if hit_chance is not None:
+                hc_val = _finite_float(hit_chance, default=100.0)
+                if hc_val < 100.0:
+                    health_issues.append(
+                        {
+                            "category": "Offence",
+                            "severity": "MEDIUM",
+                            "message": f"Hit Chance is {hc_val:.1f}% (< 100%)",
+                        }
+                    )
+
+            # 4. Mana Cost vs Unreserved Mana & Regen
+            mana_cost = _finite_float(stats.get("ManaCost"))
+            mana_unres = _finite_float(stats.get("ManaUnreserved"))
+            raw_mana_regen = (
+                stats.get("ManaRegenRecovery")
+                if stats.get("ManaRegenRecovery") is not None
+                else stats.get("ManaRegen")
+            )
+            mana_regen = _finite_float(raw_mana_regen)
+            mana_leech = _finite_float(stats.get("ManaLeechGainRate"))
+            speed = _finite_float(stats.get("Speed"))
+            life_unres = _finite_float(stats.get("LifeUnreserved"))
+            if mana_cost > 0 and mana_cost > mana_unres and life_unres > 0:
+                health_issues.append(
+                    {
+                        "category": "Sustain",
+                        "severity": "HIGH",
+                        "message": f"Skill Mana Cost ({mana_cost:.0f}) exceeds Unreserved Mana ({mana_unres:.0f})",
+                    }
+                )
+            elif mana_cost > 0 and mana_regen < 0:
+                health_issues.append(
+                    {
+                        "category": "Sustain",
+                        "severity": "MEDIUM",
+                        "message": f"Net Mana Regen is negative ({mana_regen:.1f}/s) with Mana Cost {mana_cost:.0f}",
+                    }
+                )
+            elif (
+                mana_cost > 0
+                and speed > 0
+                and (mana_cost * speed) > (max(0.0, mana_regen) + mana_leech)
+                and life_unres > 0
+            ):
+                spend_rate = mana_cost * speed
+                rec_rate = max(0.0, mana_regen) + mana_leech
+                health_issues.append(
+                    {
+                        "category": "Sustain",
+                        "severity": "LOW",
+                        "message": (
+                            f"Mana spend rate ({spend_rate:.1f}/s = {mana_cost:.0f} * {speed:.2f}/s) "
+                            f"exceeds net Mana recovery + leech ({rec_rate:.1f}/s)"
+                        ),
+                    }
+                )
+
+            # 5. Unallocated points
+            pts = info.get("points", {})
+            used, used_max = int(pts.get("used") or 0), int(pts.get("usedMax") or 0)
+            asc_used, asc_max = int(pts.get("ascUsed") or 0), int(pts.get("ascMax") or 0)
+            if used > used_max:
+                health_issues.append(
+                    {
+                        "category": "Points",
+                        "severity": "HIGH",
+                        "message": f"Over-allocated passive points: {used}/{used_max}",
+                    }
+                )
+            if asc_used < asc_max:
+                health_issues.append(
+                    {
+                        "category": "Points",
+                        "severity": "LOW",
+                        "message": f"Unallocated Ascendancy points: {asc_used}/{asc_max}",
+                    }
+                )
+
+            # 6. Sidebar warnings
+            for w in digest_before["warnings"]:
+                health_issues.append(
+                    {
+                        "category": "EngineWarning",
+                        "severity": "HIGH",
+                        "message": w,
+                    }
+                )
+
+            # 7. Empty primary equipment slots
+            primary_slots = {"Weapon 1", "Body Armour", "Helmet", "Gloves", "Boots", "Amulet", "Ring 1", "Ring 2", "Belt"}
+            for slot in items_res.get("slots", []):
+                if slot.get("name") in primary_slots and not slot.get("inactive") and not slot.get("selItemId"):
+                    health_issues.append(
+                        {
+                            "category": "Equipment",
+                            "severity": "MEDIUM",
+                            "message": f"Equipment slot '{slot['name']}' is empty",
+                        }
+                    )
+
+            # Run non-destructive de-watering snapshot
+            try:
+                stripped, records = dewater_build_with_records(worker, keep=keep)
+                digest_dewatered = capture_digest(worker)
+                dewater_diff = diff_digest(digest_before, digest_dewatered)
+                water_attribution = (
+                    attribute_water(worker, records, digest_dewatered, digest_before["primaryDpsKey"])
+                    if attribution
+                    else []
+                )
+            finally:
+                worker.call("import_code", {"code": snap_code, "mode": "replace"})
+            restore_check = verify_restored(worker, snap_code, digest_before)
+        finally:
+            if hasattr(worker, "last_good_code"):
+                worker.last_good_code = prev_last_good
+
+        dew_stats = digest_dewatered["stats"]
+        orig_ele = _safe_min_ele_max_hit(stats)
+        dew_ele = _safe_min_ele_max_hit(dew_stats)
         return {
             "healthIssues": health_issues,
             "inflationStripped": stripped,
+            "waterAttribution": water_attribution,
+            "restoreCheck": restore_check,
             "original": {
                 "primaryDpsKey": digest_before["primaryDpsKey"],
                 "primaryDps": digest_before["primaryDps"],
-                "fullDps": stats.get("FullDPS"),
-                "combinedDps": stats.get("CombinedDPS"),
-                "totalDps": stats.get("TotalDPS"),
-                "minionCombinedDps": stats.get("MinionCombinedDPS"),
+                "fullDps": _json_safe_stat(stats.get("FullDPS")) if stats.get("FullDPS") is not None else None,
+                "combinedDps": _json_safe_stat(stats.get("CombinedDPS")) if stats.get("CombinedDPS") is not None else None,
+                "totalDps": _json_safe_stat(stats.get("TotalDPS")) if stats.get("TotalDPS") is not None else None,
+                "minionCombinedDps": _json_safe_stat(stats.get("MinionCombinedDPS")) if stats.get("MinionCombinedDPS") is not None else None,
                 "totalEhp": digest_before["totalEhp"],
                 "life": digest_before["life"],
-                "physMaxHit": stats.get("PhysicalMaximumHitTaken"),
-                "eleMaxHit": min(
-                    float(stats.get("FireMaximumHitTaken") or 0),
-                    float(stats.get("ColdMaximumHitTaken") or 0),
-                    float(stats.get("LightningMaximumHitTaken") or 0),
-                ),
-                "chaosMaxHit": stats.get("ChaosMaximumHitTaken"),
+                "physMaxHit": _json_safe_stat(stats.get("PhysicalMaximumHitTaken")) if stats.get("PhysicalMaximumHitTaken") is not None else None,
+                "eleMaxHit": orig_ele if orig_ele is not None else 0.0,
+                "chaosMaxHit": _json_safe_stat(stats.get("ChaosMaximumHitTaken")) if stats.get("ChaosMaximumHitTaken") is not None else None,
             },
             "dewateredPinnacle": {
                 "primaryDpsKey": digest_dewatered["primaryDpsKey"],
                 "primaryDps": digest_dewatered["primaryDps"],
-                "fullDps": digest_dewatered["stats"].get("FullDPS"),
-                "combinedDps": digest_dewatered["stats"].get("CombinedDPS"),
-                "totalDps": digest_dewatered["stats"].get("TotalDPS"),
-                "minionCombinedDps": digest_dewatered["stats"].get("MinionCombinedDPS"),
+                "fullDps": _json_safe_stat(dew_stats.get("FullDPS")) if dew_stats.get("FullDPS") is not None else None,
+                "combinedDps": _json_safe_stat(dew_stats.get("CombinedDPS")) if dew_stats.get("CombinedDPS") is not None else None,
+                "totalDps": _json_safe_stat(dew_stats.get("TotalDPS")) if dew_stats.get("TotalDPS") is not None else None,
+                "minionCombinedDps": _json_safe_stat(dew_stats.get("MinionCombinedDPS")) if dew_stats.get("MinionCombinedDPS") is not None else None,
                 "totalEhp": digest_dewatered["totalEhp"],
                 "life": digest_dewatered["life"],
-                "physMaxHit": digest_dewatered["stats"].get("PhysicalMaximumHitTaken"),
-                "eleMaxHit": min(
-                    float(digest_dewatered["stats"].get("FireMaximumHitTaken") or 0),
-                    float(digest_dewatered["stats"].get("ColdMaximumHitTaken") or 0),
-                    float(digest_dewatered["stats"].get("LightningMaximumHitTaken") or 0),
-                ),
-                "chaosMaxHit": digest_dewatered["stats"].get("ChaosMaximumHitTaken"),
+                "physMaxHit": _json_safe_stat(dew_stats.get("PhysicalMaximumHitTaken")) if dew_stats.get("PhysicalMaximumHitTaken") is not None else None,
+                "eleMaxHit": dew_ele if dew_ele is not None else 0.0,
+                "chaosMaxHit": _json_safe_stat(dew_stats.get("ChaosMaximumHitTaken")) if dew_stats.get("ChaosMaximumHitTaken") is not None else None,
             },
             "dewaterDiff": dewater_diff,
         }
 
 
-def resolve_slot_name(worker: BridgeWorker, slot_query: str) -> str:
+def resolve_slot_name(
+    worker: BridgeWorker,
+    slot_query: str,
+    *,
+    items_res: dict[str, Any] | None = None,
+) -> str:
     """Resolve user slot query (including '#1', '#2' jewel socket shorthand or Flask 1..5) to exact PoB slotName."""
     q = slot_query.strip()
-    items_res = worker.call("list_items", {})
+    if items_res is None:
+        items_res = worker.call("list_items", {})
     slots = items_res.get("slots", [])
 
     # Check '#1', '#2' jewel socket shorthand
@@ -590,6 +1321,7 @@ _KNOWN_CONFIG_DEFAULTS: dict[str, Any] = {
     "pantheonMajorGod": "None",
     "pantheonMinorGod": "None",
     "presetBossSkills": "None",
+    **_POB_TRUTHY_CONFIG_DEFAULTS,
 }
 
 _ALWAYS_SHOW_VISIBLE_CONFIG_VARS = frozenset({
@@ -614,10 +1346,20 @@ def _infer_config_default(item: dict[str, Any]) -> Any:
 
 def inspect_config(
     worker: BridgeWorker,
+    show_all: bool = False,
     *,
     include_defaults: bool = False,
+    search: str | None = None,
+    with_options: bool = False,
 ) -> dict[str, Any]:
-    """Inspect active PoB ConfigTab set, active/non-default config variables, and raw customMods."""
+    """Inspect active PoB ConfigTab set, active/non-default/searched config variables, and raw customMods.
+
+    Omits bulky `options` dropdown arrays unless `with_options=True` or matched by `search`.
+    """
+    effective_all = bool(show_all or include_defaults)
+    search_clean = (search or "").strip()
+    search_low = search_clean.lower()
+
     with worker.lock:
         cfg_res = worker.call("list_config", {})
 
@@ -642,7 +1384,10 @@ def inspect_config(
             visible = bool(item.get("visible", True))
 
             if item.get("type") == "check":
-                is_default = (val in (None, False)) and (default_val is False)
+                if default_val is True:
+                    is_default = val is True
+                else:
+                    is_default = (val in (None, False)) and (default_val is False)
             elif item.get("type") == "list":
                 is_default = (val is None) or (val == default_val)
             else:
@@ -652,30 +1397,49 @@ def inspect_config(
             if is_active:
                 active_count += 1
 
-            if include_defaults or is_active:
-                entry: dict[str, Any] = {
-                    "section": sec_name,
-                    "sectionZh": sec_name_zh,
-                    "var": var,
-                    "label": strip_pob_escapes(item.get("label") or ""),
-                    "labelZh": strip_pob_escapes(item.get("labelZh") or item.get("label") or ""),
-                    "type": item.get("type"),
-                    "value": val,
-                    "defaultValue": default_val,
-                    "placeholder": item.get("placeholder"),
-                    "visible": visible,
-                    "isDefault": is_default,
-                }
-                if item.get("list"):
-                    entry["options"] = [
-                        {
-                            "val": o.get("val"),
-                            "label": strip_pob_escapes(o.get("label") or ""),
-                            "labelZh": strip_pob_escapes(o.get("labelZh") or o.get("label") or ""),
-                        }
-                        for o in item["list"]
-                    ]
-                variables.append(entry)
+            label_clean = strip_pob_escapes(item.get("label") or "")
+            label_zh_clean = strip_pob_escapes(item.get("labelZh") or item.get("label") or "")
+            raw_list = item.get("list") or []
+
+            matched_search = False
+            if search_low:
+                hay_parts = [str(var), label_clean, label_zh_clean, sec_name, sec_name_zh]
+                for o in raw_list:
+                    if isinstance(o, dict):
+                        hay_parts.append(str(o.get("val") or ""))
+                        hay_parts.append(strip_pob_escapes(o.get("label") or ""))
+                        hay_parts.append(strip_pob_escapes(o.get("labelZh") or ""))
+                haystack = " ".join(hay_parts).lower()
+                matched_search = search_low in haystack
+                if not matched_search:
+                    continue
+            elif not (effective_all or is_active):
+                continue
+
+            entry: dict[str, Any] = {
+                "section": sec_name,
+                "sectionZh": sec_name_zh,
+                "var": var,
+                "label": label_clean,
+                "labelZh": label_zh_clean,
+                "type": item.get("type"),
+                "value": val,
+                "defaultValue": default_val,
+                "placeholder": item.get("placeholder"),
+                "visible": visible,
+                "isDefault": is_default,
+            }
+            if raw_list and (with_options or matched_search):
+                entry["options"] = [
+                    {
+                        "val": o.get("val"),
+                        "label": strip_pob_escapes(o.get("label") or ""),
+                        "labelZh": strip_pob_escapes(o.get("labelZh") or o.get("label") or ""),
+                    }
+                    for o in raw_list
+                    if isinstance(o, dict)
+                ]
+            variables.append(entry)
 
     custom_mods = cfg_res.get("customMods", [])
     enabled_texts: list[str] = []
@@ -697,7 +1461,9 @@ def inspect_config(
         "variables": variables,
         "activeCount": active_count,
         "totalCount": total_count,
-        "includeDefaults": include_defaults,
+        "includeDefaults": effective_all,
+        "search": search_clean or None,
+        "withOptions": bool(with_options),
         "customMods": custom_mods,
         "customModsText": "\n".join(enabled_texts),
         "activeCustomModLines": active_custom_lines,
@@ -714,16 +1480,18 @@ def inspect_items(
     include_raw: bool = False,
     all_raw: bool = False,
 ) -> dict[str, Any]:
-    """List equipped items (optionally fetching all raw texts + allocated jewel sockets in one lock pass) or inspect one slot."""
+    """List equipped items (pipelining all `item_raw` RPCs in ONE batch) or inspect one slot."""
     effective_slot = slot_selector if slot_selector is not None else slot_name
     want_raw = bool(raw or include_raw or all_raw)
 
     with worker.lock:
-        items_res = worker.call("list_items", {})
-        items_by_id = {it["id"]: it for it in items_res.get("items", [])}
-
         if effective_slot:
-            resolved_slot = resolve_slot_name(worker, effective_slot)
+            items_res, build_info = _call_batch(
+                worker,
+                [("list_items", {}), ("get_build_info", {})],
+            )
+            items_by_id = {it["id"]: it for it in items_res.get("items", [])}
+            resolved_slot = resolve_slot_name(worker, effective_slot, items_res=items_res)
             slot_obj = next((s for s in items_res.get("slots", []) if s["name"] == resolved_slot), None)
             item_id = slot_obj.get("selItemId") if slot_obj else None
             if not item_id:
@@ -732,23 +1500,46 @@ def inspect_items(
                     "item": None,
                     "tooltip": None,
                     "raw": None,
+                    "buildInfo": build_info,
                 }
-            tip = worker.call("item_tooltip", {"id": item_id, "slotName": resolved_slot, "compare": False})
-            raw_text = worker.call("item_raw", {"id": item_id}).get("raw") if want_raw else None
+            if want_raw:
+                tip, raw_res = _call_batch(
+                    worker,
+                    [
+                        ("item_tooltip", {"id": item_id, "slotName": resolved_slot, "compare": False}),
+                        ("item_raw", {"id": item_id}),
+                    ],
+                )
+                raw_text = raw_res.get("raw") if isinstance(raw_res, dict) else None
+            else:
+                tip = worker.call("item_tooltip", {"id": item_id, "slotName": resolved_slot, "compare": False})
+                raw_text = None
             return {
                 "slot": slot_obj,
                 "item": items_by_id.get(item_id),
                 "tooltip": tip,
                 "raw": raw_text,
+                "buildInfo": build_info,
             }
 
         allocated_nodes: set[int] = set()
         if all_raw:
-            tree_state = worker.call("get_tree_state", {})
+            items_res, tree_state, build_info = _call_batch(
+                worker,
+                [("list_items", {}), ("get_tree_state", {}), ("get_build_info", {})],
+            )
             allocated_nodes = {int(x) for x in tree_state.get("allocatedNodes", [])}
+        else:
+            items_res, build_info = _call_batch(
+                worker,
+                [("list_items", {}), ("get_build_info", {})],
+            )
 
+        items_by_id = {it["id"]: it for it in items_res.get("items", [])}
         equipped_slots: list[dict[str, Any]] = []
-        raw_cache: dict[int, str | None] = {}
+        raw_ids_ordered: list[int] = []
+        raw_ids_seen: set[int] = set()
+
         for s in items_res.get("slots", []):
             item_id = s.get("selItemId")
             node_id = s.get("nodeId")
@@ -781,12 +1572,29 @@ def inspect_items(
                 entry["allocated"] = is_allocated_socket
             if want_raw and item_id:
                 iid = int(item_id)
-                if iid not in raw_cache:
-                    raw_cache[iid] = worker.call("item_raw", {"id": iid}).get("raw")
-                entry["raw"] = raw_cache[iid]
+                if iid not in raw_ids_seen:
+                    raw_ids_seen.add(iid)
+                    raw_ids_ordered.append(iid)
             equipped_slots.append(entry)
 
+        if want_raw and raw_ids_ordered:
+            raw_responses = _call_batch(
+                worker,
+                [("item_raw", {"id": iid}) for iid in raw_ids_ordered],
+                raise_on_error=False,
+            )
+            raw_cache: dict[int, str | None] = {}
+            for iid, res_obj in zip(raw_ids_ordered, raw_responses):
+                if isinstance(res_obj, dict) and not res_obj.get("_error") and res_obj.get("ok") is not False:
+                    raw_cache[iid] = res_obj.get("raw")
+                else:
+                    raw_cache[iid] = None
+            for entry in equipped_slots:
+                if entry.get("itemId"):
+                    entry["raw"] = raw_cache.get(int(entry["itemId"]))
+
         return {
+            "buildInfo": build_info,
             "activeItemSetId": items_res.get("activeItemSetId"),
             "itemSets": items_res.get("itemSets", []),
             "equippedSlots": equipped_slots,
@@ -801,8 +1609,15 @@ def resolve_skill_group_index(skills_res: dict[str, Any], group_selector: str | 
     groups = skills_res.get("groups", [])
     if not groups:
         raise ValueError("Build has no skill groups.")
-    if group_selector is None or str(group_selector).strip().lower() == "main":
-        return int(skills_res.get("mainSocketGroup") or 1)
+    if group_selector is None or str(group_selector).strip().lower() in ("", "main"):
+        raw_main = skills_res.get("mainSocketGroup")
+        try:
+            main_idx = int(raw_main) if raw_main is not None else 1
+        except (TypeError, ValueError):
+            main_idx = 1
+        if any(g.get("index") == main_idx for g in groups):
+            return main_idx
+        return int(groups[0]["index"])
     s = str(group_selector).strip()
     if s.isdigit():
         idx = int(s)
@@ -817,21 +1632,182 @@ def resolve_skill_group_index(skills_res: dict[str, Any], group_selector: str | 
     raise ValueError(f"Could not find skill group matching '{group_selector}'.")
 
 
+JEWEL_RADII_316: list[tuple[str, float]] = [
+    ("Small", 960.0),
+    ("Medium", 1440.0),
+    ("Large", 1800.0),
+    ("Very Large", 2400.0),
+    ("Massive", 2880.0),
+]
+
+JEWEL_RADII_315: list[tuple[str, float]] = [
+    ("Small", 800.0),
+    ("Medium", 1200.0),
+    ("Large", 1500.0),
+]
+
+
+def _jewel_radii_for_version(tree_version: str | None) -> list[tuple[str, float]]:
+    tv = str(tree_version or "").strip()
+    if tv.startswith(("3_15", "3_14", "3_13", "3_12", "3_11", "3_10", "3_9", "3_8")):
+        return JEWEL_RADII_315
+    return JEWEL_RADII_316
+
+
+def _normalize_query_list(search: str | None, queries: Iterable[str] | str | None) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    raw_items: list[str] = []
+    if search is not None and str(search).strip():
+        raw_items.append(str(search).strip())
+    if isinstance(queries, str):
+        if queries.strip():
+            raw_items.append(queries.strip())
+    elif queries is not None:
+        for q in queries:
+            s = str(q or "").strip()
+            if s:
+                raw_items.append(s)
+    for item in raw_items:
+        key = item.lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(item)
+    return out
+
+
+def _normalize_node_types(node_types: Iterable[str] | str | None) -> set[str]:
+    if node_types is None:
+        return set()
+    items = [node_types] if isinstance(node_types, str) else list(node_types)
+    out: set[str] = set()
+    for it in items:
+        for part in str(it or "").split(","):
+            s = part.strip().lower()
+            if not s:
+                continue
+            if s in ("jewel", "jewelsocket", "jewel_socket"):
+                s = "socket"
+            elif s in ("asc", "ascend", "ascendancy"):
+                s = "ascendancy"
+            out.add(s)
+    return out
+
+
+def _matches_node_types(meta: dict[str, Any], allowed_types: set[str]) -> bool:
+    if not allowed_types:
+        return True
+    ntype = str(meta.get("type") or "Normal").lower()
+    is_asc = bool(meta.get("asc"))
+    if "ascendancy" in allowed_types and is_asc:
+        return True
+    if ntype in allowed_types:
+        return True
+    if "mastery" in allowed_types and meta.get("overrideWhy") == "mastery":
+        return True
+    return False
+
+
+def _resolve_socket_radius_spec(
+    socket_radius: str | int,
+    radii: list[tuple[str, float]],
+    socket_index_by_node: dict[int, int],
+    items_res: dict[str, Any],
+    tree_state: dict[str, Any],
+    nodes_db: dict[str, Any],
+) -> tuple[int, float, str]:
+    """Resolve `socket_radius` ('#1', '26725', '#1:Large', 'Jewel 26725') to `(socket_node_id, max_radius, label)`."""
+    raw = str(socket_radius).strip()
+    if not raw:
+        raise ValueError("socket_radius cannot be empty.")
+
+    sock_part = raw
+    max_radius_label = radii[-1][0]
+    max_radius = radii[-1][1]
+
+    if ":" in raw:
+        left, right = raw.rsplit(":", 1)
+        r_query = right.strip().lower().replace("_", " ").replace("-", " ")
+        matched_r = None
+        for lbl, val in radii:
+            if lbl.lower() == r_query:
+                matched_r = (lbl, val)
+                break
+        if matched_r is not None:
+            sock_part = left.strip()
+            max_radius_label, max_radius = matched_r
+        else:
+            try:
+                num_r = float(right.strip())
+                if num_r > 0:
+                    sock_part = left.strip()
+                    max_radius = num_r
+                    max_radius_label = f"Custom({num_r:g})"
+            except ValueError:
+                pass
+
+    # 1. '#N' jewel socket index
+    m_hash = re.match(r"^#(\d+)$", sock_part)
+    if m_hash:
+        target_idx = int(m_hash.group(1))
+        for nid, s_idx in socket_index_by_node.items():
+            if s_idx == target_idx:
+                return nid, max_radius, max_radius_label
+        raise ValueError(f"Jewel socket #{target_idx} not found in build slots.")
+
+    # 2. Numeric: exact nodeId in nodes_db, else socketIndex
+    if sock_part.isdigit():
+        num = int(sock_part)
+        if str(num) in nodes_db:
+            return num, max_radius, max_radius_label
+        for nid, s_idx in socket_index_by_node.items():
+            if s_idx == num:
+                return nid, max_radius, max_radius_label
+        raise ValueError(f"Jewel socket '{sock_part}' not found by node ID or socket index.")
+
+    # 3. Match against slot name/label or socket node name
+    q_low = sock_part.lower()
+    for slot in items_res.get("slots", []):
+        if slot.get("nodeId") is not None:
+            cand_text = " ".join(
+                str(slot.get(k) or "") for k in ("name", "label", "labelZh")
+            ).lower()
+            if q_low == str(slot.get("name") or "").lower() or q_low in cand_text:
+                return int(slot["nodeId"]), max_radius, max_radius_label
+
+    for sock in tree_state.get("sockets", []):
+        nid = int(sock["nodeId"])
+        meta = nodes_db.get(str(nid)) or {}
+        if q_low in str(meta.get("name") or "").lower() or q_low in str(meta.get("nameZh") or "").lower():
+            return nid, max_radius, max_radius_label
+
+    raise ValueError(f"Jewel socket '{socket_radius}' not found.")
+
+
 def inspect_skills(
     worker: BridgeWorker,
     *,
     group_selector: str | None = None,
 ) -> dict[str, Any]:
-    """List all skill groups or inspect a specific group with per-gem DPS tooltips."""
+    """List all skill groups or inspect a specific group with pipelined per-gem DPS tooltips."""
     with worker.lock:
         skills_res = worker.call("list_skills", {})
         if group_selector is not None:
             idx = resolve_skill_group_index(skills_res, group_selector)
-            group = next(g for g in skills_res.get("groups", []) if g["index"] == idx)
+            group = next((g for g in skills_res.get("groups", []) if g.get("index") == idx), None)
+            if group is None:
+                raise ValueError(f"Skill group #{idx} not found.")
+            gems = group.get("gems", [])
+            tip_calls = [("gem_tooltip", {"group": idx, "index": gem["index"]}) for gem in gems]
+            tips = _call_batch(worker, tip_calls, raise_on_error=False) if tip_calls else []
             gems_with_tips = []
-            for gem in group.get("gems", []):
-                tip = worker.call("gem_tooltip", {"group": idx, "index": gem["index"]})
-                gems_with_tips.append({**gem, "tooltipDps": tip.get("dps")})
+            for gem, tip in zip(gems, tips):
+                dps_val = (
+                    tip.get("dps")
+                    if isinstance(tip, dict) and not tip.get("_error") and tip.get("ok") is not False
+                    else None
+                )
+                gems_with_tips.append({**gem, "tooltipDps": dps_val})
             return {
                 "group": {**group, "gems": gems_with_tips},
                 "mainSocketGroup": skills_res.get("mainSocketGroup"),
@@ -841,14 +1817,37 @@ def inspect_skills(
 
 def inspect_tree(
     worker: BridgeWorker,
-    *,
     search: str | None = None,
+    *,
+    queries: Iterable[str] | str | None = None,
+    node_types: Iterable[str] | str | None = None,
+    allocated: bool | None = None,
+    max_cost: int | None = None,
+    show_path: bool = False,
+    masteries: bool = False,
+    socket_radius: str | int | None = None,
 ) -> dict[str, Any]:
-    """Summarize allocated Keystones, Notables, Masteries, Ascendancy nodes, Jewels, or search tree nodes."""
+    """Summarize allocated passive tree nodes or search/filter nodes with pipelined `node_hover` RPCs."""
+    query_list = _normalize_query_list(search, queries)
+    allowed_types = _normalize_node_types(node_types)
+    if masteries and not query_list and not allowed_types and socket_radius is None:
+        allowed_types = {"mastery"}
+
+    is_filtered_mode = bool(
+        query_list
+        or allowed_types
+        or allocated is not None
+        or max_cost is not None
+        or masteries
+        or socket_radius is not None
+    )
+
     with worker.lock:
-        tree_state = worker.call("get_tree_state", {})
-        specs_res = worker.call("list_specs", {})
-        items_res = worker.call("list_items", {})
+        # Pipeline get_tree_state + list_items in ONE batch (dropping unused list_specs!)
+        tree_state, items_res = _call_batch(
+            worker,
+            [("get_tree_state", {}), ("list_items", {})],
+        )
         tree_version = tree_state.get("treeVersion")
         nodes_db = worker.get_cached_tree_data(tree_version).get("nodes", {})
 
@@ -884,42 +1883,213 @@ def inspect_tree(
             base["allocated"] = nid in allocated_set
             if nid in socket_index_by_node:
                 base["socketIndex"] = socket_index_by_node[nid]
+            # Preserve full untruncated masteryEffects for Mastery nodes
+            raw_base = nodes_db.get(sid) or {}
+            if raw_base.get("masteryEffects") and not base.get("masteryEffects"):
+                base["masteryEffects"] = raw_base["masteryEffects"]
             return base
 
-        if search:
-            q = search.strip()
-            # Check '#1', '#2' jewel socket shorthand
-            m_sock = re.match(r"^#(\d+)$", q)
+        if is_filtered_mode:
+            type_rank = {"Keystone": 0, "Notable": 1, "Mastery": 2, "Socket": 3, "Normal": 4}
+            socket_radius_info: dict[str, Any] | None = None
             matches: list[dict[str, Any]] = []
-            if m_sock:
-                target_idx = int(m_sock.group(1))
-                for nid, s_idx in socket_index_by_node.items():
-                    if s_idx == target_idx:
-                        meta = _get_node_meta(nid)
-                        hover = worker.call("node_hover", {"id": nid})
-                        meta["cost"] = hover.get("cost")
-                        meta["path"] = hover.get("path")
-                        matches.append(meta)
-            else:
-                q_lower = q.lower()
+            force_path_ids: set[int] = set()
+
+            if socket_radius is not None:
+                radii = _jewel_radii_for_version(tree_version)
+                sock_nid, max_r, max_r_label = _resolve_socket_radius_spec(
+                    socket_radius, radii, socket_index_by_node, items_res, tree_state, nodes_db
+                )
+                sock_node = _get_node_meta(sock_nid)
+                sx, sy = sock_node.get("x"), sock_node.get("y")
+                if not isinstance(sx, (int, float)) or not isinstance(sy, (int, float)):
+                    raise ValueError(f"Jewel socket node {sock_nid} has no tree coordinates.")
+
+                counts_by_radius: dict[str, int] = {lbl: 0 for lbl, _ in radii}
                 all_node_ids = set(nodes_db.keys()) | set(dynamic_map.keys())
                 for sid in all_node_ids:
                     nid = int(sid)
+                    if nid == sock_nid:
+                        continue
                     meta = _get_node_meta(nid)
-                    haystack = " ".join(
-                        [
+                    if meta.get("asc") or meta.get("proxy") or meta.get("expansion"):
+                        continue
+                    if meta.get("type") in ("ClassStart", "AscendClassStart"):
+                        continue
+                    nx, ny = meta.get("x"), meta.get("y")
+                    if not isinstance(nx, (int, float)) or not isinstance(ny, (int, float)):
+                        continue
+                    dist = math.hypot(float(nx) - float(sx), float(ny) - float(sy))
+                    if dist > max_r:
+                        continue
+                    tier_label = max_r_label
+                    for lbl, r_outer in radii:
+                        if dist <= r_outer:
+                            tier_label = lbl
+                            break
+                    for lbl, r_outer in radii:
+                        if dist <= r_outer:
+                            counts_by_radius[lbl] += 1
+                    meta["distance"] = round(dist, 1)
+                    meta["radiusTier"] = tier_label
+                    matches.append(meta)
+
+                socket_radius_info = {
+                    "id": sock_nid,
+                    "nodeId": sock_nid,
+                    "socketNodeId": sock_nid,
+                    "name": sock_node.get("name"),
+                    "nameZh": sock_node.get("nameZh"),
+                    "query": str(socket_radius),
+                    "socketIndex": socket_index_by_node.get(sock_nid),
+                    "x": sx,
+                    "y": sy,
+                    "maxRadius": max_r,
+                    "maxRadiusLabel": max_r_label,
+                    "radiusThresholds": {lbl: r for lbl, r in radii},
+                    "countsByRadius": counts_by_radius,
+                    "radii": {lbl: [] for lbl, _ in radii},
+                }
+            else:
+                all_node_ids = set(nodes_db.keys()) | set(dynamic_map.keys())
+                matches = [_get_node_meta(int(sid)) for sid in all_node_ids]
+
+            # Apply multi-query matching (OR semantics across queries)
+            if query_list:
+                socket_queries: dict[int, str] = {}
+                text_queries: list[tuple[str, str]] = []
+                for q in query_list:
+                    m_sock = re.match(r"^#(\d+)$", q)
+                    if m_sock:
+                        socket_queries[int(m_sock.group(1))] = q
+                    else:
+                        text_queries.append((q, q.lower()))
+
+                filtered_by_query: list[dict[str, Any]] = []
+                for meta in matches:
+                    hit_queries: list[str] = []
+                    s_idx = meta.get("socketIndex")
+                    if s_idx is not None and int(s_idx) in socket_queries:
+                        hit_queries.append(socket_queries[int(s_idx)])
+                        force_path_ids.add(int(meta["id"]))
+
+                    if text_queries:
+                        hay_parts = [
                             str(meta.get("id") or ""),
                             str(meta.get("name") or ""),
                             str(meta.get("nameZh") or ""),
                             " ".join(str(s) for s in (meta.get("stats") or [])),
                             " ".join(str(s) for s in (meta.get("statsZh") or [])),
                         ]
-                    ).lower()
-                    if q_lower in haystack:
-                        matches.append(meta)
+                        for eff in meta.get("masteryEffects") or []:
+                            if isinstance(eff, dict):
+                                hay_parts.append(str(eff.get("effect") or ""))
+                                hay_parts.append(" ".join(str(s) for s in (eff.get("stats") or [])))
+                                hay_parts.append(" ".join(str(s) for s in (eff.get("statsZh") or [])))
+                        haystack = " ".join(hay_parts).lower()
+                        for orig_q, low_q in text_queries:
+                            if low_q in haystack:
+                                hit_queries.append(orig_q)
 
-                # Sort allocated first, then Keystone/Notable/Mastery/Socket before Normal
-                type_rank = {"Keystone": 0, "Notable": 1, "Mastery": 2, "Socket": 3, "Normal": 4}
+                    if hit_queries:
+                        if len(query_list) > 1:
+                            meta["matchedQueries"] = hit_queries
+                        filtered_by_query.append(meta)
+                matches = filtered_by_query
+
+            # Apply node_types and allocated filters
+            if allowed_types:
+                matches = [m for m in matches if _matches_node_types(m, allowed_types)]
+            if allocated is not None:
+                want_alloc = bool(allocated)
+                matches = [m for m in matches if bool(m.get("allocated")) is want_alloc]
+
+            # Sort: socket_radius sorts by distance first; max_cost pre-sorts by tree proximity
+            # (BFS hop distance over adjacency, falling back to Euclidean distance) BEFORE hover slicing.
+            bfs_dist: dict[int, int] = {}
+            if socket_radius is not None:
+                matches.sort(
+                    key=lambda m: (
+                        float(m.get("distance", 1e9)),
+                        type_rank.get(m.get("type", "Normal"), 5),
+                        m.get("id", 0),
+                    )
+                )
+            elif max_cost is not None:
+                adj: dict[int, set[int]] = {}
+                group_notables: dict[Any, list[int]] = {}
+                mastery_groups: list[tuple[int, Any]] = []
+                for src_map in (nodes_db, dynamic_map):
+                    for sid, raw_node in src_map.items():
+                        if not isinstance(raw_node, dict):
+                            continue
+                        try:
+                            uid = int(raw_node.get("id", sid))
+                        except (TypeError, ValueError):
+                            continue
+                        for edge_key in ("linked", "links", "out", "in"):
+                            edges = raw_node.get(edge_key)
+                            if not isinstance(edges, (list, tuple)):
+                                continue
+                            for raw_nb in edges:
+                                try:
+                                    vid = int(raw_nb)
+                                except (TypeError, ValueError):
+                                    continue
+                                if vid == uid:
+                                    continue
+                                adj.setdefault(uid, set()).add(vid)
+                                adj.setdefault(vid, set()).add(uid)
+                        grp_id = raw_node.get("group")
+                        if grp_id is not None:
+                            ntype = raw_node.get("type")
+                            if ntype == "Notable":
+                                group_notables.setdefault(grp_id, []).append(uid)
+                            elif ntype == "Mastery":
+                                mastery_groups.append((uid, grp_id))
+                for mid, grp_id in mastery_groups:
+                    if not adj.get(mid):
+                        for nid in group_notables.get(grp_id, ()):
+                            adj.setdefault(mid, set()).add(nid)
+                            adj.setdefault(nid, set()).add(mid)
+
+                if allocated_set and adj:
+                    bfs_dist = {nid: 0 for nid in allocated_set}
+                    queue = deque(allocated_set)
+                    while queue:
+                        cur = queue.popleft()
+                        next_d = bfs_dist[cur] + 1
+                        for nb in adj.get(cur, ()):
+                            if nb not in bfs_dist:
+                                bfs_dist[nb] = next_d
+                                queue.append(nb)
+
+                alloc_coords: list[tuple[float, float]] = []
+                for aid in allocated_set:
+                    ameta = dynamic_map.get(str(aid)) or nodes_db.get(str(aid)) or {}
+                    ax, ay = ameta.get("x"), ameta.get("y")
+                    if isinstance(ax, (int, float)) and isinstance(ay, (int, float)):
+                        alloc_coords.append((float(ax), float(ay)))
+
+                def _min_euclid_sq(meta: dict[str, Any]) -> float:
+                    nx, ny = meta.get("x"), meta.get("y")
+                    if not alloc_coords or not isinstance(nx, (int, float)) or not isinstance(ny, (int, float)):
+                        return float("inf")
+                    fx, fy = float(nx), float(ny)
+                    return min((fx - ax) * (fx - ax) + (fy - ay) * (fy - ay) for ax, ay in alloc_coords)
+
+                def _proximity_sort_key(m: dict[str, Any]) -> tuple[int, int, float, int, int]:
+                    nid = int(m["id"])
+                    trank = type_rank.get(m.get("type", "Normal"), 5)
+                    if m.get("allocated"):
+                        return (0, 0, 0.0, trank, nid)
+                    hop = bfs_dist.get(nid)
+                    if hop is not None:
+                        return (1, hop, 0.0, trank, nid)
+                    return (2, 999999, _min_euclid_sq(m), trank, nid)
+
+                matches.sort(key=_proximity_sort_key)
+            else:
                 matches.sort(
                     key=lambda m: (
                         0 if m.get("allocated") else 1,
@@ -927,23 +2097,73 @@ def inspect_tree(
                         m.get("id", 0),
                     )
                 )
-                # Enrich top 25 matches with path cost
-                for m in matches[:25]:
-                    try:
-                        hover = worker.call("node_hover", {"id": m["id"]})
-                        m["cost"] = hover.get("cost")
-                    except Exception:
-                        pass
 
-            return {
-                "search": search,
+            # Pipeline node_hover RPCs in ONE batch!
+            if max_cost is not None:
+                cost_cap = int(max_cost)
+                within_hop = sum(
+                    1
+                    for m in matches
+                    if m.get("allocated") or bfs_dist.get(int(m["id"]), 999999) <= cost_cap
+                )
+                hover_limit = min(max(60, within_hop), 250)
+            else:
+                hover_limit = 50 if (masteries or socket_radius is not None) else 25
+            hover_targets = matches[:hover_limit]
+            if hover_targets:
+                hover_calls = [("node_hover", {"id": m["id"]}) for m in hover_targets]
+                hover_results = _call_batch(worker, hover_calls, raise_on_error=False)
+                for m, hover in zip(hover_targets, hover_results):
+                    if isinstance(hover, dict) and not hover.get("_error") and hover.get("ok") is not False:
+                        m["cost"] = hover.get("cost")
+                        if show_path or int(m["id"]) in force_path_ids:
+                            m["path"] = hover.get("path")
+                            if m.get("allocated") and hover.get("depends") is not None:
+                                m["depends"] = hover.get("depends")
+
+            if max_cost is not None:
+                cost_cap = int(max_cost)
+                matches = [
+                    m
+                    for m in matches
+                    if m.get("cost") is not None and int(m["cost"]) <= cost_cap
+                ]
+                if socket_radius is None:
+                    matches.sort(
+                        key=lambda m: (
+                            0 if m.get("allocated") else 1,
+                            int(m["cost"]),
+                            type_rank.get(m.get("type", "Normal"), 5),
+                            m.get("id", 0),
+                        )
+                    )
+
+            result_limit = 100 if (masteries or socket_radius is not None) else 50
+            out: dict[str, Any] = {
+                "search": search if search is not None else (", ".join(query_list) if query_list else None),
+                "queries": query_list,
+                "masteries": bool(masteries),
+                "showPath": bool(show_path),
                 "totalMatches": len(matches),
-                "matches": matches[:50],
+                "matches": matches[:result_limit],
             }
+            if socket_radius_info is not None:
+                radii_groups: dict[str, list[dict[str, Any]]] = {
+                    lbl: [] for lbl in socket_radius_info["radii"].keys()
+                }
+                for m in matches[:result_limit]:
+                    tier = m.get("radiusTier")
+                    if tier in radii_groups:
+                        radii_groups[tier].append(m)
+                    elif tier:
+                        radii_groups.setdefault(str(tier), []).append(m)
+                socket_radius_info["radii"] = radii_groups
+                out["socketRadius"] = socket_radius_info
+            return out
 
         keystones: list[dict[str, Any]] = []
         notables: list[dict[str, Any]] = []
-        masteries: list[dict[str, Any]] = []
+        masteries_list: list[dict[str, Any]] = []
         ascendancy_nodes: list[dict[str, Any]] = []
 
         for nid in sorted(allocated_ids):
@@ -957,7 +2177,7 @@ def inspect_tree(
             elif ntype == "Notable":
                 notables.append(meta)
             elif ntype == "Mastery" or meta.get("overrideWhy") == "mastery":
-                masteries.append(meta)
+                masteries_list.append(meta)
 
         jewel_sockets = []
         for sock in tree_state.get("sockets", []):
@@ -975,15 +2195,38 @@ def inspect_tree(
             "className": tree_state.get("className"),
             "ascendClassName": tree_state.get("ascendClassName"),
             "points": tree_state.get("points"),
-            "activeSpec": specs_res.get("activeSpec"),
-            "specs": specs_res.get("specs", []),
             "allocatedCount": len(allocated_ids),
             "keystones": keystones,
             "ascendancyNodes": ascendancy_nodes,
-            "masteries": masteries,
+            "masteries": masteries_list,
             "notables": notables,
             "jewelSockets": jewel_sockets,
         }
+
+
+_CALC_CELL_NUM_RE = re.compile(
+    r"^\s*[xX×]?\s*([+-]?\d{1,3}(?:,\d{3})*(?:\.\d+)?|[+-]?\d+(?:\.\d+)?)\s*(?:%|/s|s|sec|ms|x|X|×|m|pts?|秒|次/秒|米)?\s*$"
+)
+
+
+def _parse_calc_cell_value(raw_text: str, disp_text: str) -> float | None:
+    """Parse a clean numeric value from English `raw` (preferred) or localized `text`, returning finite float or None."""
+    for candidate in (raw_text, disp_text):
+        s = (candidate or "").strip()
+        if not s:
+            continue
+        s_low = s.lower()
+        if s_low in ("inf", "+inf", "infinity", "-inf", "-infinity", "nan"):
+            return None
+        m = _CALC_CELL_NUM_RE.match(s)
+        if m:
+            try:
+                val = float(m.group(1).replace(",", ""))
+                if math.isfinite(val):
+                    return val
+            except ValueError:
+                continue
+    return None
 
 
 _CAMEL_SPLIT_RE = re.compile(r"([a-z0-9])([A-Z])")
@@ -1114,37 +2357,49 @@ def _score_calc_row(
 
 def search_calcs_breakdown(
     worker: BridgeWorker,
-    keyword: str,
+    keyword: str | None = None,
     *,
+    keywords: Iterable[str] | str | None = None,
     limit: int = 20,
     max_breakdowns: int = 8,
+    no_breakdown: bool = False,
 ) -> dict[str, Any]:
-    """Bilingual (EN + ZH) search across `get_calcs` rows and fetch `calcs_breakdown` for top matches."""
-    q_norm = _norm_calc_text(keyword)
-    q_compact = q_norm.replace(" ", "")
-    q_tokens = [t for t in q_norm.split(" ") if t]
+    """Bilingual (EN + ZH) search across `get_calcs` rows with variadic keywords and pipelined `calcs_breakdown`."""
+    kw_list = _normalize_query_list(keyword, keywords)
+    if not kw_list:
+        kw_list = [""]
 
     with worker.lock:
         # Ensure we have both English and Chinese labels regardless of current set_translate state.
-        # When translate=True, bridge.lua's get_calcs returns BOTH English (label / cell.raw) and Chinese (labelZh / cell.text).
-        # If translate was False, briefly toggle it on inside try...finally so ZH labels are also indexed.
+        # Avoid redundant version{} RPC by checking tracked `worker.translate_enabled` / `hello_info` first.
         orig_translate: bool | None = None
         toggled_translate = False
         if worker.caps.get("translateToggle", False):
-            try:
-                ver = worker.call("version", {})
-                orig_translate = ver.get("translate")
-                if orig_translate is False:
+            tracked = getattr(worker, "translate_enabled", None)
+            if tracked is None:
+                info_dict = getattr(worker, "hello_info", None) or getattr(worker, "info", None) or {}
+                if isinstance(info_dict, dict) and "translate" in info_dict:
+                    tracked = info_dict.get("translate")
+            if tracked is None:
+                try:
+                    ver = worker.call("version", {})
+                    tracked = ver.get("translate")
+                except Exception:
+                    tracked = None
+            if tracked is False:
+                orig_translate = False
+                try:
                     worker.call("set_translate", {"enabled": True})
                     toggled_translate = True
-            except Exception:
-                toggled_translate = False
+                except Exception:
+                    toggled_translate = False
 
         try:
             calcs = worker.call("get_calcs", {})
-            scored_rows: list[tuple[float, int, dict[str, Any]]] = []
-            seq = 0
 
+            # Pre-extract normalized rows once so multi-keyword queries share ONE get_calcs scan
+            indexed_rows: list[dict[str, Any]] = []
+            seq = 0
             for sec in calcs.get("sections", []):
                 si = sec.get("si")
                 sec_id = str(sec.get("id") or "")
@@ -1187,77 +2442,148 @@ def search_calcs_breakdown(
                             + " "
                             + _compact_calc_text(f"{sub_zh} {r_zh}")
                         )
-
-                        score = _score_calc_row(
-                            q_norm,
-                            q_compact,
-                            q_tokens,
-                            sec_norm,
-                            sub_norm,
-                            row_norm,
-                            cells_norm,
-                            sub_row_compact,
+                        indexed_rows.append(
+                            {
+                                "seq": seq,
+                                "si": si,
+                                "ui": ui,
+                                "ri": ri,
+                                "sec_id": sec_id,
+                                "sec_group": sec_group,
+                                "sec_norm": sec_norm,
+                                "sub_en": sub_en,
+                                "sub_zh": sub_zh or sub_en,
+                                "sub_norm": sub_norm,
+                                "row_en": r_en,
+                                "row_zh": r_zh,
+                                "row_norm": row_norm,
+                                "cells_norm": cells_norm,
+                                "sub_row_compact": sub_row_compact,
+                                "cells": row.get("cells", []),
+                            }
                         )
-                        if score > 0:
-                            scored_rows.append(
-                                (
-                                    score,
-                                    seq,
-                                    {
-                                        "si": si,
-                                        "ui": ui,
-                                        "ri": ri,
-                                        "sec_id": sec_id,
-                                        "sec_group": sec_group,
-                                        "sub_en": sub_en,
-                                        "sub_zh": sub_zh or sub_en,
-                                        "row_en": r_en,
-                                        "row_zh": r_zh,
-                                        "cells": row.get("cells", []),
-                                    },
-                                )
-                            )
-                            seq += 1
+                        seq += 1
 
-            # Sort highest match score first, preserving original Calcs order for ties
-            scored_rows.sort(key=lambda item: (-item[0], item[1]))
+            # Collect unique breakdown coordinates across all keywords and execute ONE batch
+            per_kw_scored: list[tuple[str, list[tuple[float, int, dict[str, Any]]]]] = []
+            bd_coord_order: list[tuple[Any, Any, Any, Any]] = []
+            bd_coord_seen: set[tuple[Any, Any, Any, Any]] = set()
 
-            matches: list[dict[str, Any]] = []
-            breakdowns_fetched = 0
-            for score, _, item in scored_rows[:limit]:
-                cells_out: list[dict[str, Any]] = []
-                for cell in item["cells"]:
-                    ci = cell.get("ci")
-                    c_entry: dict[str, Any] = {
-                        "ci": ci,
-                        "text": strip_pob_escapes(cell.get("text") or cell.get("raw") or ""),
-                        "hasBreakdown": bool(cell.get("hasBreakdown")),
-                    }
-                    if cell.get("hasBreakdown") and breakdowns_fetched < max_breakdowns:
-                        try:
-                            bd = worker.call(
-                                "calcs_breakdown",
-                                {"si": item["si"], "ui": item["ui"], "ri": item["ri"], "ci": ci},
-                            )
-                            c_entry["breakdown"] = bd.get("sections", [])
-                            breakdowns_fetched += 1
-                        except Exception:
-                            pass
-                    cells_out.append(c_entry)
+            for kw in kw_list:
+                q_norm = _norm_calc_text(kw)
+                q_compact = q_norm.replace(" ", "")
+                q_tokens = [t for t in q_norm.split(" ") if t]
+                scored: list[tuple[float, int, dict[str, Any]]] = []
+                for item in indexed_rows:
+                    score = _score_calc_row(
+                        q_norm,
+                        q_compact,
+                        q_tokens,
+                        item["sec_norm"],
+                        item["sub_norm"],
+                        item["row_norm"],
+                        item["cells_norm"],
+                        item["sub_row_compact"],
+                    )
+                    if score > 0:
+                        scored.append((score, item["seq"], item))
+                scored.sort(key=lambda pair: (-pair[0], pair[1]))
+                per_kw_scored.append((kw, scored))
 
-                matches.append(
+                if not no_breakdown and max_breakdowns > 0:
+                    kw_bd_count = 0
+                    for _, _, item in scored[:limit]:
+                        for cell in item["cells"]:
+                            if cell.get("hasBreakdown") and kw_bd_count < max_breakdowns:
+                                coord = (item["si"], item["ui"], item["ri"], cell.get("ci"))
+                                if coord not in bd_coord_seen:
+                                    bd_coord_seen.add(coord)
+                                    bd_coord_order.append(coord)
+                                kw_bd_count += 1
+
+            bd_map: dict[tuple[Any, Any, Any, Any], list[Any]] = {}
+            if not no_breakdown and bd_coord_order:
+                bd_calls = [
+                    ("calcs_breakdown", {"si": si, "ui": ui, "ri": ri, "ci": ci})
+                    for (si, ui, ri, ci) in bd_coord_order
+                ]
+                bd_responses = _call_batch(worker, bd_calls, raise_on_error=False)
+                for coord, bd in zip(bd_coord_order, bd_responses):
+                    if isinstance(bd, dict) and not bd.get("_error") and bd.get("ok") is not False and "sections" in bd:
+                        bd_map[coord] = bd.get("sections", [])
+
+            def _build_matches(scored: list[tuple[float, int, dict[str, Any]]]) -> list[dict[str, Any]]:
+                out_matches: list[dict[str, Any]] = []
+                kw_bd_count = 0
+                for score, _, item in scored[:limit]:
+                    cells_out: list[dict[str, Any]] = []
+                    for cell in item["cells"]:
+                        ci = cell.get("ci")
+                        raw_clean = strip_pob_escapes(cell.get("raw") or cell.get("text") or "")
+                        text_clean = strip_pob_escapes(cell.get("text") or cell.get("raw") or "")
+                        c_entry: dict[str, Any] = {
+                            "ci": ci,
+                            "text": text_clean,
+                            "raw": raw_clean,
+                            "value": _parse_calc_cell_value(raw_clean, text_clean),
+                            "hasBreakdown": bool(cell.get("hasBreakdown")),
+                        }
+                        if not no_breakdown and cell.get("hasBreakdown") and kw_bd_count < max_breakdowns:
+                            coord = (item["si"], item["ui"], item["ri"], ci)
+                            if coord in bd_map:
+                                c_entry["breakdown"] = bd_map[coord]
+                            kw_bd_count += 1
+                        cells_out.append(c_entry)
+
+                    out_matches.append(
+                        {
+                            "sectionId": item["sec_id"],
+                            "sectionGroup": item["sec_group"],
+                            "subsection": item["sub_zh"],
+                            "subsectionEn": item["sub_en"],
+                            "rowLabel": item["row_en"],
+                            "rowLabelZh": item["row_zh"],
+                            "score": score,
+                            "coords": {"si": item["si"], "ui": item["ui"], "ri": item["ri"]},
+                            "cells": cells_out,
+                        }
+                    )
+                return out_matches
+
+            if len(per_kw_scored) == 1:
+                kw, scored = per_kw_scored[0]
+                return {
+                    "keyword": kw,
+                    "totalMatches": len(scored),
+                    "matches": _build_matches(scored),
+                }
+
+            per_kw_results: list[dict[str, Any]] = []
+            combined_matches: list[dict[str, Any]] = []
+            seen_coords: set[tuple[Any, Any, Any]] = set()
+            for kw, scored in per_kw_scored:
+                kw_matches = _build_matches(scored)
+                per_kw_results.append(
                     {
-                        "sectionId": item["sec_id"],
-                        "sectionGroup": item["sec_group"],
-                        "subsection": item["sub_zh"],
-                        "subsectionEn": item["sub_en"],
-                        "rowLabel": item["row_en"],
-                        "rowLabelZh": item["row_zh"],
-                        "score": score,
-                        "coords": {"si": item["si"], "ui": item["ui"], "ri": item["ri"]},
-                        "cells": cells_out,
+                        "keyword": kw,
+                        "totalMatches": len(scored),
+                        "matches": kw_matches,
                     }
                 )
+                for m in kw_matches:
+                    c = m["coords"]
+                    key = (c["si"], c["ui"], c["ri"])
+                    if key not in seen_coords:
+                        seen_coords.add(key)
+                        combined_matches.append({**m, "matchedKeyword": kw})
+
+            return {
+                "keyword": kw_list[0],
+                "keywords": kw_list,
+                "results": per_kw_results,
+                "totalMatches": sum(r["totalMatches"] for r in per_kw_results),
+                "matches": combined_matches,
+            }
         finally:
             if toggled_translate and orig_translate is not None:
                 try:
@@ -1265,8 +2591,5 @@ def search_calcs_breakdown(
                 except Exception:
                     pass
 
-        return {
-            "keyword": keyword,
-            "totalMatches": len(scored_rows),
-            "matches": matches,
-        }
+
+inspect_calcs = search_calcs_breakdown

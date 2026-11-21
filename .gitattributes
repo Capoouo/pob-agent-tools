@@ -1,0 +1,2 @@
+*.sh text eol=lf
+pob_cli/src/pob_cli/lua/*.lua text eol=lf
