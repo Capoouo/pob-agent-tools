@@ -22,6 +22,7 @@ pob summary [--target <slug>] [--json]                                          
 pob audit [--keep <spec>]... [--no-attribution] [--target <slug>] [--json]             # Hard gaps + 4-dim water audit -> Pinnacle (per-item PoB attribution; --keep var|Flask N|flasks|gem|customMods|party)
 pob config list [--all] [--search "<sub >"] [--with-options] [--target <slug>] [--json] # Active/filtered ConfigTab vars + raw customMods
 pob items [--slot "Weapon 1"|"#1"] [--all] [--raw] [--target <slug>] [--json]          # Equipped table, single slot, or all equipped + allocated jewels raw
+pob item inspect (--slot S | --raw "<item text>" | --file f) [--want "Cold Resistance"]... [--target <slug>] [--json] # Rare-item affix occupancy and bench candidates; uncertain matches never claim free slots
 pob skills [--group main|1|"label"] [--target <slug>] [--json]                         # Skill groups or per-gem DPS tooltips
 pob tree [--search "<kw>" ...] [--type Keystone|Notable|Mastery|Socket|Ascendancy ...] [--allocated|--unallocated] [--max-cost N] [--show-path] [--masteries] [--socket-radius <id|#1>] [--json]
 pob calc "<kw1>" ["<kw2>" ...] [--limit 20] [--no-breakdown] [--target <slug>] [--json] # Variadic EN/ZH get_calcs + calcs_breakdown formulas/tables
@@ -63,6 +64,7 @@ pob wiki "<q1>" ["<q2>" ...] [--proxy <url>] [--json]
 pob trade stats "<text|中文>" [--slot S] [--limit 5] [--proxy U] [--json]              # Local TradeSiteStats.lua (0ms) or API fallback
 pob trade search --slot S [--stat "text|中文=min"]... [--want T]... [--budget N] [--currency chaos_equiv|chaos|divine] [--status available|securable|online|any] [--allow-conversion [--convert-to E]] [--open-prefix|--open-suffix|--open-affix] [--pob auto|on|off] [--target <slug>] [--dump-query] [--proxy U] [--json]
 pob trade convert (--text T | --file f) --to fire|cold|lightning [--out f] [--json]    # Harvest 3.30 swap preview (same tier, rerolled)
+pob trade search --slot gloves --bench-craft "Area Damage" --pob on [--bench-craft "maximum Life"] # Original + legal minimum-roll bench variants; PoB-ranked by default. --pob-limit counts source listings; --budget caps listing price, craft/removal costs are additional. Hard --stat filters apply before crafting.
 pob bench list --slot S [--search "<text|中文>"] [--affix prefix|suffix] [--limit 25] [--json]
 pob bench suggest --slot S --stat "<text|中文>" [--affix prefix|suffix] [--limit 5] [--json]
 

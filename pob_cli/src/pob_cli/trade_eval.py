@@ -235,6 +235,7 @@ class Candidate:
     listing_id: str | None = None
     pob: PobEval | None = None
     pob_error: str | None = None
+    bench_craft: dict[str, Any] | None = None
 
     @property
     def display_name(self) -> str:
@@ -839,6 +840,10 @@ def format_report(
             ", ".join(f"{conv.element}->{conv.target}" for conv in candidate.conversions)
             or "-"
         )
+        item_label = candidate.display_name
+        if candidate.bench_craft:
+            craft = candidate.bench_craft
+            item_label += f" [bench: {' / '.join(craft['lines'])}; +{craft['cost']}]"
         score_str = f"{_finite_float(candidate.score):g}"
         if has_pob:
             dps = candidate.pob.dps_pct_str if candidate.pob is not None else "-"
@@ -846,7 +851,7 @@ def format_report(
             rows.append(
                 [
                     index,
-                    _escape(candidate.display_name),
+                    _escape(item_label),
                     _escape(candidate.price_text),
                     score_str,
                     _escape(dps),
@@ -860,7 +865,7 @@ def format_report(
             rows.append(
                 [
                     index,
-                    _escape(candidate.display_name),
+                    _escape(item_label),
                     _escape(candidate.price_text),
                     score_str,
                     gains,
@@ -925,6 +930,12 @@ def format_report(
         lines.append(f"## {index}. {sanitize_text(candidate.display_name)} - {sanitize_text(candidate.price_text)}")
         if candidate.url:
             lines.append(f"[Trade listing]({candidate.url})")
+        if candidate.bench_craft:
+            craft = candidate.bench_craft
+            lines.append(
+                f"Bench ({craft['action']}, minimum roll): {' / '.join(craft['lines'])}; "
+                f"cost: {craft['cost']}" + (" + remove existing craft" if craft['action'] == 'replace_craft' else "")
+            )
         lines.append("")
         if candidate.pob is not None:
             pob = candidate.pob
@@ -1005,6 +1016,7 @@ def report_json(candidates: list[Candidate]) -> list[dict[str, Any]]:
             "conversion_warnings": list(candidate.conversion_warnings),
             "pob": candidate.pob.as_dict() if candidate.pob is not None else None,
             "pob_error": candidate.pob_error,
+            "bench_craft": candidate.bench_craft,
             "gains": [
                 {
                     "mod": delta.example,

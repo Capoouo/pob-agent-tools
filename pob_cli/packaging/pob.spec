@@ -17,6 +17,7 @@ hiddenimports = [
     "pob_cli.errors",
     "pob_cli.daemon",
     "pob_cli.cli_trade",
+    "pob_cli.item_inspect",
     "pob_cli.timeless",
     "pob_cli.cli_timeless",
 ]

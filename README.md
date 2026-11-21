@@ -23,6 +23,7 @@ High-signal CLI, managed dual-upstream headless engine, offline Lua game-data SQ
 - **Official PoE1 Trade & Crafting Bench (`pob trade` / `pob bench`)**:
   - Read-only official trade search with 0ms offline local `TradeSiteStats.lua` resolution (bilingual EN/ZH + slot-aware `(Local)` routing), GGG dynamic `X-Rate-Limit-*` persistence, 3.30 instant buyout (`--status available`) & `chaos_equiv` pricing, Harvest same-tier conversion (`--allow-conversion` with same-group conflict guards), and single-snapshot batch headless PoB DPS/EHP verification (`trade_eval_items`). See [docs/TRADE.md](docs/TRADE.md).
   - Dual-source crafting bench lookup (`pob bench list|suggest`) driven by auto-updating `ModMaster.lua` (0 unknown affixes) with a compact offline cost/unlock overlay and ready-to-verify `{crafted}` lines.
+  - Read-only `pob item inspect` classifies a rare item's explicit/crafted prefixes and suffixes (including hybrid mods), reports uncertain open slots honestly, and filters bench suggestions against occupied affix groups.
 - **Timeless Jewel Seed Search (`pob timeless list|search`)**: Finds the best seeds across PoB's 11 timeless jewels at any allocated socket, with every reported row calculated by headless PoB (no hand-set weights). Seeds matching on allocated notables are deduplicated, large searches fit per-node contributions to narrow candidates (`--exact` evaluates all seeds), and work runs across parallel throwaway engines (`--workers`, `--idle`). Accepts English or Chinese jewel names.
 
 ---
@@ -102,6 +103,8 @@ pob audit
 pob audit --keep conditionStationary
 pob config list
 pob items --all --raw
+pob item inspect --slot "Ring 2" --want "Cold Resistance"
+pob item inspect --file copied-item.txt --want "maximum Life"
 pob skills --group main
 pob calc "Average Hit"
 
@@ -132,12 +135,19 @@ pob wiki "Eldritch Battery"
 pob trade stats "攻击速度" --slot weapon1
 pob trade search --slot gloves --budget 20 --stat "冰霜抗性=40" --want "Attack Speed" --allow-conversion --pob auto
 pob trade search --slot gloves --budget 10 --stat "最大生命=60" --open-suffix --pob auto
+pob trade search --slot gloves --budget 20 --currency divine --stat "to Dexterity=55" --bench-craft "Area Damage" --pob on
+# --bench-craft is repeatable: inspect top --pob-limit listings, keep original and legal
+# minimum-roll craft variants, then rank by PoB by default. Craft/removal costs are
+# additional to --budget (listing price cap); hard --stat filters apply before crafting.
+# JSON bench_craft includes action, cost, removed_lines and listed_item_text.
 pob bench suggest --slot gloves --stat "冰霜抗性"
 
 # 7. Timeless jewel seed search (PoB-verified; ranks real headless PoB results)
 pob timeless list
 pob timeless search --jewel "Lethal Pride" --socket 61419 --stat CombinedDPS --idle
 ```
+
+`pob item inspect` is read-only. It classifies rare-item explicit/crafted affixes from the installed PoB mod tables, counts hybrid lines as one affix, and suggests compatible bench options for `--want` (or common life/resistance targets by default). For pasted text without an inferable item class, pass `--slot` as the item type. Unmatched or ambiguous lines make open-slot counts unknown; suggested crafts then require checking the item in game. It does not apply a craft.
 
 Pass `--json` to any command for structured, color-stripped JSON output. Pass `--offline` before a subcommand (or set `POB_OFFLINE=1`) to skip GitHub update checks. See [AGENTS.md](AGENTS.md) for the compact agent cheat-sheet.
 

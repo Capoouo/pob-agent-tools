@@ -402,6 +402,8 @@ def cmd_trade_stats(
 @click.option("--open-prefix", is_flag=True, help="Require at least one open prefix.")
 @click.option("--open-suffix", is_flag=True, help="Require at least one open suffix.")
 @click.option("--open-affix", is_flag=True, help="Require at least one open prefix or suffix.")
+@click.option("--bench-craft", "bench_crafts", multiple=True,
+              help='Try adding/replacing a bench craft, e.g. "Area Damage" (repeatable; requires PoB).')
 @click.option(
     "--bench-hint/--no-bench-hint",
     default=True,
@@ -457,6 +459,7 @@ def cmd_trade_search(
     open_prefix: bool,
     open_suffix: bool,
     open_affix: bool,
+    bench_crafts: tuple[str, ...],
     bench_hint: bool,
     pob_mode: str,
     pob_limit: int,
@@ -472,6 +475,12 @@ def cmd_trade_search(
 ) -> None:
     """Search official PoE1 trade listings, compare against equipped gear, and verify in PoB."""
     ctx = click.get_current_context()
+    if bench_crafts and (pob_mode == "off" or not slot or no_compare or current_item_file):
+        raise click.UsageError("--bench-craft requires --slot, PoB verification and the loaded build comparison.")
+    if bench_crafts and pob_limit <= 0:
+        raise click.UsageError("--bench-craft requires --pob-limit greater than zero.")
+    if bench_crafts and ctx.get_parameter_source("sort_by") == click.core.ParameterSource.DEFAULT:
+        sort_by = "pob"
     if not slot and not category and not no_category:
         _err_utf8("Provide --slot (or --category / --no-category).")
         ctx.exit(1)
@@ -686,6 +695,17 @@ def cmd_trade_search(
 
     candidates = sort_candidates(candidates, "score")
 
+    verification_limit = max(0, pob_limit)
+    if bench_crafts and not dump_query:
+        from .trade_craft import expand_bench_candidates
+        selected = expand_bench_candidates(candidates[:verification_limit], slot=slot, wants=bench_crafts)
+        for candidate in selected:
+            if candidate.bench_craft:
+                candidate.deltas = compare_items(current, candidate.item, weights=weight_map, preferred=preferred)
+                candidate.score = score_deltas(candidate.deltas)
+        candidates = selected + candidates[verification_limit:]
+        verification_limit = len(selected)
+
     if pob_mode != "off" and candidates:
         if not pob_slot:
             if pob_mode == "on":
@@ -699,7 +719,7 @@ def cmd_trade_search(
                     candidates,
                     slot=pob_slot,
                     target=target,
-                    limit=max(0, pob_limit),
+                    limit=verification_limit,
                     daemon_call=_daemon_call_safe,
                 )
             except BootstrapMissingError as exc:
@@ -710,7 +730,7 @@ def cmd_trade_search(
                     return
             except Exception as exc:
                 err_text = sanitize_text(exc, 300)
-                for c in candidates[: max(0, pob_limit)]:
+                for c in candidates[:verification_limit]:
                     if c.pob is None and not c.pob_error:
                         c.pob_error = err_text
                 if pob_mode == "on":
@@ -718,7 +738,7 @@ def cmd_trade_search(
                     ctx.exit(6)
                     return
 
-            checked = candidates[: max(0, pob_limit)]
+            checked = candidates[:verification_limit]
             if pob_mode == "on" and checked:
                 failed = [c for c in checked if c.pob is None]
                 if failed:
