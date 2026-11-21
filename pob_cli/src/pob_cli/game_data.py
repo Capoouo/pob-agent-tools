@@ -109,7 +109,7 @@ def _is_pid_alive(pid: int) -> bool:
         return False
     except PermissionError:
         return True
-    except OSError:
+    except (OSError, OverflowError):
         return False
 
 
@@ -2229,7 +2229,7 @@ def _is_index_valid(db_path: Path, pob_version: str, data_version: str) -> bool:
 def _is_build_lock_stale(lock_path: Path, *, stale_sec: float = 60.0) -> bool:
     try:
         st = lock_path.stat()
-    except OSError:
+    except (OSError, OverflowError):
         return False
     # Reclaim any lockfile (including same-PID leaked locks) older than stale_sec.
     if (time.time() - st.st_mtime) > stale_sec:
@@ -2253,7 +2253,7 @@ def _try_break_stale_lock(lock_path: Path) -> bool:
     trash = lock_path.parent / f".{lock_path.name}.stale.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex[:8]}"
     try:
         os.replace(lock_path, trash)
-    except OSError:
+    except (OSError, OverflowError):
         return False
     try:
         trash.unlink(missing_ok=True)
