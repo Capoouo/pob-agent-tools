@@ -3,19 +3,24 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import time
 from pathlib import Path
 
 import pytest
 
 from pob_cli.game_data import (
+    _fold_search_text,
     ensure_gamedata_index,
     query_local_data,
+    query_multi,
     resolve_pob_dir,
 )
 
 REAL_POB_DIR = Path("F:/poe/PobTools[20261102]")
 HAS_REAL_POB = (REAL_POB_DIR / "PoE1" / "Data" / "Gems.lua").is_file()
+MANAGED_POB_DIR = Path("F:/poe/.runtime/engine")
+HAS_MANAGED_POB = (MANAGED_POB_DIR / "PoE1" / "Data" / "Gems.lua").is_file()
 
 
 @pytest.mark.skipif(not HAS_REAL_POB, reason="Real PobTools[20261102] directory not available")
@@ -303,3 +308,501 @@ def test_no_zh_fallback_resolution_and_auto_rebuild(tmp_path: Path, monkeypatch:
 
     with pytest.raises(ValueError, match="Unsupported kind"):
         query_local_data("invalid_kind", "foo", runtime_dir=rt)
+
+
+def test_fold_search_text_diacritics_and_punctuation() -> None:
+    assert _fold_search_text("Doppelgänger Guise") == "doppelganger guise"
+    assert _fold_search_text("Mjölner") == "mjolner"
+    assert _fold_search_text("Watcher’s Eye") == "watcher's eye"
+    assert _fold_search_text("Precursor‘s — Emblem") == "precursor's - emblem"
+
+
+def test_synthetic_diacritics_special_uniques_item_skills_shared_cache_and_multi(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Offline synthetic test covering diacritics, Special uniques, item skills, shared cache, and query_multi."""
+    monkeypatch.delenv("POB_CACHE_DIR", raising=False)
+    shared_rt = tmp_path / ".runtime"
+    engine_dir = _create_synthetic_pob_dir(shared_rt / "engine", pob_ver="2.99.5")
+    # Mark synthetic engine dir valid for updater.is_valid_engine_dir on Windows & POSIX
+    (engine_dir / "pob-zh.exe").write_bytes(b"")
+    (engine_dir / "Data" / "bridge").mkdir(parents=True, exist_ok=True)
+    (engine_dir / "Data" / "bridge" / "bridge.lua").write_text("-- stub", encoding="utf-8")
+    data_dir = engine_dir / "PoE1" / "Data"
+
+    # Add diacritic uniques
+    (data_dir / "Uniques" / "body.lua").write_text(
+        """return {
+[[
+Doppelgänger Guise
+Test Amulet
+Implicits: 0
+(40-60)% more Critical Strike Chance while Insane
+]],
+[[
+Mjölner
+Test Amulet
+Implicits: 0
+Trigger a Socketed Lightning Spell on Hit
+]]
+}""",
+        encoding="utf-8",
+    )
+
+    # Add Special uniques (WatchersEye.lua, BoundByDestiny.lua, Generated.lua)
+    special_dir = data_dir / "Uniques" / "Special"
+    special_dir.mkdir(parents=True, exist_ok=True)
+    (special_dir / "WatchersEye.lua").write_text(
+        """return {
+    ["WrathLightningPenetration"] = { affix = "", "Damage Penetrates (10-15)% Lightning Resistance while affected by Wrath", level = 1, group = "WrathPen", weightKey = {}, weightVal = {}, modTags = {} },
+}""",
+        encoding="utf-8",
+    )
+    (special_dir / "BoundByDestiny.lua").write_text(
+        """return {
+    ["MaxLife2Elder"] = { type = "2Elder", affix = "", "(10-15)% increased maximum Life if 2 Elder Items are Equipped", level = 1, group = "MaxLife2Elder", weightKey = {}, weightVal = {}, modTags = {} },
+}""",
+        encoding="utf-8",
+    )
+    (special_dir / "Generated.lua").write_text(
+        """data.uniques.generated = {}
+local watchersEye = {
+[[
+Watcher's Eye
+Prismatic Jewel
+Limited to: 1
+]]
+}
+local boundByDestiny = {
+[[
+Bound by Destiny
+Prismatic Jewel
+Limited to: 1
+]]
+}
+local impossibleEscape = {
+    "Impossible Escape",
+    "Viridian Jewel",
+    "Limited to: 1",
+}
+function buildForbidden(classNotables)
+end
+table.insert(data.uniques.generated, table.concat(watchersEye, "\\n"))
+table.insert(data.uniques.generated, table.concat(boundByDestiny, "\\n"))
+table.insert(data.uniques.generated, table.concat(impossibleEscape, "\\n"))
+""",
+        encoding="utf-8",
+    )
+
+    # Add item-granted skill in other.lua
+    (data_dir / "Skills" / "other.lua").write_text(
+        """return function(skills, mod, flag, skill)
+skills["SupportUniqueSuspendInTimeCanUse"] = {
+    name = "Temporal Mirage",
+    hidden = true,
+    color = 4,
+    support = true,
+    fromItem = true,
+    constantStats = { { "base_cast_speed_+%", 100 } },
+    stats = {},
+    levels = {
+        [1] = { levelRequirement = 70, manaMultiplier = -100 },
+    },
+}
+end""",
+        encoding="utf-8",
+    )
+
+    # Two separate swarm worker runtime dirs pointing at shared POB_ROOT must reuse ONE SQLite DB
+    monkeypatch.setenv("POB_ROOT", str(engine_dir))
+    worker_a = tmp_path / "swarm_a"
+    worker_b = tmp_path / "swarm_b"
+    db_a = ensure_gamedata_index(runtime_dir=worker_a)
+    db_b = ensure_gamedata_index(runtime_dir=worker_b)
+    assert db_a == db_b
+    assert db_a.parent == shared_rt / "cache"
+
+    # Diacritic folding queries
+    res_dg = query_local_data("unique", "Doppelganger Guise", runtime_dir=worker_a)
+    assert res_dg["count"] >= 1
+    assert res_dg["results"][0]["name"] == "Doppelgänger Guise"
+
+    res_mj = query_local_data("unique", "Mjolner", runtime_dir=worker_a)
+    assert res_mj["count"] >= 1
+    assert res_mj["results"][0]["name"] == "Mjölner"
+
+    # Curly apostrophe & Special uniques
+    for q_name, expected in (
+        ("Watcher’s Eye", "Watcher's Eye"),
+        ("Bound by Destiny", "Bound by Destiny"),
+        ("Forbidden Flame", "Forbidden Flame"),
+        ("Forbidden Flesh", "Forbidden Flesh"),
+        ("Impossible Escape", "Impossible Escape"),
+    ):
+        r = query_local_data("unique", q_name, runtime_dir=worker_a)
+        assert r["count"] >= 1, f"Expected hit for special unique {q_name!r}"
+        assert r["results"][0]["name"] == expected
+
+    # Item-granted skill lookup
+    res_tm = query_local_data("gem", "Temporal Mirage", runtime_dir=worker_a)
+    assert res_tm["count"] == 1
+    assert res_tm["results"][0]["name"] == "Temporal Mirage"
+    assert res_tm["results"][0]["is_item_skill"] is True
+    assert res_tm["results"][0]["skill_source"] == "item"
+
+    # query_multi using Path and open sqlite3.Connection (no redundant items/byQuery keys)
+    multi_res = query_multi(db_a, "unique", [" Doppelganger Guise ", "Mjolner", "Forbidden Flame", "   "])
+    assert multi_res["kind"] == "unique"
+    assert multi_res["queries"] == ["Doppelganger Guise", "Mjolner", "Forbidden Flame"]
+    assert "items" not in multi_res
+    assert "byQuery" not in multi_res
+    assert list(multi_res["results"].keys()) == ["Doppelganger Guise", "Mjolner", "Forbidden Flame"]
+    assert multi_res["results"]["Mjolner"]["results"][0]["name"] == "Mjölner"
+
+    conn = sqlite3.connect(f"{db_a.resolve().as_uri()}?mode=ro", uri=True)
+    try:
+        multi_conn = query_multi(conn, "gem", ["Test Bolt", "Temporal Mirage"])
+        assert [multi_conn["results"][q]["results"][0]["name"] for q in multi_conn["queries"]] == [
+            "Test Bolt",
+            "Temporal Mirage",
+        ]
+    finally:
+        conn.close()
+
+    # query_multi with optional db=None (keyword dispatch matching daemon.py)
+    multi_kw = query_multi(kind="gem", queries=["Test Bolt", "Temporal Mirage"], runtime_dir=worker_a)
+    assert multi_kw["results"]["Temporal Mirage"]["results"][0]["name"] == "Temporal Mirage"
+
+    # Explicit POB_CACHE_DIR override
+    custom_cache = tmp_path / "custom_shared_cache"
+    monkeypatch.setenv("POB_CACHE_DIR", str(custom_cache))
+    db_c = ensure_gamedata_index(runtime_dir=worker_a)
+    assert db_c.parent == custom_cache
+
+
+def test_schema_v4_to_v5_auto_upgrade_and_explicit_pob_dir_isolation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify pre-existing v4 SQLite DB auto-rebuilds to v5 and explicit pob_dir ignores env POB_ROOT."""
+    from pob_cli import game_data
+
+    monkeypatch.delenv("POB_CACHE_DIR", raising=False)
+    # Point env POB_ROOT at a shared .runtime/engine to simulate active swarm env
+    env_rt = tmp_path / "env_shared" / ".runtime"
+    env_eng = _create_synthetic_pob_dir(env_rt / "engine", pob_ver="2.99.9")
+    (env_eng / "pob-zh.exe").write_bytes(b"")
+    monkeypatch.setenv("POB_ROOT", str(env_eng))
+
+    # Build against an explicit separate legacy-style pob_dir -> must write to tmp_path/rt/cache, NOT env_rt/cache
+    legacy_pob = _create_synthetic_pob_dir(tmp_path / "LegacySeed", pob_ver="2.99.0")
+    rt = tmp_path / "rt"
+    db_path = ensure_gamedata_index(pob_dir=legacy_pob, runtime_dir=rt)
+    assert db_path.parent == rt / "cache"
+
+    # Downgrade DB schema_version to "4" and drop gems.is_item_skill to simulate a pre-existing v4 DB
+    game_data._VALID_INDEX_CACHE.clear()
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("UPDATE meta SET value = '4' WHERE key = 'schema_version'")
+        conn.commit()
+    finally:
+        conn.close()
+
+    # ensure_gamedata_index must detect v4 != SCHEMA_VERSION (6) and auto-rebuild
+    assert game_data.SCHEMA_VERSION == 6
+    rebuilt_path = ensure_gamedata_index(pob_dir=legacy_pob, runtime_dir=rt)
+    assert rebuilt_path == db_path
+    conn = sqlite3.connect(f"{rebuilt_path.resolve().as_uri()}?mode=ro", uri=True)
+    try:
+        meta = dict(conn.execute("SELECT key, value FROM meta").fetchall())
+        assert meta["schema_version"] == "6"
+    finally:
+        conn.close()
+
+
+def test_concurrent_build_lockfile_prevents_thundering_herd_and_recovers_stale_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify atomic build lockfile serializes concurrent cold builds, cleans .tmp, and recovers stale locks."""
+    import concurrent.futures
+    import json
+    from pob_cli import game_data
+
+    monkeypatch.delenv("POB_ROOT", raising=False)
+    monkeypatch.delenv("POB_CACHE_DIR", raising=False)
+
+    rt = tmp_path / "rt_lock"
+    engine_dir = _create_synthetic_pob_dir(rt / "engine", pob_ver="2.99.7")
+
+    # 1. Pre-create a stale lockfile from a dead PID + old mtime
+    poe1_dir, zh_dir = game_data._resolve_poe1_data_dirs(engine_dir)
+    pob_ver, data_ver = game_data.detect_versions(poe1_dir, zh_dir)
+    cache_dir = rt / "cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    expected_db = cache_dir / f"gamedata_{pob_ver}_{data_ver}.sqlite"
+    lock_file = Path(f"{expected_db}.build.lock")
+    lock_file.write_text(json.dumps({"pid": 99999999, "ts": 1.0}), encoding="utf-8")
+    os.utime(lock_file, (1.0, 1.0))
+
+    # 2. Fire 4 concurrent threads calling ensure_gamedata_index simultaneously
+    parse_calls = 0
+    real_parse_gems = game_data._parse_gems_and_skills
+
+    def counted_parse_gems(*args, **kwargs):
+        nonlocal parse_calls
+        parse_calls += 1
+        time.sleep(0.05)
+        return real_parse_gems(*args, **kwargs)
+
+    monkeypatch.setattr(game_data, "_parse_gems_and_skills", counted_parse_gems)
+    game_data._VALID_INDEX_CACHE.clear()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        futs = [pool.submit(ensure_gamedata_index, runtime_dir=rt) for _ in range(4)]
+        paths = [f.result() for f in futs]
+
+    assert all(p == expected_db for p in paths)
+    assert parse_calls == 1
+    assert not lock_file.exists()
+    assert list(cache_dir.glob("*.tmp")) == []
+
+
+@pytest.mark.skipif(not HAS_REAL_POB, reason="Real PobTools[20261102] directory not available")
+def test_real_pob_diacritics_special_uniques_item_skills_and_partial_zh_translate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify real PoB index covers diacritics, Special uniques, Temporal Mirage, and partial CN translate."""
+    monkeypatch.delenv("POB_ROOT", raising=False)
+    monkeypatch.delenv("POB_CACHE_DIR", raising=False)
+
+    assert query_local_data("unique", "Doppelganger Guise", pob_dir=REAL_POB_DIR, runtime_dir=tmp_path)["results"][0]["name"] == "Doppelgänger Guise"
+    assert query_local_data("unique", "Mjolner", pob_dir=REAL_POB_DIR, runtime_dir=tmp_path)["results"][0]["name"] == "Mjölner"
+
+    for special_name in (
+        "Watcher's Eye",
+        "Bound by Destiny",
+        "Forbidden Flame",
+        "Forbidden Flesh",
+        "Impossible Escape",
+        "The Balance of Terror",
+        "Sublime Vision",
+        "Megalomaniac",
+        "Precursor's Emblem",
+        "Skin of the Lords",
+    ):
+        res_sp = query_local_data("unique", special_name, pob_dir=REAL_POB_DIR, runtime_dir=tmp_path)
+        assert res_sp["count"] >= 1, f"Missing Special unique {special_name}"
+        assert res_sp["results"][0]["name"] == special_name
+
+    # Item-granted skills from Data/Skills/other.lua & glove.lua
+    for skill_name in ("Abberath's Fury", "Word of Blades"):
+        res_sk = query_local_data("gem", skill_name, pob_dir=REAL_POB_DIR, runtime_dir=tmp_path)
+        assert res_sk["count"] >= 1, f"Expected item skill {skill_name!r}"
+        assert res_sk["results"][0]["name"] == skill_name
+        assert res_sk["results"][0]["is_item_skill"] is True
+
+    if HAS_MANAGED_POB:
+        res_tm = query_local_data("gem", "Temporal Mirage", pob_dir=MANAGED_POB_DIR, runtime_dir=tmp_path / "managed")
+        assert res_tm["count"] >= 1
+        assert res_tm["results"][0]["name"] == "Temporal Mirage"
+        assert res_tm["results"][0]["is_item_skill"] is True
+
+        res_pearl = query_local_data("unique", "Pearl of Tsoatha", pob_dir=MANAGED_POB_DIR, runtime_dir=tmp_path / "managed")
+        assert res_pearl["count"] >= 1
+        pearl = res_pearl["results"][0]
+        assert pearl["name"] == "Pearl of Tsoatha"
+        assert pearl["implicits"] == ["+(8-10)% to all Elemental Resistances"]
+        assert len(pearl["explicits"]) >= 1
+
+    # That Which Was Taken parses cleanly despite leading `Item Class:` + `Rarity:` lines
+    res_twwt = query_local_data("unique", "That Which Was Taken", pob_dir=REAL_POB_DIR, runtime_dir=tmp_path)
+    assert res_twwt["count"] >= 1
+    assert res_twwt["results"][0]["name"] == "That Which Was Taken"
+    assert res_twwt["results"][0]["base_type"] == "Crimson Jewel"
+
+    # Partial Chinese translate queries return core entity matches without lore proverb pollution
+    res_ivory = query_local_data("translate", "象牙塔", pob_dir=REAL_POB_DIR, runtime_dir=tmp_path)
+    assert res_ivory["count"] >= 1
+    assert any(r["en"] == "The Ivory Tower" for r in res_ivory["results"])
+
+    res_frost = query_local_data("translate", "寒冰法师", pob_dir=REAL_POB_DIR, runtime_dir=tmp_path)
+    assert res_frost["count"] >= 1
+    assert any("Frost" in r["en"] for r in res_frost["results"])
+
+    # Gibberish CJK query must return 0 hits instead of lore proverbs
+    res_gib = query_local_data("translate", "不存在的测试词缀", pob_dir=REAL_POB_DIR, runtime_dir=tmp_path)
+    assert res_gib["count"] == 0
+
+
+def test_build_lock_timeout_same_pid_stale_token_ownership_and_force_rebuild_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify P0/P2 build lock hardening: no infinite spin, same-PID stale reclaim, token ownership, force_rebuild error."""
+    import json
+    from pob_cli import game_data
+
+    monkeypatch.delenv("POB_ROOT", raising=False)
+    monkeypatch.delenv("POB_CACHE_DIR", raising=False)
+
+    # 1. _is_pid_alive bounds check
+    assert game_data._is_pid_alive(0) is False
+    assert game_data._is_pid_alive(-5) is False
+    assert game_data._is_pid_alive(0x1_0000_0000) is False
+    assert game_data._is_pid_alive(os.getpid()) is True
+
+    # 2. Same-PID leaked lock older than stale_sec is reclaimed via atomic rename
+    lock_path = tmp_path / "test.sqlite.build.lock"
+    db_path = tmp_path / "test.sqlite"
+    lock_path.write_text(json.dumps({"pid": os.getpid(), "token": "old-tok", "ts": 1.0}), encoding="utf-8")
+    os.utime(lock_path, (1.0, 1.0))
+    assert game_data._is_build_lock_stale(lock_path, stale_sec=60.0) is True
+
+    tok = game_data._acquire_build_lock(lock_path, db_path, "2.99.0", "nozh-1", timeout_sec=0.5, stale_sec=60.0)
+    assert isinstance(tok, str) and tok
+    stored = json.loads(lock_path.read_text(encoding="utf-8"))
+    assert stored["token"] == tok
+
+    # 3. _release_build_lock must NOT unlink a lock owned by a different token
+    game_data._release_build_lock(lock_path, "wrong-token")
+    assert lock_path.exists()
+    game_data._release_build_lock(lock_path, tok)
+    assert not lock_path.exists()
+
+    # 4. Unbreakable stale lock (os.replace raises PermissionError) raises TimeoutError cleanly (no infinite spin)
+    lock_path.write_text(json.dumps({"pid": 99999999, "token": "stuck", "ts": 1.0}), encoding="utf-8")
+    os.utime(lock_path, (1.0, 1.0))
+    real_replace = os.replace
+
+    def deny_replace(src, dst):
+        raise PermissionError("locked by AV")
+
+    monkeypatch.setattr(os, "replace", deny_replace)
+    t0 = time.monotonic()
+    with pytest.raises(TimeoutError):
+        game_data._acquire_build_lock(lock_path, db_path, "2.99.0", "nozh-1", timeout_sec=0.12, stale_sec=60.0)
+    assert (time.monotonic() - t0) < 2.0
+    monkeypatch.setattr(os, "replace", real_replace)
+    lock_path.unlink(missing_ok=True)
+
+    # 5. Write failure inside _acquire_build_lock cleans up 0-byte lockfile
+    def fail_write(_fd, _data):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(os, "write", fail_write)
+    with pytest.raises(OSError, match="disk full"):
+        game_data._acquire_build_lock(lock_path, db_path, "2.99.0", "nozh-1", timeout_sec=0.2)
+    assert not lock_path.exists()
+    monkeypatch.undo()
+
+    # 6. force_rebuild=True must raise PermissionError if os.replace fails (never silently return old DB)
+    rt = tmp_path / "rt_force"
+    _create_synthetic_pob_dir(rt / "engine", pob_ver="2.99.8")
+    built = ensure_gamedata_index(runtime_dir=rt)
+    assert built.is_file()
+
+    def deny_db_replace(src, dst):
+        if Path(dst) == built:
+            raise PermissionError("db in use")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", deny_db_replace)
+    with pytest.raises(PermissionError, match="db in use"):
+        ensure_gamedata_index(runtime_dir=rt, force_rebuild=True)
+
+
+def test_synthetic_uniques_header_pearl_and_lore_proverb_filtering(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify That Which Was Taken header stripping, Pearl of Tsoatha implicit/explicit, and lore proverb exclusion."""
+    import json
+
+    monkeypatch.delenv("POB_ROOT", raising=False)
+    monkeypatch.delenv("POB_CACHE_DIR", raising=False)
+
+    rt = tmp_path / "rt_syn"
+    engine_dir = _create_synthetic_pob_dir(rt / "engine", pob_ver="2.99.6")
+    data_dir = engine_dir / "PoE1" / "Data"
+
+    # Synthetic That Which Was Taken with Item Class + Rarity + Requirements + Level
+    (data_dir / "Uniques" / "jewel.lua").write_text(
+        """return {
+[[
+Item Class: Jewels
+Rarity: Unique
+That Which Was Taken
+Crimson Jewel
+Requirements:
+Level: 48
+Crafted: true
+League: Affliction
+Limited to: 1
+Implicits: 0
++10 to all Attributes
+]]
+}""",
+        encoding="utf-8",
+    )
+
+    # Synthetic Pearl of Tsoatha in Special/Generated.lua
+    special_dir = data_dir / "Uniques" / "Special"
+    special_dir.mkdir(parents=True, exist_ok=True)
+    (special_dir / "Generated.lua").write_text(
+        """data.uniques.generated = {}
+local pearl = {
+    "Pearl of Tsoatha",
+    "Prismatic Ring",
+    "LevelReq: 30",
+    "Implicits: 1",
+}
+table.insert(data.uniques.generated, table.concat(pearl, "\\n"))
+""",
+        encoding="utf-8",
+    )
+
+    # Synthetic ZH dictionary with keystone/ascendancy proverbs + dotted entity name
+    zh_dir = engine_dir / "Data" / "poe1" / "zh-rCN"
+    zh_dir.mkdir(parents=True, exist_ok=True)
+    (zh_dir / "meta.json").write_text(json.dumps({"version": "1.0.0"}), encoding="utf-8")
+    (zh_dir / "Z-Keystone_Proverb.json").write_text(
+        json.dumps({"entries": {"The First Ones exist,": "不存在的古老格言测试"}}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (zh_dir / "Z-Ascendancy_Proverb.json").write_text(
+        json.dumps({"entries": {"The artist need not be present": "不存在的升华箴言词缀"}}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (zh_dir / "uniques.json").write_text(
+        json.dumps(
+            {
+                "entries": {
+                    "Ralakesh's Impatience": "拉克斯・急躁",
+                    "The Ivory Tower": "象牙之塔",
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    res_tw = query_local_data("unique", "That Which Was Taken", runtime_dir=rt)
+    assert res_tw["count"] == 1
+    tw = res_tw["results"][0]
+    assert tw["name"] == "That Which Was Taken"
+    assert tw["base_type"] == "Crimson Jewel"
+    assert tw["req_level"] == 48
+    assert tw["explicits"] == ["+10 to all Attributes"]
+
+    res_pearl = query_local_data("unique", "Pearl of Tsoatha", runtime_dir=rt)
+    assert res_pearl["count"] == 1
+    pearl = res_pearl["results"][0]
+    assert pearl["implicits"] == ["+(8-10)% to all Elemental Resistances"]
+    assert pearl["explicits"] == ["Socketed/Random Support Gem (Helmet / Gloves / Boots / Passive Tree)"]
+
+    # Dotted entity name matches via Step 4a and skips 4b/4c
+    res_dot = query_local_data("translate", "拉克斯急躁", runtime_dir=rt)
+    assert res_dot["count"] == 1
+    assert res_dot["results"][0]["en"] == "Ralakesh's Impatience"
+
+    # Lore proverbs excluded and gibberish CJK returns 0 hits
+    res_gib = query_local_data("translate", "不存在的测试词缀", runtime_dir=rt)
+    assert res_gib["count"] == 0

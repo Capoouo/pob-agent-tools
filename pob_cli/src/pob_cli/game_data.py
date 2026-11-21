@@ -12,14 +12,166 @@ import json
 import os
 import re
 import sqlite3
+import sys
+import threading
 import time
+import unicodedata
+import uuid
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
+from . import updater as _updater
 from .updater import detect_source_checkout_root, get_runtime_dir
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 6
+_INDEX_BUILD_LOCK = threading.RLock()
+
+_FOLD_CHAR_MAP = str.maketrans(
+    {
+        "\u2018": "'",
+        "\u2019": "'",
+        "\u201a": "'",
+        "\u201b": "'",
+        "\u02bc": "'",
+        "\u0060": "'",
+        "\u00b4": "'",
+        "\u201c": '"',
+        "\u201d": '"',
+        "\u2010": "-",
+        "\u2011": "-",
+        "\u2012": "-",
+        "\u2013": "-",
+        "\u2014": "-",
+        "\u2212": "-",
+        "\u3000": " ",
+        "\u00a0": " ",
+    }
+)
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+_CJK_PARTICLE_RE = re.compile(r"[之的・·．\s]+")
+
+
+def _fold_search_text(text: str) -> str:
+    """Fold Unicode diacritics (NFKD), curly apostrophes/dashes, and case for search matching."""
+    if not text:
+        return ""
+    decomposed = unicodedata.normalize("NFKD", text)
+    stripped = "".join(ch for ch in decomposed if unicodedata.category(ch) != "Mn")
+    return stripped.translate(_FOLD_CHAR_MAP).lower()
+
+
+def _sqlite_ro_uri(db_path: Path) -> str:
+    """Build a properly percent-encoded read-only SQLite file URI."""
+    return f"{db_path.resolve().as_uri()}?mode=ro"
+
+
+def _is_pid_alive(pid: int) -> bool:
+    """Best-effort OS check whether process ``pid`` is currently alive."""
+    if pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    if sys.platform == "win32":
+        if pid > 0xFFFFFFFF:
+            return False
+        try:
+            import ctypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            open_process = kernel32.OpenProcess
+            open_process.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+            open_process.restype = ctypes.c_void_p
+            get_exit_code = kernel32.GetExitCodeProcess
+            get_exit_code.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
+            get_exit_code.restype = ctypes.c_int
+            close_handle = kernel32.CloseHandle
+            close_handle.argtypes = [ctypes.c_void_p]
+            close_handle.restype = ctypes.c_int
+
+            handle = open_process(0x1000, 0, int(pid))
+            if not handle:
+                # ERROR_ACCESS_DENIED (5): process exists under higher privilege
+                return ctypes.get_last_error() == 5
+            try:
+                exit_code = ctypes.c_ulong(0)
+                if get_exit_code(handle, ctypes.byref(exit_code)):
+                    return int(exit_code.value) == 259  # STILL_ACTIVE
+                return False
+            finally:
+                close_handle(handle)
+        except Exception:
+            return True
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def _shared_cache_dir(
+    runtime_dir: Path | None = None,
+    *,
+    pob_root: Path | None = None,
+) -> Path:
+    """Resolve shared engine-scoped cache dir via updater.get_shared_cache_dir if present."""
+    env_cache = os.environ.get("POB_CACHE_DIR", "").strip()
+    if env_cache:
+        cache_dir = Path(env_cache)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return cache_dir
+
+    fn = getattr(_updater, "get_shared_cache_dir", None)
+    if callable(fn):
+        if pob_root is not None:
+            try:
+                cache_dir = Path(fn(runtime_dir, pob_root=pob_root))
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                return cache_dir
+            except TypeError:
+                # Older/in-flight updater.get_shared_cache_dir without pob_root kwarg:
+                # fall through to local explicit-pob_root check below.
+                pass
+        else:
+            cache_dir = Path(fn(runtime_dir))
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            return cache_dir
+
+    rt = resolve_runtime_dir(runtime_dir)
+    eng_candidate: Path | None = Path(pob_root) if pob_root is not None else None
+    if eng_candidate is None:
+        env_root = os.environ.get("POB_ROOT", "").strip()
+        if env_root:
+            eng_candidate = Path(env_root)
+
+    shared_candidate: Path | None = None
+    if eng_candidate is not None:
+        try:
+            eng_parent = eng_candidate.resolve().parent
+            same_rt = eng_parent == rt.resolve()
+        except OSError:
+            eng_parent = eng_candidate.parent
+            same_rt = False
+        if not same_rt and (
+            (eng_parent / "cache").is_dir()
+            or eng_parent.name in (".runtime", "pob-agent-tools")
+        ):
+            shared_candidate = eng_parent / "cache"
+
+    if shared_candidate is not None:
+        try:
+            shared_candidate.mkdir(parents=True, exist_ok=True)
+            return shared_candidate
+        except OSError:
+            pass
+
+    cache_dir = rt / "cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir
 
 # Constants from PoE1/Data/Misc.lua (GameConstants.dat) used by CalcTools.lua
 SKILL_DAMAGE_BASE_EFFECTIVENESS = 3.885209
@@ -90,6 +242,7 @@ COLOR_NAMES: dict[int, str] = {
 UNIQUE_META_KEYS: frozenset[str] = frozenset(
     {
         "Variant",
+        "Version",
         "Has Alt Variant",
         "Has Alt Variant Two",
         "Has Alt Variant Three",
@@ -100,6 +253,8 @@ UNIQUE_META_KEYS: frozenset[str] = frozenset(
         "League",
         "Source",
         "LevelReq",
+        "Level",
+        "Requirements",
         "Requires Level",
         "Sockets",
         "Item Level",
@@ -223,8 +378,6 @@ ZH_FILE_CATEGORY_HINT: dict[str, tuple[str, int]] = {
     "Items_Oils.json": ("base", 2),
     "Z-Item.json": ("base", 2),
     "tree_dn.json": ("passive", 1),
-    "Z-Keystone_Proverb.json": ("passive", 2),
-    "Z-Ascendancy_Proverb.json": ("passive", 2),
     "TattooPassives.json": ("passive", 2),
     "passiveTree.json": ("passive", 3),
     "tree_sd.json": ("stat", 3),
@@ -361,10 +514,7 @@ def detect_versions(poe1_dir: Path, zh_dir: Path | None) -> tuple[str, str]:
     _scan_dir_entries(hasher, data_dir / "Skills", ".lua")
     _scan_dir_entries(hasher, data_dir / "Bases", ".lua")
     _scan_dir_entries(hasher, data_dir / "Uniques", ".lua")
-    race_lua = data_dir / "Uniques" / "Special" / "race.lua"
-    if race_lua.is_file():
-        st = race_lua.stat()
-        hasher.update(f"race.lua:{st.st_size}:{st.st_mtime_ns};".encode("utf-8"))
+    _scan_dir_entries(hasher, data_dir / "Uniques" / "Special", ".lua")
 
     zh_prefix = "nozh"
     if zh_dir is not None and zh_dir.is_dir():
@@ -752,6 +902,7 @@ class _ZhDictionary:
         self.passives: dict[str, str] = {}
         self.stats_exact: dict[str, str] = {}
         self.stat_templates: dict[str, str] = {}
+        self.aliases: dict[str, list[str]] = {}
         self.all_entries: list[tuple[str, str, str, int]] = []
 
     @classmethod
@@ -842,6 +993,8 @@ class _ZhDictionary:
             "A-Skillsfrom1.json",
             "A-Skillsfrom2.json",
             "Z-Uniques_Proverb.json",
+            "Z-Keystone_Proverb.json",
+            "Z-Ascendancy_Proverb.json",
             "Z-Exceptional_Gems_Lore.json",
             "Z-Replica_Dragonfang's_Flight.json",
             "Z-Skills_Gems_Overview.json",
@@ -867,7 +1020,7 @@ class _ZhDictionary:
             is_gem_file = fn in ("gems.json", "Gems_data.txt.json", "Items_Gems.txt.json", "Z-Skills.json") or is_season_patch
             is_unique_file = fn in ("uniques.json", "Uniques.txt.json", "Z-S28-Foulborn.json", "Z-Flask.json", "Z-Jewel.json") or is_season_patch
             is_base_file = fn in ("items.json", "Items_Accessories.txt.json", "Items_Armour.txt.json", "Items_Flasks.txt.json", "Items_Jewels.txt.json", "Items_Weapons.txt.json", "Z-Item.json", "Z-Flask.json", "Z-Jewel.json", "Z-Addition.json", "Z.json") or is_season_patch
-            is_passive_file = fn in ("tree_dn.json", "Z-Keystone_Proverb.json", "Z-Ascendancy_Proverb.json", "TattooPassives.json", "Z-Phrecia.json") or is_season_patch
+            is_passive_file = fn in ("tree_dn.json", "TattooPassives.json", "Z-Phrecia.json") or is_season_patch
             is_stat_file = fn in ("statDescriptions.json", "stats.json", "Query_Mod.json", "ModMap.json", "A-1a.json", "A-1b.json", "Z-Item.json", "tree_sd.json", "Z-Addition.json", "Z.json") or is_season_patch
 
             for raw_en, raw_zh in entries.items():
@@ -900,6 +1053,36 @@ class _ZhDictionary:
                     dedup_pairs[key] = (en, rank_hint)
 
         obj.all_entries = [(en, k[1], k[2], rank) for k, (en, rank) in dedup_pairs.items()]
+
+        # Also index short entity-name community/TW aliases (e.g. "象牙塔", "看守之眼", "禁忌烈焰")
+        # from A-1a.json without pulling 38k superseded stat templates.
+        alias_path = zh_dir / "A-1a.json"
+        if alias_path.is_file() and "A-1a.json" in superseded:
+            try:
+                alias_payload = json.loads(alias_path.read_text(encoding="utf-8"))
+                alias_entries = alias_payload.get("entries") if isinstance(alias_payload, dict) else None
+                if isinstance(alias_entries, dict):
+                    for raw_en, raw_zh in alias_entries.items():
+                        if not isinstance(raw_en, str) or not isinstance(raw_zh, str):
+                            continue
+                        en = raw_en.strip()
+                        zh = raw_zh.strip()
+                        if (
+                            not en
+                            or not zh
+                            or len(en) > 60
+                            or len(zh) > 60
+                            or "{" in en
+                            or "#" in en
+                            or "\n" in en
+                            or "\n" in zh
+                        ):
+                            continue
+                        bucket = obj.aliases.setdefault(en.lower(), [])
+                        if zh not in bucket:
+                            bucket.append(zh)
+            except Exception:
+                pass
         return obj
 
     def translate_gem(self, name: str) -> str | None:
@@ -1007,25 +1190,31 @@ def _compute_skill_level_stats(skill: dict[str, Any], lvl_num: int) -> dict[str,
     return {k: v for k, v in entry.items() if v is not None and v != {}}
 
 
+ITEM_SKILL_FILES: frozenset[str] = frozenset({"other.lua", "glove.lua", "minion.lua"})
+
+
 def _parse_gems_and_skills(poe1_dir: Path, zh: _ZhDictionary) -> list[dict[str, Any]]:
     data_dir = poe1_dir / "Data"
     skills: dict[str, dict[Any, Any]] = {}
+    skill_source_file: dict[str, str] = {}
     for fn in SKILL_FILES:
         p = data_dir / "Skills" / fn
         if p.is_file():
-            skills.update(
-                _parse_lua_assignments(
-                    p,
-                    "skills",
-                    skip_keys=LUA_SKIP_KEYS_SKILL,
-                    keep_levels=SKILL_KEEP_LEVELS,
-                    prestrip_re=SKILL_HIGH_LEVEL_STRIP_RE,
-                )
+            is_item_file = fn in ITEM_SKILL_FILES
+            parsed_sk = _parse_lua_assignments(
+                p,
+                "skills",
+                skip_keys=LUA_SKIP_KEYS_SKILL,
+                keep_levels=None if is_item_file else SKILL_KEEP_LEVELS,
+                prestrip_re=None if is_item_file else SKILL_HIGH_LEVEL_STRIP_RE,
             )
+            skills.update(parsed_sk)
+            for sk_id in parsed_sk:
+                skill_source_file[sk_id] = fn
 
     gems_raw = _parse_lua_return(data_dir / "Gems.lua")
     if not isinstance(gems_raw, dict):
-        return []
+        gems_raw = {}
 
     # Replicate PoB's synthesized Vaal + Transfigured hybrid gems (Modules/Data.lua:1098-1118)
     synthesized: dict[str, dict[Any, Any]] = {}
@@ -1050,6 +1239,7 @@ def _parse_gems_and_skills(poe1_dir: Path, zh: _ZhDictionary) -> list[dict[str, 
     by_game_id: dict[str, list[dict[str, Any]]] = {}
     by_granted_id: dict[str, list[dict[str, Any]]] = {}
     by_name_lower: dict[str, list[dict[str, Any]]] = {}
+    referenced_skill_ids: set[str] = set()
     records: list[dict[str, Any]] = []
 
     for gem_id, gem in gems_raw.items():
@@ -1060,6 +1250,10 @@ def _parse_gems_and_skills(poe1_dir: Path, zh: _ZhDictionary) -> list[dict[str, 
             continue
         ge_id = str(gem.get("grantedEffectId") or "")
         sec_id = gem.get("secondaryGrantedEffectId")
+        if ge_id:
+            referenced_skill_ids.add(ge_id)
+        if isinstance(sec_id, str) and sec_id:
+            referenced_skill_ids.add(sec_id)
         skill = skills.get(ge_id, {})
         sec_skill = skills.get(sec_id, {}) if isinstance(sec_id, str) else {}
         tags_raw = gem.get("tags") if isinstance(gem.get("tags"), dict) else {}
@@ -1120,6 +1314,7 @@ def _parse_gems_and_skills(poe1_dir: Path, zh: _ZhDictionary) -> list[dict[str, 
             "is_vaal": is_vaal,
             "is_transfigured": is_transfigured,
             "is_imbued": is_imbued,
+            "is_item_skill": False,
             "color": color,
             "tag_string": str(gem.get("tagString") or ""),
             "tags": tags_list,
@@ -1144,6 +1339,108 @@ def _parse_gems_and_skills(poe1_dir: Path, zh: _ZhDictionary) -> list[dict[str, 
             by_game_id.setdefault(rec["game_id"], []).append(rec)
         if ge_id:
             by_granted_id.setdefault(ge_id, []).append(rec)
+        by_name_lower.setdefault(name.lower(), []).append(rec)
+
+    # Index item-, ascendancy-, tree-, enchant-, and minion-granted skills from Data/Skills/*.lua
+    for sk_id, skill in skills.items():
+        if sk_id in referenced_skill_ids or not isinstance(skill, dict):
+            continue
+        src_fn = skill_source_file.get(sk_id, "")
+        from_item = bool(skill.get("fromItem"))
+        from_tree = bool(skill.get("fromTree"))
+        if src_fn not in ITEM_SKILL_FILES and not from_item and not from_tree:
+            continue
+        name = str(skill.get("name") or "").strip()
+        if not name:
+            continue
+
+        is_support = bool(skill.get("support"))
+        color = COLOR_NAMES.get(int(skill.get("color") or 0), "")
+        raw_levels = skill.get("levels")
+        avail_lvl_nums = sorted(k for k in raw_levels if isinstance(k, int)) if isinstance(raw_levels, dict) else []
+        if len(avail_lvl_nums) > 8:
+            pick = sorted({avail_lvl_nums[0], avail_lvl_nums[-1], *(lv for lv in (1, 10, 15, 20, 21, 25, 30) if lv in avail_lvl_nums)})
+        else:
+            pick = avail_lvl_nums
+
+        levels_out = {}
+        for lvl_num in pick:
+            lvl_stats = _compute_skill_level_stats(skill, lvl_num)
+            if lvl_stats is not None:
+                levels_out[str(lvl_num)] = lvl_stats
+
+        quality_stats = []
+        for qs in _as_seq(skill.get("qualityStats")):
+            if isinstance(qs, list) and len(qs) >= 2 and isinstance(qs[1], (int, float)):
+                quality_stats.append(
+                    {
+                        "stat": qs[0],
+                        "per_quality": qs[1],
+                        "at_20_quality": round(float(qs[1]) * 20, 4),
+                    }
+                )
+
+        constant_stats = []
+        for cs in _as_seq(skill.get("constantStats")):
+            if isinstance(cs, list) and len(cs) >= 2:
+                constant_stats.append({"stat": cs[0], "value": cs[1]})
+
+        base_flags = skill.get("baseFlags") if isinstance(skill.get("baseFlags"), dict) else {}
+        tags_list = sorted(str(k) for k, v in base_flags.items() if v)
+        if is_support and "support" not in tags_list:
+            tags_list.append("support")
+        if from_item:
+            skill_source = "item"
+        elif from_tree:
+            skill_source = "tree"
+        else:
+            skill_source = src_fn.removesuffix(".lua") or "skill"
+
+        ref_lvl = (
+            levels_out.get("20")
+            or (levels_out.get(str(pick[-1])) if pick else None)
+            or levels_out.get("1")
+            or {}
+        )
+        zh_name = zh.translate_gem(name) or (zh.passives.get(name) if zh.available else None)
+
+        rec = {
+            "id": f"Skill/{sk_id}",
+            "name": name,
+            "display_name": name,
+            "zh_name": zh_name,
+            "game_id": "",
+            "variant_id": "",
+            "granted_effect_id": sk_id,
+            "secondary_granted_effect_id": None,
+            "plus_version_of": None,
+            "is_support": is_support,
+            "is_vaal": False,
+            "is_transfigured": False,
+            "is_imbued": False,
+            "is_item_skill": True,
+            "skill_source": skill_source,
+            "color": color,
+            "tag_string": ", ".join(t.title() for t in tags_list),
+            "tags": tags_list,
+            "req_str": 0,
+            "req_dex": 0,
+            "req_int": 0,
+            "natural_max_level": pick[-1] if pick else 1,
+            "description": str(skill.get("description") or ""),
+            "cast_time": skill.get("castTime"),
+            "crit_chance": ref_lvl.get("critChance"),
+            "damage_effectiveness": ref_lvl.get("damageEffectiveness"),
+            "mana_multiplier": ref_lvl.get("manaMultiplier"),
+            "mana_cost": {lvl_k: lvl_v.get("cost") for lvl_k, lvl_v in levels_out.items() if lvl_v.get("cost")},
+            "quality_stats": quality_stats,
+            "constant_stats": constant_stats,
+            "levels": levels_out,
+            "secondary_skill_name": None,
+            "variants": [],
+        }
+        records.append(rec)
+        by_granted_id.setdefault(sk_id, []).append(rec)
         by_name_lower.setdefault(name.lower(), []).append(rec)
 
     by_sec_id: dict[str, list[dict[str, Any]]] = {}
@@ -1245,6 +1542,296 @@ def _parse_bases(poe1_dir: Path, zh: _ZhDictionary) -> list[dict[str, Any]]:
     return records
 
 
+def _extract_special_lua_blocks(special_dir: Path, data_dir: Path) -> list[tuple[str, str]]:
+    """Safely extract unique item text blocks from all ``Data/Uniques/Special/*.lua`` files.
+
+    Handles standard return-table files (``race.lua``), ``New.lua`` (``data.uniques.new``),
+    mod-pool tables (``WatchersEye.lua``, ``BoundByDestiny.lua``), and programmatic unique
+    generators in ``Generated.lua`` (Watcher's Eye, Sublime Vision, Vorana's March,
+    Bound by Destiny, Forbidden Flame/Flesh, Impossible Escape, Skin of the Lords,
+    The Balance of Terror, Precursor's Emblem, Megalomaniac, Forbidden Shako,
+    Replica Dragonfang's Flight, Pearl of Tsoatha, etc.).
+    """
+    if not special_dir.is_dir():
+        return []
+
+    out: list[tuple[str, str]] = []
+    watchers_eye_mods: list[str] = []
+    sublime_vision_mods: list[str] = []
+    voranas_march_mods: list[str] = []
+    bound_by_destiny_mods: list[str] = []
+
+    we_path = special_dir / "WatchersEye.lua"
+    if we_path.is_file():
+        parsed = _parse_lua_return(
+            we_path,
+            skip_keys=LUA_SKIP_KEYS_MOD,
+            prestrip_re=MOD_TRADEHASH_STRIP_RE,
+            prestrip_repl=" }",
+        )
+        if isinstance(parsed, dict):
+            for mod_id, entry in parsed.items():
+                if not isinstance(mod_id, str) or not isinstance(entry, dict):
+                    continue
+                stat_lines = [str(s).strip() for s in _as_seq(entry) if isinstance(s, str) and s.strip()]
+                if not stat_lines:
+                    continue
+                if mod_id.startswith("SublimeVision"):
+                    sublime_vision_mods.extend(stat_lines)
+                elif mod_id.startswith("SummonArbalist"):
+                    voranas_march_mods.extend(stat_lines)
+                else:
+                    watchers_eye_mods.extend(stat_lines)
+
+    bbd_path = special_dir / "BoundByDestiny.lua"
+    if bbd_path.is_file():
+        parsed = _parse_lua_return(
+            bbd_path,
+            skip_keys=LUA_SKIP_KEYS_MOD,
+            prestrip_re=MOD_TRADEHASH_STRIP_RE,
+            prestrip_repl=" }",
+        )
+        if isinstance(parsed, dict):
+            for entry in parsed.values():
+                if isinstance(entry, dict):
+                    stat_lines = [str(s).strip() for s in _as_seq(entry) if isinstance(s, str) and s.strip()]
+                    if stat_lines:
+                        bound_by_destiny_mods.append(" ".join(stat_lines))
+
+    gen_path = special_dir / "Generated.lua"
+    if gen_path.is_file():
+        gen_txt = gen_path.read_text(encoding="utf-8", errors="ignore")
+        tokens = _tokenize_lua(gen_txt)
+        parser = _LuaParser(tokens)
+        local_tables: dict[str, Any] = {}
+        local_inserts: dict[str, list[str]] = {}
+        generated_vars: list[str] = []
+
+        # Single linear scan over Generated.lua tokens to capture local tables & static inserts
+        while parser.pos < parser.n:
+            tok = parser.peek()
+            if tok == ("IDENT", "local"):
+                nxt = parser.peek(1)
+                eq = parser.peek(2)
+                brace = parser.peek(3)
+                if (
+                    nxt is not None
+                    and nxt[0] == "IDENT"
+                    and eq == ("OP", "=")
+                    and brace == ("OP", "{")
+                ):
+                    var_name = nxt[1]
+                    parser.pos += 3
+                    local_tables[var_name] = parser.parse_table()
+                    continue
+            if (
+                tok == ("IDENT", "table")
+                and parser.peek(1) == ("OP", ".")
+                and parser.peek(2) == ("IDENT", "insert")
+                and parser.peek(3) == ("OP", "(")
+            ):
+                parser.pos += 4
+                target_tok = parser.peek()
+                if target_tok is not None and target_tok[0] == "IDENT":
+                    target_var = target_tok[1]
+                    # Check table.insert(data.uniques.generated, table.concat(<var>, "\n"))
+                    if (
+                        target_var == "data"
+                        and parser.peek(1) == ("OP", ".")
+                        and parser.peek(2) == ("IDENT", "uniques")
+                        and parser.peek(3) == ("OP", ".")
+                        and parser.peek(4) == ("IDENT", "generated")
+                        and parser.peek(5) == ("OP", ",")
+                        and parser.peek(6) == ("IDENT", "table")
+                        and parser.peek(7) == ("OP", ".")
+                        and parser.peek(8) == ("IDENT", "concat")
+                        and parser.peek(9) == ("OP", "(")
+                    ):
+                        src_tok = parser.peek(10)
+                        if src_tok is not None and src_tok[0] == "IDENT" and src_tok[1] not in generated_vars:
+                            generated_vars.append(src_tok[1])
+                    elif parser.peek(1) == ("OP", ",") and parser.peek(2) is not None and parser.peek(2)[0] == "STR":
+                        # Only record direct literal string inserts (not loop concat expressions like "Variant: "..x)
+                        if parser.peek(3) == ("OP", ")"):
+                            val_str = parser.peek(2)[1]
+                            local_inserts.setdefault(target_var, []).append(val_str)
+                continue
+            parser.advance()
+
+        # Collect charge/curse mod dictionaries defined inside Generated.lua
+        charge_mod_lines: list[str] = []
+        for cname in ("enduranceChargeMods", "frenzyChargeMods", "powerChargeMods"):
+            tbl = local_tables.get(cname)
+            if isinstance(tbl, dict):
+                for tier_tbl in tbl.values():
+                    if isinstance(tier_tbl, dict):
+                        for v in tier_tbl.values():
+                            if isinstance(v, str) and v.strip():
+                                charge_mod_lines.append(v.strip())
+        balance_mod_lines: list[str] = []
+        bot_tbl = local_tables.get("balanceOfTerrorMods")
+        if isinstance(bot_tbl, dict):
+            for v in bot_tbl.values():
+                if isinstance(v, str) and v.strip():
+                    balance_mod_lines.append(v.strip())
+
+        extra_by_var: dict[str, list[str]] = {
+            "precursorsEmblem": charge_mod_lines,
+            "balanceOfTerror": balance_mod_lines,
+            "watchersEye": watchers_eye_mods,
+            "sublimeVision": sublime_vision_mods,
+            "voranasMarch": voranas_march_mods,
+            "boundByDestiny": bound_by_destiny_mods,
+            "megalomaniac": ["1 Added Passive Skill is <Cluster Notable>"],
+            "forbiddenShako": [
+                "Socketed Gems are Supported by Level (1-10) <Support Gem>",
+                "Socketed Gems are Supported by Level (25-35) <Support Gem>",
+            ],
+            "replicaForbiddenShako": [
+                "Socketed Gems are Supported by Level (1-10) <Support Gem>",
+                "Socketed Gems are Supported by Level (25-35) <Support Gem>",
+            ],
+            "skinOfTheLords": ["Allocates a random Keystone Passive Skill"],
+            "impossibleEscape": [
+                "Passive Skills in radius of <Keystone> can be allocated without being connected to your tree"
+            ],
+            "replicaDragonfangsFlight": ["+3 to Level of all <Active Skill> Gems"],
+            "pearl": [
+                "+(8-10)% to all Elemental Resistances",
+                "Socketed/Random Support Gem (Helmet / Gloves / Boots / Passive Tree)",
+            ],
+        }
+
+        # Preserve order of generated_vars, plus any known local unique tables
+        ordered_vars = list(generated_vars)
+        for known in (
+            "megalomaniac",
+            "forbiddenShako",
+            "replicaForbiddenShako",
+            "precursorsEmblem",
+            "balanceOfTerror",
+            "watchersEye",
+            "sublimeVision",
+            "voranasMarch",
+            "boundByDestiny",
+            "skinOfTheLords",
+            "impossibleEscape",
+            "replicaDragonfangsFlight",
+            "pearl",
+        ):
+            if known in local_tables and known not in ordered_vars:
+                ordered_vars.append(known)
+
+        for var_name in ordered_vars:
+            tbl = local_tables.get(var_name)
+            parts: list[str] = [str(x) for x in _as_seq(tbl) if isinstance(x, str) and x.strip()]
+            parts.extend(s for s in local_inserts.get(var_name, []) if s.strip())
+            parts.extend(extra_by_var.get(var_name, []))
+            if parts:
+                out.append((var_name, "\n".join(parts)))
+
+        # Synthesize Forbidden Flame & Forbidden Flesh from buildForbidden()
+        if "buildForbidden" in gen_txt:
+            out.append(
+                (
+                    "ForbiddenFlame",
+                    "\n".join(
+                        [
+                            "Rarity: UNIQUE",
+                            "Forbidden Flame",
+                            "Crimson Jewel",
+                            "Source: Drops from unique{The Searing Exarch}",
+                            "Limited to: 1",
+                            "Item Level: 83",
+                            "Implicits: 0",
+                            "Allocates <Ascendancy Notable> if you have the matching modifier on Forbidden Flesh",
+                            "Corrupted",
+                        ]
+                    ),
+                )
+            )
+            out.append(
+                (
+                    "ForbiddenFlesh",
+                    "\n".join(
+                        [
+                            "Rarity: UNIQUE",
+                            "Forbidden Flesh",
+                            "Cobalt Jewel",
+                            "Source: Drops from unique{The Eater of Worlds}",
+                            "Limited to: 1",
+                            "Item Level: 83",
+                            "Implicits: 0",
+                            "Allocates <Ascendancy Notable> if you have the matching modifier on Forbidden Flame",
+                            "Corrupted",
+                        ]
+                    ),
+                )
+            )
+    else:
+        # Even without Generated.lua (e.g. minimal/synthetic engine dir), synthesize Watcher's Eye /
+        # Bound by Destiny if their mod tables exist under Special/.
+        if watchers_eye_mods:
+            out.append(
+                (
+                    "WatchersEye",
+                    "\n".join(
+                        [
+                            "Watcher's Eye",
+                            "Prismatic Jewel",
+                            "Limited to: 1",
+                            "Implicits: 0",
+                            "(4-6)% increased maximum Energy Shield",
+                            "(4-6)% increased maximum Life",
+                            "(4-6)% increased maximum Mana",
+                            *watchers_eye_mods,
+                        ]
+                    ),
+                )
+            )
+        if bound_by_destiny_mods:
+            out.append(
+                (
+                    "BoundByDestiny",
+                    "\n".join(
+                        [
+                            "Bound by Destiny",
+                            "Prismatic Jewel",
+                            "Limited to: 1",
+                            "Implicits: 0",
+                            *bound_by_destiny_mods,
+                        ]
+                    ),
+                )
+            )
+
+    # Parse all other Special/*.lua files (race.lua, New.lua, or custom return-table special uniques)
+    handled_special = {"Generated.lua", "WatchersEye.lua", "BoundByDestiny.lua"}
+    for p in sorted(special_dir.glob("*.lua")):
+        if p.name in handled_special:
+            continue
+        blocks = _parse_lua_return(p)
+        seq = [b for b in _as_seq(blocks) if isinstance(b, str) and b.strip()]
+        if seq:
+            for b in seq:
+                out.append((p.stem, b))
+            continue
+        # Handle `data.uniques.new = { [[...]], ... }` style files such as New.lua
+        txt = p.read_text(encoding="utf-8", errors="ignore")
+        toks = _tokenize_lua(txt)
+        p_sub = _LuaParser(toks)
+        while p_sub.pos < p_sub.n:
+            if p_sub.peek() == ("OP", "{"):
+                tbl = p_sub.parse_table()
+                for b in _as_seq(tbl):
+                    if isinstance(b, str) and b.strip():
+                        out.append((p.stem, b))
+            else:
+                p_sub.advance()
+
+    return out
+
+
 def _parse_uniques(
     poe1_dir: Path,
     bases_by_name: dict[str, dict[str, Any]],
@@ -1279,130 +1866,141 @@ def _parse_uniques(
         except json.JSONDecodeError:
             pass
 
-    files = sorted(uniques_dir.glob("*.lua"))
-    race_path = uniques_dir / "Special" / "race.lua"
-    if race_path.is_file():
-        files.append(race_path)
+    raw_blocks: list[tuple[str, str]] = []
+    for p in sorted(uniques_dir.glob("*.lua")):
+        blocks = _parse_lua_return(p)
+        for block in _as_seq(blocks):
+            if isinstance(block, str):
+                raw_blocks.append((p.stem, block))
+
+    raw_blocks.extend(_extract_special_lua_blocks(uniques_dir / "Special", data_dir))
 
     records: list[dict[str, Any]] = []
     seen_names: set[str] = set()
 
-    for p in files:
-        fallback_slot = p.stem
-        blocks = _parse_lua_return(p)
-        for block in _as_seq(blocks):
-            if not isinstance(block, str):
-                continue
-            lines = [ln.strip() for ln in block.strip().splitlines() if ln.strip()]
-            if len(lines) < 2:
-                continue
-            name = lines[0]
-            if name in seen_names:
-                continue
-            seen_names.add(name)
-            base_type = lines[1]
+    for fallback_slot, block in raw_blocks:
+        lines = [ln.strip() for ln in block.strip().splitlines() if ln.strip()]
+        while lines and lines[0].startswith(("Item Class:", "Rarity:")):
+            lines = lines[1:]
+        if len(lines) < 2:
+            continue
+        name = lines[0]
+        if name in seen_names:
+            continue
+        seen_names.add(name)
+        base_type = MOD_TAG_PREFIX_RE.sub("", lines[1]).strip() or lines[1]
 
-            variants: list[str] = []
-            league: str | None = None
-            source: str | None = None
-            req_level: int | None = None
-            implicits_count = 0
-            idx = 2
+        variants: list[str] = []
+        league: str | None = None
+        source: str | None = None
+        req_level: int | None = None
+        implicits_count = 0
+        idx = 2
 
-            while idx < len(lines):
-                ln = lines[idx]
-                if ln.startswith("Implicits:"):
-                    try:
-                        implicits_count = int(ln.split(":", 1)[1].strip())
-                    except ValueError:
-                        implicits_count = 0
-                    idx += 1
-                    break
-                if ln.startswith("Variant:"):
-                    variants.append(ln.split(":", 1)[1].strip())
-                    idx += 1
-                    continue
-                if ln.startswith("League:"):
-                    league = ln.split(":", 1)[1].strip()
-                    idx += 1
-                    continue
-                if ln.startswith("Source:"):
-                    source = ln.split(":", 1)[1].strip()
-                    idx += 1
-                    continue
-                if ln.startswith("Requires Level ") or ln.startswith("LevelReq:"):
-                    m_lvl = re.search(r"(\d+)", ln)
-                    if m_lvl:
-                        req_level = int(m_lvl.group(1))
-                    idx += 1
-                    continue
-                if ":" in ln and not ln.startswith("{") and ln.split(":", 1)[0].strip() in UNIQUE_META_KEYS:
-                    idx += 1
-                    continue
-                # Some legacy uniques omit "Implicits:" line directly
+        while idx < len(lines):
+            ln = lines[idx]
+            if ln.startswith("Implicits:"):
+                try:
+                    implicits_count = int(ln.split(":", 1)[1].strip())
+                except ValueError:
+                    implicits_count = 0
+                idx += 1
                 break
+            if ln.startswith("Variant:"):
+                variants.append(ln.split(":", 1)[1].strip())
+                idx += 1
+                continue
+            if ln.startswith("League:"):
+                league = ln.split(":", 1)[1].strip()
+                idx += 1
+                continue
+            if ln.startswith("Source:"):
+                source = ln.split(":", 1)[1].strip()
+                idx += 1
+                continue
+            if ln.startswith("Requirements:"):
+                idx += 1
+                continue
+            if ln.startswith("Requires Level ") or ln.startswith("LevelReq:") or ln.startswith("Level:"):
+                m_lvl = re.search(r"(\d+)", ln)
+                if m_lvl:
+                    req_level = int(m_lvl.group(1))
+                idx += 1
+                continue
+            if ln.startswith("{variant:") and idx < 10 and MOD_TAG_PREFIX_RE.sub("", ln).strip() in bases_by_name:
+                # Alternate base-type lines (e.g. Precursor's Emblem {variant:2}Sapphire Ring)
+                idx += 1
+                continue
+            if ln in ("Shaper Item", "Elder Item", "Fractured Item", "Synthesised Item"):
+                idx += 1
+                continue
+            if ":" in ln and not ln.startswith("{") and ln.split(":", 1)[0].strip() in UNIQUE_META_KEYS:
+                idx += 1
+                continue
+            # Some legacy or generated uniques omit "Implicits:" line directly
+            break
 
-            implicits = lines[idx : idx + implicits_count] if implicits_count > 0 else []
-            explicits = lines[idx + implicits_count :]
+        implicits = lines[idx : idx + implicits_count] if implicits_count > 0 else []
+        explicits = lines[idx + implicits_count :]
 
-            implicits_zh = [zh.translate_stat_line(ln) for ln in implicits] if zh.available else []
-            explicits_zh = [zh.translate_stat_line(ln) for ln in explicits] if zh.available else []
+        implicits_zh = [zh.translate_stat_line(ln) for ln in implicits] if zh.available else []
+        explicits_zh = [zh.translate_stat_line(ln) for ln in explicits] if zh.available else []
 
-            base_info = bases_by_name.get(base_type)
-            item_class = base_info["type"] if base_info else fallback_slot
-            base_tags = base_info["tags"] if base_info else [fallback_slot]
+        base_info = bases_by_name.get(base_type)
+        item_class = base_info["type"] if base_info else fallback_slot
+        base_tags = base_info["tags"] if base_info else [fallback_slot]
 
-            foulborn_mods: list[dict[str, Any]] = []
-            seen_fb_lines: set[str] = set()
-            for orig_id, fb_id in foulborn_json_map.get(name, {}).items():
-                fb_mod = foulborn_mods_by_id.get(fb_id)
-                if fb_mod:
-                    for line in fb_mod["stats"]:
-                        seen_fb_lines.add(line)
-                    foulborn_mods.append(
-                        {
-                            "mod_id": fb_id,
-                            "replaces_mod_id": orig_id,
-                            "stats": fb_mod["stats"],
-                            "stats_zh": fb_mod["stats_zh"],
-                        }
-                    )
-            for fb_line in foulborn_lua_map.get(name, []):
-                if fb_line not in seen_fb_lines:
-                    foulborn_mods.append(
-                        {
-                            "mod_id": None,
-                            "replaces_mod_id": None,
-                            "stats": [fb_line],
-                            "stats_zh": [zh.translate_stat_line(fb_line)] if zh.available else [],
-                        }
-                    )
+        foulborn_mods: list[dict[str, Any]] = []
+        seen_fb_lines: set[str] = set()
+        for orig_id, fb_id in foulborn_json_map.get(name, {}).items():
+            fb_mod = foulborn_mods_by_id.get(fb_id)
+            if fb_mod:
+                for line in fb_mod["stats"]:
+                    seen_fb_lines.add(line)
+                foulborn_mods.append(
+                    {
+                        "mod_id": fb_id,
+                        "replaces_mod_id": orig_id,
+                        "stats": fb_mod["stats"],
+                        "stats_zh": fb_mod["stats_zh"],
+                    }
+                )
+        for fb_line in foulborn_lua_map.get(name, []):
+            if fb_line not in seen_fb_lines:
+                foulborn_mods.append(
+                    {
+                        "mod_id": None,
+                        "replaces_mod_id": None,
+                        "stats": [fb_line],
+                        "stats_zh": [zh.translate_stat_line(fb_line)] if zh.available else [],
+                    }
+                )
 
-            zh_name = zh.translate_unique(name)
-            foulborn_en = f"Foulborn {name}"
-            zh_foulborn = zh.translate_unique(foulborn_en)
+        zh_name = zh.translate_unique(name)
+        foulborn_en = f"Foulborn {name}"
+        zh_foulborn = zh.translate_unique(foulborn_en)
 
-            records.append(
-                {
-                    "name": name,
-                    "zh_name": zh_name,
-                    "foulborn_name": foulborn_en if (foulborn_mods or zh_foulborn) else None,
-                    "zh_foulborn_name": zh_foulborn,
-                    "base_type": base_type,
-                    "base_type_zh": zh.translate_base(base_type),
-                    "item_class": item_class,
-                    "tags": base_tags,
-                    "req_level": req_level,
-                    "league": league,
-                    "source": source,
-                    "variants": variants,
-                    "implicits": implicits,
-                    "implicits_zh": implicits_zh,
-                    "explicits": explicits,
-                    "explicits_zh": explicits_zh,
-                    "foulborn_mods": foulborn_mods,
-                }
-            )
+        records.append(
+            {
+                "name": name,
+                "zh_name": zh_name,
+                "foulborn_name": foulborn_en if (foulborn_mods or zh_foulborn) else None,
+                "zh_foulborn_name": zh_foulborn,
+                "base_type": base_type,
+                "base_type_zh": zh.translate_base(base_type),
+                "item_class": item_class,
+                "tags": base_tags,
+                "req_level": req_level,
+                "league": league,
+                "source": source,
+                "variants": variants,
+                "implicits": implicits,
+                "implicits_zh": implicits_zh,
+                "explicits": explicits,
+                "explicits_zh": explicits_zh,
+                "foulborn_mods": foulborn_mods,
+            }
+        )
     return records
 
 
@@ -1521,6 +2119,7 @@ def _create_schema(conn: sqlite3.Connection) -> None:
             is_vaal INTEGER NOT NULL,
             is_transfigured INTEGER NOT NULL,
             is_imbued INTEGER NOT NULL,
+            is_item_skill INTEGER NOT NULL DEFAULT 0,
             color TEXT,
             tag_string TEXT,
             search_text_lower TEXT NOT NULL,
@@ -1613,7 +2212,7 @@ def _is_index_valid(db_path: Path, pob_version: str, data_version: str) -> bool:
     if not db_path.is_file():
         return False
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn = sqlite3.connect(_sqlite_ro_uri(db_path), uri=True)
         try:
             rows = dict(conn.execute("SELECT key, value FROM meta").fetchall())
             return (
@@ -1627,40 +2226,149 @@ def _is_index_valid(db_path: Path, pob_version: str, data_version: str) -> bool:
         return False
 
 
-def ensure_gamedata_index(
+def _is_build_lock_stale(lock_path: Path, *, stale_sec: float = 60.0) -> bool:
+    try:
+        st = lock_path.stat()
+    except OSError:
+        return False
+    # Reclaim any lockfile (including same-PID leaked locks) older than stale_sec.
+    if (time.time() - st.st_mtime) > stale_sec:
+        return True
+    try:
+        payload = json.loads(lock_path.read_text(encoding="utf-8"))
+        if isinstance(payload, dict):
+            ts = payload.get("ts")
+            if isinstance(ts, (int, float)) and (time.time() - float(ts)) > stale_sec:
+                return True
+            pid = int(payload.get("pid") or 0)
+            if pid > 0 and pid != os.getpid() and not _is_pid_alive(pid):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _try_break_stale_lock(lock_path: Path) -> bool:
+    """Atomically claim a stale lockfile via rename before unlinking so peers never delete a fresh lock."""
+    trash = lock_path.parent / f".{lock_path.name}.stale.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex[:8]}"
+    try:
+        os.replace(lock_path, trash)
+    except OSError:
+        return False
+    try:
+        trash.unlink(missing_ok=True)
+    except OSError:
+        pass
+    return True
+
+
+def _release_build_lock(lock_path: Path, owner_token: str) -> None:
+    """Unlink ``lock_path`` only if its stored owner token still matches ``owner_token``."""
+    try:
+        payload = json.loads(lock_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if not isinstance(payload, dict) or payload.get("token") != owner_token:
+        return
+    try:
+        lock_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _acquire_build_lock(
+    lock_path: Path,
+    db_path: Path,
+    pob_version: str,
+    data_version: str,
     *,
-    pob_dir: Path | None = None,
-    runtime_dir: Path | None = None,
     force_rebuild: bool = False,
-) -> Path:
-    """Build (if missing/stale) and return path to the versioned SQLite game data index."""
-    rt_dir = resolve_runtime_dir(runtime_dir)
-    resolved_pob = resolve_pob_dir(pob_dir, rt_dir)
-    poe1_dir, zh_dir = _resolve_poe1_data_dirs(resolved_pob)
-    pob_version, data_version = detect_versions(poe1_dir, zh_dir)
+    timeout_sec: float = 45.0,
+    stale_sec: float = 60.0,
+) -> str | None:
+    """Acquire atomic cross-process lockfile; returns owner token if acquired, None if DB became valid while waiting."""
+    deadline = time.monotonic() + max(0.05, float(timeout_sec))
+    deadline_break_attempted = False
+    stale_breaks = 0
+    while True:
+        token = f"{os.getpid()}:{threading.get_ident()}:{uuid.uuid4().hex}"
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                os.write(
+                    fd,
+                    json.dumps(
+                        {
+                            "pid": os.getpid(),
+                            "tid": threading.get_ident(),
+                            "token": token,
+                            "ts": time.time(),
+                        }
+                    ).encode("utf-8"),
+                )
+            except BaseException:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                try:
+                    lock_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise
+            else:
+                try:
+                    os.close(fd)
+                except BaseException:
+                    try:
+                        lock_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    raise
+            return token
+        except FileExistsError:
+            if not force_rebuild and _is_index_valid(db_path, pob_version, data_version):
+                return None
+            now_mono = time.monotonic()
+            if _is_build_lock_stale(lock_path, stale_sec=stale_sec):
+                if _try_break_stale_lock(lock_path):
+                    stale_breaks += 1
+                    if now_mono < deadline:
+                        if stale_breaks > 1:
+                            time.sleep(0.05)
+                        continue
+                    if not deadline_break_attempted:
+                        deadline_break_attempted = True
+                        continue
+                    raise TimeoutError(f"Timed out acquiring game data build lock: {lock_path}")
+                if now_mono >= deadline:
+                    raise TimeoutError(f"Timed out breaking stale game data build lock: {lock_path}")
+                time.sleep(0.05)
+                continue
+            if now_mono >= deadline:
+                if not deadline_break_attempted:
+                    deadline_break_attempted = True
+                    if _try_break_stale_lock(lock_path):
+                        continue
+                raise TimeoutError(f"Timed out waiting for game data build lock: {lock_path}")
+            time.sleep(0.05)
+        except OSError as exc:
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"Failed to acquire game data build lock {lock_path}: {exc}") from exc
+            time.sleep(0.05)
 
-    cache_dir = rt_dir / "cache"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    db_path = cache_dir / f"gamedata_{pob_version}_{data_version}.sqlite"
 
-    cache_key = (str(db_path), pob_version, data_version)
-    if not force_rebuild:
-        if cache_key in _VALID_INDEX_CACHE and db_path.is_file():
-            return db_path
-        if _is_index_valid(db_path, pob_version, data_version):
-            _VALID_INDEX_CACHE.add(cache_key)
-            return db_path
-    else:
-        _VALID_INDEX_CACHE.discard(cache_key)
-
-    zh = _ZhDictionary.load(zh_dir)
-    gems = _parse_gems_and_skills(poe1_dir, zh)
-    bases = _parse_bases(poe1_dir, zh)
-    bases_by_name = {b["name"]: b for b in bases}
-    mods, foulborn_by_id = _parse_mods(poe1_dir, zh)
-    uniques = _parse_uniques(poe1_dir, bases_by_name, foulborn_by_id, zh)
-
-    tmp_path = cache_dir / f".gamedata_{os.getpid()}_{time.time_ns()}.sqlite.tmp"
+def _write_gamedata_sqlite(
+    tmp_path: Path,
+    *,
+    pob_version: str,
+    data_version: str,
+    zh: _ZhDictionary,
+    gems: list[dict[str, Any]],
+    bases: list[dict[str, Any]],
+    uniques: list[dict[str, Any]],
+    mods: list[dict[str, Any]],
+) -> None:
     if tmp_path.exists():
         tmp_path.unlink()
 
@@ -1691,23 +2399,34 @@ def ensure_gamedata_index(
         # Gems
         gem_rows = []
         for g in gems:
-            s_txt = " ".join(
-                p for p in (g["name"], g["display_name"], g["zh_name"] or "", g["tag_string"], g["granted_effect_id"]) if p
-            ).lower()
+            s_txt = _fold_search_text(
+                " ".join(
+                    p
+                    for p in (
+                        g["name"],
+                        g["display_name"],
+                        g["zh_name"] or "",
+                        g["tag_string"],
+                        g["granted_effect_id"],
+                    )
+                    if p
+                )
+            )
             gem_rows.append(
                 (
                     g["id"],
                     g["name"],
-                    g["name"].lower(),
-                    g["display_name"].lower(),
+                    _fold_search_text(g["name"]),
+                    _fold_search_text(g["display_name"]),
                     g["zh_name"],
-                    g["zh_name"].lower() if g["zh_name"] else None,
+                    _fold_search_text(g["zh_name"]) if g["zh_name"] else None,
                     g["game_id"],
                     g["variant_id"],
                     int(g["is_support"]),
                     int(g["is_vaal"]),
                     int(g["is_transfigured"]),
                     int(g["is_imbued"]),
+                    int(bool(g.get("is_item_skill"))),
                     g["color"],
                     g["tag_string"],
                     s_txt,
@@ -1715,7 +2434,7 @@ def ensure_gamedata_index(
                 )
             )
         conn.executemany(
-            "INSERT INTO gems VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO gems VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             gem_rows,
         )
         conn.execute("INSERT INTO gems_fts(gems_fts) VALUES('rebuild')")
@@ -1723,25 +2442,29 @@ def ensure_gamedata_index(
         # Bases
         base_rows = []
         for b in bases:
-            slots_l = " ".join([b["type"].lower(), (b["sub_type"] or "").lower(), *(t.lower() for t in b["tags"])])
-            s_txt = " ".join(
-                p
-                for p in (
-                    b["name"],
-                    b["zh_name"] or "",
-                    b["type"],
-                    b["sub_type"] or "",
-                    " ".join(b["implicits"]),
-                    " ".join(x for x in b["implicits_zh"] if x),
+            slots_l = _fold_search_text(
+                " ".join([b["type"], b["sub_type"] or "", *b["tags"]])
+            )
+            s_txt = _fold_search_text(
+                " ".join(
+                    p
+                    for p in (
+                        b["name"],
+                        b["zh_name"] or "",
+                        b["type"],
+                        b["sub_type"] or "",
+                        " ".join(b["implicits"]),
+                        " ".join(x for x in b["implicits_zh"] if x),
+                    )
+                    if p
                 )
-                if p
-            ).lower()
+            )
             base_rows.append(
                 (
                     b["name"],
-                    b["name"].lower(),
+                    _fold_search_text(b["name"]),
                     b["zh_name"],
-                    b["zh_name"].lower() if b["zh_name"] else None,
+                    _fold_search_text(b["zh_name"]) if b["zh_name"] else None,
                     b["type"],
                     b["sub_type"],
                     b["req"]["level"],
@@ -1757,35 +2480,37 @@ def ensure_gamedata_index(
         # Uniques
         unique_rows = []
         for u in uniques:
-            slots_l = " ".join([u["item_class"].lower(), *(t.lower() for t in u["tags"])])
+            slots_l = _fold_search_text(" ".join([u["item_class"], *u["tags"]]))
             fb_lines = " ".join(
                 " ".join(fm["stats"]) + " " + " ".join(x for x in fm["stats_zh"] if x) for fm in u["foulborn_mods"]
             )
-            s_txt = " ".join(
-                p
-                for p in (
-                    u["name"],
-                    u["zh_name"] or "",
-                    u["foulborn_name"] or "",
-                    u["zh_foulborn_name"] or "",
-                    u["base_type"],
-                    u["base_type_zh"] or "",
-                    " ".join(u["implicits"]),
-                    " ".join(u["explicits"]),
-                    " ".join(x for x in u["implicits_zh"] if x),
-                    " ".join(x for x in u["explicits_zh"] if x),
-                    fb_lines,
+            s_txt = _fold_search_text(
+                " ".join(
+                    p
+                    for p in (
+                        u["name"],
+                        u["zh_name"] or "",
+                        u["foulborn_name"] or "",
+                        u["zh_foulborn_name"] or "",
+                        u["base_type"],
+                        u["base_type_zh"] or "",
+                        " ".join(u["implicits"]),
+                        " ".join(u["explicits"]),
+                        " ".join(x for x in u["implicits_zh"] if x),
+                        " ".join(x for x in u["explicits_zh"] if x),
+                        fb_lines,
+                    )
+                    if p
                 )
-                if p
-            ).lower()
+            )
             unique_rows.append(
                 (
                     u["name"],
-                    u["name"].lower(),
+                    _fold_search_text(u["name"]),
                     u["zh_name"],
-                    u["zh_name"].lower() if u["zh_name"] else None,
-                    u["foulborn_name"].lower() if u["foulborn_name"] else None,
-                    u["zh_foulborn_name"].lower() if u["zh_foulborn_name"] else None,
+                    _fold_search_text(u["zh_name"]) if u["zh_name"] else None,
+                    _fold_search_text(u["foulborn_name"]) if u["foulborn_name"] else None,
+                    _fold_search_text(u["zh_foulborn_name"]) if u["zh_foulborn_name"] else None,
                     u["base_type"],
                     u["item_class"],
                     slots_l,
@@ -1800,9 +2525,9 @@ def ensure_gamedata_index(
         # Mods
         mod_rows = []
         for m in mods:
-            en_stats = "\n".join(m["stats"]).lower()
-            zh_stats = "\n".join(x for x in m["stats_zh"] if x).lower()
-            search_en = " ".join([m["id"], m["affix"], m["group"], en_stats]).lower()
+            en_stats = _fold_search_text("\n".join(m["stats"]))
+            zh_stats = _fold_search_text("\n".join(x for x in m["stats_zh"] if x))
+            search_en = _fold_search_text(" ".join([m["id"], m["affix"], m["group"]])) + " " + en_stats
             search_zh = zh_stats
             fts_txt = f"{search_en} {search_zh}".strip()
             mod_rows.append(
@@ -1811,9 +2536,9 @@ def ensure_gamedata_index(
                     m["source"],
                     m["generation_type"],
                     m["group"],
-                    m["group"].lower(),
+                    _fold_search_text(m["group"]),
                     m["affix"],
-                    m["affix"].lower(),
+                    _fold_search_text(m["affix"]),
                     m["level"],
                     en_stats,
                     zh_stats,
@@ -1829,26 +2554,37 @@ def ensure_gamedata_index(
         conn.executemany("INSERT INTO mods VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", mod_rows)
         conn.execute("INSERT INTO mods_fts(mods_fts) VALUES('rebuild')")
 
-        # Translations (merge ZH dictionaries + parsed entities, deduplicating identical (en_lower, zh))
+        # Translations (merge ZH dictionaries + parsed entities + community aliases)
         tr_best: dict[tuple[str, str], tuple[str, str, str, str, str, int]] = {}
 
         def _add_tr(en_s: str, zh_s: str, cat_s: str, rank_i: int) -> None:
-            k = (en_s.lower(), zh_s)
+            en_folded = _fold_search_text(en_s)
+            zh_folded = _fold_search_text(zh_s)
+            k = (en_folded, zh_s)
             prev = tr_best.get(k)
             if prev is None or rank_i < prev[5]:
-                tr_best[k] = (en_s, k[0], zh_s, zh_s.lower(), cat_s, rank_i)
+                tr_best[k] = (en_s, en_folded, zh_s, zh_folded, cat_s, rank_i)
 
         for en, zh_str, cat, rank in zh.all_entries:
             _add_tr(en, zh_str, cat, rank)
         for g in gems:
             if g["zh_name"]:
                 _add_tr(g["name"], g["zh_name"], "gem", 1)
+            for alias_zh in zh.aliases.get(g["name"].lower(), ()):
+                _add_tr(g["name"], alias_zh, "gem", 2)
         for u in uniques:
             if u["zh_name"]:
                 _add_tr(u["name"], u["zh_name"], "unique", 1)
+            for alias_zh in zh.aliases.get(u["name"].lower(), ()):
+                _add_tr(u["name"], alias_zh, "unique", 2)
         for b in bases:
             if b["zh_name"]:
                 _add_tr(b["name"], b["zh_name"], "base", 1)
+            for alias_zh in zh.aliases.get(b["name"].lower(), ()):
+                _add_tr(b["name"], alias_zh, "base", 2)
+        for p_en in zh.passives:
+            for alias_zh in zh.aliases.get(p_en.lower(), ()):
+                _add_tr(p_en, alias_zh, "passive", 2)
 
         conn.executemany(
             "INSERT INTO translations (en, en_lower, zh, zh_lower, category, cat_rank) VALUES (?,?,?,?,?,?)",
@@ -1863,9 +2599,104 @@ def ensure_gamedata_index(
     finally:
         conn.close()
 
-    os.replace(tmp_path, db_path)
-    _VALID_INDEX_CACHE.add(cache_key)
-    return db_path
+
+def ensure_gamedata_index(
+    *,
+    pob_dir: Path | None = None,
+    runtime_dir: Path | None = None,
+    force_rebuild: bool = False,
+) -> Path:
+    """Build (if missing/stale) and return path to the versioned SQLite game data index."""
+    rt_dir = resolve_runtime_dir(runtime_dir)
+    resolved_pob = resolve_pob_dir(pob_dir, rt_dir)
+    poe1_dir, zh_dir = _resolve_poe1_data_dirs(resolved_pob)
+    pob_version, data_version = detect_versions(poe1_dir, zh_dir)
+
+    cache_dir = _shared_cache_dir(runtime_dir, pob_root=resolved_pob)
+    db_path = cache_dir / f"gamedata_{pob_version}_{data_version}.sqlite"
+
+    cache_key = (str(db_path), pob_version, data_version)
+    if not force_rebuild:
+        if cache_key in _VALID_INDEX_CACHE and db_path.is_file():
+            return db_path
+        if _is_index_valid(db_path, pob_version, data_version):
+            _VALID_INDEX_CACHE.add(cache_key)
+            return db_path
+    else:
+        _VALID_INDEX_CACHE.discard(cache_key)
+
+    lock_path = Path(f"{db_path}.build.lock")
+    with _INDEX_BUILD_LOCK:
+        if not force_rebuild and _is_index_valid(db_path, pob_version, data_version):
+            _VALID_INDEX_CACHE.add(cache_key)
+            return db_path
+
+        lock_token = _acquire_build_lock(
+            lock_path,
+            db_path,
+            pob_version,
+            data_version,
+            force_rebuild=force_rebuild,
+        )
+        if not lock_token:
+            _VALID_INDEX_CACHE.add(cache_key)
+            return db_path
+
+        tmp_path = cache_dir / f".gamedata_{os.getpid()}_{threading.get_ident()}_{time.time_ns()}.sqlite.tmp"
+        try:
+            # Re-check after acquiring cross-process lock in case another worker just finished
+            if not force_rebuild and _is_index_valid(db_path, pob_version, data_version):
+                _VALID_INDEX_CACHE.add(cache_key)
+                return db_path
+
+            zh = _ZhDictionary.load(zh_dir)
+            gems = _parse_gems_and_skills(poe1_dir, zh)
+            bases = _parse_bases(poe1_dir, zh)
+            bases_by_name = {b["name"]: b for b in bases}
+            mods, foulborn_by_id = _parse_mods(poe1_dir, zh)
+            uniques = _parse_uniques(poe1_dir, bases_by_name, foulborn_by_id, zh)
+
+            _write_gamedata_sqlite(
+                tmp_path,
+                pob_version=pob_version,
+                data_version=data_version,
+                zh=zh,
+                gems=gems,
+                bases=bases,
+                uniques=uniques,
+                mods=mods,
+            )
+
+            replaced = False
+            last_perm_err: PermissionError | None = None
+            for attempt in range(4):
+                try:
+                    os.replace(tmp_path, db_path)
+                    replaced = True
+                    break
+                except PermissionError as exc:
+                    last_perm_err = exc
+                    if not force_rebuild and _is_index_valid(db_path, pob_version, data_version):
+                        replaced = True
+                        break
+                    if attempt < 3:
+                        time.sleep(0.05)
+
+            if not replaced:
+                if not force_rebuild and _is_index_valid(db_path, pob_version, data_version):
+                    replaced = True
+                elif last_perm_err is not None:
+                    raise last_perm_err
+
+            _VALID_INDEX_CACHE.add(cache_key)
+            return db_path
+        finally:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            if lock_token:
+                _release_build_lock(lock_path, lock_token)
 
 
 def _fts_phrase(token: str) -> str:
@@ -1923,14 +2754,15 @@ def _mod_matches_slot(
 
 def _query_gems(conn: sqlite3.Connection, q_lower: str, limit: int) -> list[dict[str, Any]]:
     if not q_lower:
-        rows = conn.execute("SELECT data_json FROM gems ORDER BY name LIMIT ?", (limit,)).fetchall()
+        rows = conn.execute("SELECT data_json FROM gems ORDER BY is_item_skill, name LIMIT ?", (limit,)).fetchall()
         return [json.loads(r[0]) for r in rows]
 
     fts_expr, tokens = _build_fts_match(q_lower)
     if fts_expr:
         rows = conn.execute(
             """
-            SELECT g.name_lower, g.display_name_lower, g.zh_lower, g.is_vaal, g.is_transfigured, g.data_json
+            SELECT g.name_lower, g.display_name_lower, g.zh_lower, g.is_item_skill,
+                   g.is_vaal, g.is_transfigured, g.search_text_lower, g.data_json
             FROM gems_fts f
             JOIN gems g ON g.rowid = f.rowid
             WHERE gems_fts MATCH ?
@@ -1941,7 +2773,8 @@ def _query_gems(conn: sqlite3.Connection, q_lower: str, limit: int) -> list[dict
     else:
         rows = conn.execute(
             """
-            SELECT name_lower, display_name_lower, zh_lower, is_vaal, is_transfigured, data_json
+            SELECT name_lower, display_name_lower, zh_lower, is_item_skill,
+                   is_vaal, is_transfigured, search_text_lower, data_json
             FROM gems
             WHERE instr(search_text_lower, ?) > 0
             LIMIT 250
@@ -1949,12 +2782,10 @@ def _query_gems(conn: sqlite3.Connection, q_lower: str, limit: int) -> list[dict
             (q_lower,),
         ).fetchall()
 
-    scored: list[tuple[tuple[int, int, int, str], str]] = []
-    for name_l, disp_l, zh_l, is_vaal, is_trans, data_json in rows:
+    scored: list[tuple[tuple[int, int, int, int, str], str]] = []
+    for name_l, disp_l, zh_l, is_item_skill, is_vaal, is_trans, search_l, data_json in rows:
         zh_l = zh_l or ""
-        if tokens and not all(
-            t in name_l or t in disp_l or t in zh_l or t in data_json.lower() for t in tokens
-        ):
+        if tokens and not all(t in search_l for t in tokens):
             continue
         if q_lower == name_l or q_lower == disp_l or (zh_l and q_lower == zh_l):
             tier = 0
@@ -1964,7 +2795,7 @@ def _query_gems(conn: sqlite3.Connection, q_lower: str, limit: int) -> list[dict
             tier = 2
         else:
             tier = 3
-        scored.append(((tier, is_vaal + is_trans, len(name_l), name_l), data_json))
+        scored.append(((tier, int(is_item_skill), is_vaal + is_trans, len(name_l), name_l), data_json))
 
     scored.sort(key=lambda item: item[0])
     return [json.loads(item[1]) for item in scored[:limit]]
@@ -2192,11 +3023,11 @@ def _query_translate(conn: sqlite3.Connection, q_lower: str, limit: int, zh_avai
         # Graceful fallback when Data/poe1/zh-rCN is absent
         results: list[dict[str, Any]] = []
         for tbl, cat in (("gems", "gem"), ("uniques", "unique"), ("bases", "base")):
-            for (name,) in conn.execute(
-                f"SELECT name FROM {tbl} WHERE instr(name_lower, ?) > 0 ORDER BY length(name) LIMIT ?",
+            for name, name_l in conn.execute(
+                f"SELECT name, name_lower FROM {tbl} WHERE instr(name_lower, ?) > 0 ORDER BY length(name) LIMIT ?",
                 (q_lower, limit),
             ).fetchall():
-                match_type = "exact" if name.lower() == q_lower else ("prefix" if name.lower().startswith(q_lower) else "substring")
+                match_type = "exact" if name_l == q_lower else ("prefix" if name_l.startswith(q_lower) else "substring")
                 results.append({"en": name, "zh": None, "category": cat, "match_type": match_type})
         results.sort(key=lambda r: (0 if r["match_type"] == "exact" else (1 if r["match_type"] == "prefix" else 2), len(r["en"])))
         return results[:limit]
@@ -2301,17 +3132,204 @@ def _query_translate(conn: sqlite3.Connection, q_lower: str, limit: int, zh_avai
             )
         )
 
+    # 3. Folded substring fallback across indexed uniques/gems/bases/mods when translations had 0 hits
+    if not scored:
+        for tbl, cat, rank in (("uniques", "unique", 1), ("gems", "gem", 1), ("bases", "base", 1)):
+            for name, name_l, zh_val, zh_l in conn.execute(
+                f"""
+                SELECT name, name_lower, zh_name, zh_lower
+                FROM {tbl}
+                WHERE instr(name_lower, ?) > 0 OR (zh_lower IS NOT NULL AND instr(zh_lower, ?) > 0)
+                LIMIT 50
+                """,
+                (q_lower, q_lower),
+            ).fetchall():
+                zh_l_s = zh_l or ""
+                if name_l == q_lower or (zh_l_s and zh_l_s == q_lower):
+                    tier, mtype = 0, "exact"
+                elif name_l.startswith(q_lower) or (zh_l_s and zh_l_s.startswith(q_lower)):
+                    tier, mtype = 1, "prefix"
+                else:
+                    tier, mtype = 2, "substring"
+                scored.append(
+                    (
+                        (tier, rank, len(name_l), name_l),
+                        {"en": name, "zh": zh_val, "category": cat, "match_type": mtype},
+                    )
+                )
+        if not scored:
+            fts_expr, _ = _build_fts_match(q_lower)
+            if fts_expr:
+                mod_rows = conn.execute(
+                    """
+                    SELECT m.data_json
+                    FROM mods_fts f
+                    JOIN mods m ON m.rowid = f.rowid
+                    WHERE mods_fts MATCH ?
+                    LIMIT 30
+                    """,
+                    (fts_expr,),
+                ).fetchall()
+            else:
+                mod_rows = conn.execute(
+                    """
+                    SELECT data_json
+                    FROM mods
+                    WHERE instr(stats_en_lower, ?) > 0 OR instr(stats_zh_lower, ?) > 0
+                    LIMIT 30
+                    """,
+                    (q_lower, q_lower),
+                ).fetchall()
+            for (data_json,) in mod_rows:
+                m_obj = json.loads(data_json)
+                en_stat = (m_obj.get("stats") or [""])[0]
+                zh_stat = next((s for s in (m_obj.get("stats_zh") or []) if s), None)
+                if en_stat and zh_stat:
+                    scored.append(
+                        (
+                            (2, 3, len(en_stat), _fold_search_text(en_stat)),
+                            {"en": en_stat, "zh": zh_stat, "category": "mod", "match_type": "substring"},
+                        )
+                    )
+
+    # 4. Partial CJK fallback (particle-stripped + high-overlap short-entity bigram/char match)
+    #    when Steps 1-3 had 0 hits, so partial CN queries like "象牙塔" (-> "象牙之塔") or
+    #    "寒冰法师" (-> "寒霜法师") return relevant core entities without lore pollution.
+    if not scored and _CJK_RE.search(q_lower):
+        q_cjk = _CJK_PARTICLE_RE.sub("", q_lower)
+        cjk_chars = [ch for ch in q_cjk if _CJK_RE.match(ch)]
+        if len(cjk_chars) >= 2:
+            # 4a. Particle-stripped match (e.g. "象牙塔" matches "象牙之塔")
+            p_rows = conn.execute(
+                """
+                SELECT en, en_lower, zh, zh_lower, category, cat_rank
+                FROM translations
+                WHERE cat_rank <= 2
+                  AND instr(
+                        replace(
+                          replace(
+                            replace(
+                              replace(
+                                replace(
+                                  replace(zh_lower, '之', ''),
+                                '的', ''),
+                              '・', ''),
+                            '·', ''),
+                          '．', ''),
+                        ' ', ''),
+                        ?
+                      ) > 0
+                LIMIT 80
+                """,
+                (q_cjk,),
+            ).fetchall()
+            for en, en_l, zh, zh_l, cat, cat_rank in p_rows:
+                zh_stripped = _CJK_PARTICLE_RE.sub("", zh_l)
+                tier = 1 if zh_stripped == q_cjk else 2
+                mtype = "substring" if zh_stripped == q_cjk else "partial"
+                scored.append(
+                    (
+                        (tier, cat_rank, len(zh_l), en_l),
+                        {"en": en, "zh": zh, "category": cat, "match_type": mtype},
+                    )
+                )
+
+            # Skip 4b/4c when 4a already matched, or when query is too long for fuzzy short-entity lookup
+            max_target_len = max(len(q_cjk) * 3, 12)
+            q_char_set = set(cjk_chars)
+            min_char_hits = max(2, int(-(-len(q_char_set) * 3 // 4)))  # ceil(0.75 * len)
+
+            # 4b. CJK 2-char bigram overlap across core entities (strict >=75% char coverage & short targets)
+            if not scored and len(q_cjk) <= 6:
+                bigrams = list(dict.fromkeys(q_cjk[i : i + 2] for i in range(len(q_cjk) - 1)))
+                bg_where = " OR ".join("instr(zh_lower, ?) > 0" for _ in bigrams)
+                bg_rows = conn.execute(
+                    f"""
+                    SELECT en, en_lower, zh, zh_lower, category, cat_rank
+                    FROM translations
+                    WHERE cat_rank <= 2 AND ({bg_where})
+                    ORDER BY length(zh_lower) ASC
+                    LIMIT 400
+                    """,
+                    bigrams,
+                ).fetchall()
+                for en, en_l, zh, zh_l, cat, cat_rank in bg_rows:
+                    if len(_CJK_PARTICLE_RE.sub("", zh_l)) > max_target_len:
+                        continue
+                    ch_hits = sum(1 for ch in q_char_set if ch in zh_l)
+                    if ch_hits < min_char_hits or (ch_hits / len(q_char_set)) < 0.75:
+                        continue
+                    bg_hits = sum(1 for bg in bigrams if bg in zh_l)
+                    rank_tier = 30 - min(bg_hits, 9) * 3 - min(ch_hits, 9)
+                    scored.append(
+                        (
+                            (rank_tier, cat_rank, len(zh_l), en_l),
+                            {"en": en, "zh": zh, "category": cat, "match_type": "partial"},
+                        )
+                    )
+
+            # 4c. Character overlap fallback if still empty (strict >=75% char coverage & short targets)
+            if not scored and len(q_cjk) <= 6:
+                uniq_chars = list(dict.fromkeys(cjk_chars))
+                ch_where = " OR ".join("instr(zh_lower, ?) > 0" for _ in uniq_chars)
+                ch_rows = conn.execute(
+                    f"""
+                    SELECT en, en_lower, zh, zh_lower, category, cat_rank
+                    FROM translations
+                    WHERE cat_rank <= 2 AND ({ch_where})
+                    ORDER BY length(zh_lower) ASC
+                    LIMIT 400
+                    """,
+                    uniq_chars,
+                ).fetchall()
+                for en, en_l, zh, zh_l, cat, cat_rank in ch_rows:
+                    if len(_CJK_PARTICLE_RE.sub("", zh_l)) > max_target_len:
+                        continue
+                    ch_hits = sum(1 for ch in q_char_set if ch in zh_l)
+                    if ch_hits < min_char_hits or (ch_hits / len(q_char_set)) < 0.75:
+                        continue
+                    rank_tier = 50 - min(ch_hits, 9) * 5
+                    scored.append(
+                        (
+                            (rank_tier, cat_rank, len(zh_l), en_l),
+                            {"en": en, "zh": zh, "category": cat, "match_type": "partial"},
+                        )
+                    )
+
     scored.sort(key=lambda item: item[0])
     dedup_out: list[dict[str, Any]] = []
-    seen_out: set[tuple[str, str]] = set()
+    seen_out: set[tuple[str, str | None]] = set()
     for _, item in scored:
-        key = (item["en"].lower(), item["zh"])
+        key = (_fold_search_text(item["en"]), item["zh"])
         if key not in seen_out:
             seen_out.add(key)
             dedup_out.append(item)
             if len(dedup_out) >= limit:
                 break
     return dedup_out
+
+
+def _dispatch_query(
+    conn: sqlite3.Connection,
+    kind_norm: str,
+    q_folded: str,
+    *,
+    slot: str | None,
+    ilvl: int | None,
+    limit: int,
+    zh_available: bool,
+) -> list[dict[str, Any]]:
+    if limit == 0:
+        return []
+    if kind_norm == "gem":
+        return _query_gems(conn, q_folded, limit)
+    if kind_norm == "unique":
+        return _query_uniques(conn, q_folded, slot, ilvl, limit)
+    if kind_norm == "base":
+        return _query_bases(conn, q_folded, slot, ilvl, limit)
+    if kind_norm == "mod":
+        return _query_mods(conn, q_folded, slot, ilvl, limit)
+    return _query_translate(conn, q_folded, limit, zh_available)
 
 
 def query_local_data(
@@ -2334,25 +3352,21 @@ def query_local_data(
     db_path = ensure_gamedata_index(pob_dir=pob_dir, runtime_dir=runtime_dir)
     limit = max(0, int(limit))
     q_clean = query.strip()
-    q_lower = q_clean.lower()
+    q_lower = _fold_search_text(q_clean)
 
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn = sqlite3.connect(_sqlite_ro_uri(db_path), uri=True)
     try:
         meta = dict(conn.execute("SELECT key, value FROM meta").fetchall())
         zh_available = meta.get("zh_available") == "1"
-
-        if limit == 0:
-            results: list[dict[str, Any]] = []
-        elif kind_norm == "gem":
-            results = _query_gems(conn, q_lower, limit)
-        elif kind_norm == "unique":
-            results = _query_uniques(conn, q_lower, slot, ilvl, limit)
-        elif kind_norm == "base":
-            results = _query_bases(conn, q_lower, slot, ilvl, limit)
-        elif kind_norm == "mod":
-            results = _query_mods(conn, q_lower, slot, ilvl, limit)
-        else:
-            results = _query_translate(conn, q_lower, limit, zh_available)
+        results = _dispatch_query(
+            conn,
+            kind_norm,
+            q_lower,
+            slot=slot,
+            ilvl=ilvl,
+            limit=limit,
+            zh_available=zh_available,
+        )
     finally:
         conn.close()
 
@@ -2365,4 +3379,80 @@ def query_local_data(
         "zhAvailable": zh_available,
         "count": len(results),
         "results": results,
+    }
+
+
+def query_multi(
+    db: Path | str | sqlite3.Connection | None = None,
+    kind: str = "",
+    queries: list[str] | None = None,
+    *,
+    pob_dir: Path | None = None,
+    runtime_dir: Path | None = None,
+    slot: str | None = None,
+    ilvl: int | None = None,
+    limit: int = 25,
+) -> dict[str, Any]:
+    """Run multiple local game-data queries in one SQLite connection for variadic `pob data`."""
+    kind_norm = str(kind).strip().lower()
+    if kind_norm not in ("gem", "unique", "mod", "base", "translate"):
+        raise ValueError(
+            f"Unsupported kind {kind!r}; expected one of: gem, unique, mod, base, translate."
+        )
+
+    clean_queries = list(
+        dict.fromkeys(q.strip() for q in (queries or []) if isinstance(q, str) and q.strip())
+    )
+    if not clean_queries:
+        raise ValueError("queries must contain at least one non-empty query string.")
+
+    limit = max(0, int(limit))
+    own_conn = False
+    if isinstance(db, sqlite3.Connection):
+        conn = db
+    else:
+        db_path = Path(db) if db is not None else ensure_gamedata_index(pob_dir=pob_dir, runtime_dir=runtime_dir)
+        conn = sqlite3.connect(_sqlite_ro_uri(db_path), uri=True)
+        own_conn = True
+
+    try:
+        meta = dict(conn.execute("SELECT key, value FROM meta").fetchall())
+        zh_available = meta.get("zh_available") == "1"
+        pob_ver = meta.get("pob_version", "unknown")
+        data_ver = meta.get("data_version", "unknown")
+        results_by_query: dict[str, dict[str, Any]] = {}
+        for q_clean in clean_queries:
+            q_folded = _fold_search_text(q_clean)
+            res = _dispatch_query(
+                conn,
+                kind_norm,
+                q_folded,
+                slot=slot,
+                ilvl=ilvl,
+                limit=limit,
+                zh_available=zh_available,
+            )
+            results_by_query[q_clean] = {
+                "kind": kind_norm,
+                "query": q_clean,
+                "filters": {"slot": slot, "ilvl": ilvl, "limit": limit},
+                "pobVersion": pob_ver,
+                "dataVersion": data_ver,
+                "zhAvailable": zh_available,
+                "count": len(res),
+                "results": res,
+            }
+    finally:
+        if own_conn:
+            conn.close()
+
+    return {
+        "kind": kind_norm,
+        "queries": clean_queries,
+        "filters": {"slot": slot, "ilvl": ilvl, "limit": limit},
+        "pobVersion": pob_ver,
+        "dataVersion": data_ver,
+        "zhAvailable": zh_available,
+        "count": sum(sub["count"] for sub in results_by_query.values()),
+        "results": results_by_query,
     }

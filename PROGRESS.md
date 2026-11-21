@@ -1,12 +1,16 @@
 # PROGRESS
 
 ## ACTIVE
-- 目标：pob-agent-tools v0.3.0（官方只读交易检索 + Harvest 转换 + 双源工艺台）已发布并关闭 PR #1，待确认 GitHub Actions CI/Release 产物全绿
-- 已做：[x] 完成 v0.3.0 干净重构落地（0b5ffc7，含 Co-authored-by: ChangMenQAQ 与 README 致谢）并打 tag v0.3.0；[x] 用户已推送 main 与 v0.3.0 触发 GitHub Actions CI & Release，并在 PR #1 回复升级致谢说明后关闭 PR #1
-- 下一步：[ ] 关注 GitHub Actions CI 与 Release v0.3.0 流水线完成情况，验证 Windows 独立二进制与 Scoop bucket/pob.json 自动更新（禁踩：直接 merge PR #1（含 17,756 行爬虫脏数据 crafting_bench.json、吞 3.30 flags、漏代理/动态限流、劫持 AGENTS.md 且破坏 PyInstaller pob.spec））
-- 验证：git commit 0b5ffc7 + tag v0.3.0 已推送；pytest 179 passed (1 skipped)；PR #1 已回复并关闭（2026-11-20 23:13）
+- 目标：完成 pob-agent-tools 全栈性能优化与 4 路 Gemini 4 Carbon 深度复审清零（29 文件，待提交推送触发三端 CI）
+- 已做：[x] 完成 3 阶段 12-worker Swarm 剖析+全栈性能优化，并通过 4 路 Gemini 4 Carbon (High) 并行代码复审与 4 路修复 Swarm 全部清零 35 项缺陷（1 P0 / 20 P1 / 14 P2）；[x] 修复 Carbon P0（.build.lock 100% CPU 死循环与 TOCTOU 抢锁）及全部 P1（并行重叠冷启更新检查、call_daemon 超时护活、last_good_code 防污染、0 假值强转、tree max_cost BFS 邻近排序、loadout entries 协议、source 技能组保护、compare 0 覆写、trade_eval Explode/中文词缀保护、translate 谚语过滤、TradeRateLimiter 跨进程锁、That Which Was Taken/Pearl 解析、query_multi 去重、pob new/calc/compare/borrow/trade --compact/--out/--proxy）与 P2（含 POSIX headless_runner.lua arg={} 清空）；[x] 隔离环境回归全部通过：全量 248 passed + daemon 重叠启动修复后 e2e/updater/protocol 43/43 passed（合计 249 passed, 0 failed, 1 skipped）
+- 下一步：[ ] 审阅 git diff 并按需提交推送 feat/macos-support 触发三端真机 CI（含新增 headless_runner.lua arg={} 修复与 249 项单测）（禁踩：绕过 AGY Win32 Job Object 强制 breakaway（WinError 5；合法持久化路径为 IsDaemon:true 运行 pob serve）；未递增 game_data SCHEMA_VERSION 导致旧缓存缺列崩溃（已升至 v6 自动重建）；在 DaemonManager._reader_barrier 无重入深度跟踪时嵌套调用 get_worker 引发 RW 死锁；在 main_w.start() 之后启动 _boot_update_thread 导致冷启首个 status 读到空 updateStatus（已提前到 main_w.start() 之前并行重叠））
+- 验证：task-284 全量 pytest 248/249 passed（仅 1 处冷启更新顺序失败）→ 修复 daemon.py 并行提前启动 _boot_update_thread 后，复测 test_e2e_headless + test_updater + test_protocol 43/43 passed (87.75s, ec=0)，合计 249 passed, 0 failed, 1 skipped（2026-11-21 06:00）
 
 ## LOG
+### 2026-11-21 4 路 Gemini 4 Carbon (High) 并行复审并全量清零 35 项缺陷（1 P0 .build.lock 死循环/抢锁 + 20 P1 + 14 P2，含并行重叠冷启更新检查、TradeRateLimiter 跨进程锁、translate 谚语隔离、tree BFS 邻近排序、source 技能组保护、POSIX headless_runner.lua arg={} 与 CLI 全命令 --compact/--out 对齐） → 隔离全量回归 249 passed (0 failed, 1 skipped)
+### 2026-11-21 Swarm 全栈剖析近 13 份真实 PoB 会话并落地引擎/守护进程/CLI 性能优化（call_batch 流水线、多命名槽位并发、<1ms 死 PID 清理、pob serve、延迟导入、共享 SQLite v5 缓存、19-op batch+sweep、matrix 脱水缓存与并发多查），Principal 复审 14 项 P0/P1/P2 清零 → 隔离全量 pytest 225 passed (0 failed, 1 skipped) + 真机基准 summary 5.4× / tree 14.4× / items 8.1× / matrix(6) 5.1× / CLI 启动 2.3× / 死 PID 1667× 提速
+### 2026-11-21 feat/macos-support（56d79cb）三端真机 CI 全绿（Run #44777911376）：macOS-15 (Apple Silicon)、Linux-x64 均完成原生 LuaJIT 2.1 + lua-utf8.so 编译与真实 pob bootstrap/load/summary/audit/skill add/export-code 回环/matrix/bench/trade/stop 全链路验收，Windows-x64 零回归 → 本地 pytest 186 passed + GitHub Actions 3/3 jobs success
+### 2026-11-21 在 feat/macos-support 分支落地 macOS/Linux 原生 LuaJIT 无头宿主（headless_runner.lua + build_posix_runtime.sh + 平台化 updater/bridge_client/daemon + macOS-14/Ubuntu 真机 E2E CI），复用 MIT bridge.lua 且不破坏 Windows 链路 → 本地 pytest 186 passed (0 failed)
 ### 2026-11-20 发布 pob-agent-tools v0.3.0（0b5ffc7，Co-authored-by: ChangMenQAQ），推送 main 与 v0.3.0 tag 触发 CI/Release 流水线，并在 PR #1 回复架构重构说明与致谢后关闭 → 本地 pytest 179 passed (1 skipped) + 零引擎/离线/YAML/Spec 全通
 ### 2026-11-20 Clean-Room 重构落地 PR #1 交易与工艺台工作流（pob trade / pob bench）：对齐 PoB 2.68.1 TradeSiteStats.lua 本地 0ms 槽位双语词缀路由、GGG 动态响应头持久化限流、3.30 高保真物品重建与 Harvest 同组冲突校验、ModMaster.lua 主源 + 30KB 级费用叠加层、daemon 单快照批验与 PyInstaller 打包门禁（排除直接合入 17,756 行爬虫脏快照与散文化 AGENTS.md） → pytest 179 passed (1 skipped) + 离线/零引擎/YAML/Spec 门禁全通
 ### 2026-11-20 落地 `pob-agent-tools` 打包 CI、tag 发版（PyInstaller `--onedir` + wheel/sdist + 仓内 Scoop bucket `bucket/pob.json`）与 Windows 一键安装 `install.ps1`，修复冻结版守护进程拉起（`pob _daemon`）与运行态目录（`%LOCALAPPDATA%/pob-agent-tools`） → 47 项单测/集成全通 + `install.ps1`/`bucket/pob.json`/YAML 校验全通

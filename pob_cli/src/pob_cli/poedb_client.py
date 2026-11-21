@@ -2,18 +2,28 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import difflib
 import hashlib
 import html as html_lib
 import json
 import re
+import threading
 import time
 from html.parser import HTMLParser
 from typing import Any
 
 import httpx
 
-from .importers import _get_cache_dir, _make_httpx_client
+from .importers import (
+    DEFAULT_HTTP_TIMEOUT,
+    _atomic_write_json,
+    _make_httpx_client,
+    _shared_cache_dir,
+    read_stale_cache,
+)
+
+_LAST_STALE = threading.local()
 
 POEDB_BASE_URL = "https://poedb.tw"
 POEDB_CDN_URL = "https://cdn.poedb.tw"
@@ -320,10 +330,60 @@ class _PoedbPageParser(HTMLParser):
                 self._vh_cur_li.append(data)
 
 
-def _poedb_get(url: str, *, proxy: str | None = None, timeout: float = 25.0) -> str:
+class _LazyClient:
+    """Thread-safe lazy httpx.Client holder so warm cache hits create zero HTTP clients."""
+
+    def __init__(
+        self,
+        *,
+        proxy: str | None = None,
+        timeout: float | httpx.Timeout | None = None,
+        client: httpx.Client | None = None,
+    ) -> None:
+        self._proxy = proxy
+        self._timeout = DEFAULT_HTTP_TIMEOUT if timeout is None else timeout
+        self._external = client
+        self._owned: httpx.Client | None = None
+        self._lock = threading.Lock()
+
+    def get_client(self) -> httpx.Client:
+        if self._external is not None:
+            return self._external
+        with self._lock:
+            if self._owned is None:
+                self._owned = _make_httpx_client(timeout=self._timeout, proxy=self._proxy)
+                self._owned.__enter__()
+            return self._owned
+
+    def __enter__(self) -> _LazyClient:
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        owned = self._owned
+        self._owned = None
+        if owned is not None:
+            owned.__exit__(*exc)
+
+
+def _poedb_get(
+    url: str,
+    *,
+    proxy: str | None = None,
+    timeout: float | httpx.Timeout | None = None,
+    client: httpx.Client | _LazyClient | None = None,
+) -> str:
+    resolved_timeout = DEFAULT_HTTP_TIMEOUT if timeout is None else timeout
     try:
-        with _make_httpx_client(timeout=timeout, proxy=proxy) as client:
+        if isinstance(client, _LazyClient):
+            resp = client.get_client().get(url)
+            resp.raise_for_status()
+            return resp.text
+        if client is not None:
             resp = client.get(url)
+            resp.raise_for_status()
+            return resp.text
+        with _make_httpx_client(timeout=resolved_timeout, proxy=proxy) as own_client:
+            resp = own_client.get(url)
             resp.raise_for_status()
             return resp.text
     except (httpx.HTTPError, OSError) as exc:
@@ -333,9 +393,14 @@ def _poedb_get(url: str, *, proxy: str | None = None, timeout: float = 25.0) -> 
         ) from exc
 
 
-def _discover_autocomplete_urls(lang: str = "cn", *, proxy: str | None = None) -> tuple[str, str]:
+def _discover_autocomplete_urls(
+    lang: str = "cn",
+    *,
+    proxy: str | None = None,
+    client: httpx.Client | _LazyClient | None = None,
+) -> tuple[str, str]:
     """Parse poedb.tw header script to obtain hashed autocomplete_cn and autocomplete_us URLs."""
-    home_html = _poedb_get(f"{POEDB_BASE_URL}/{lang}/", proxy=proxy, timeout=20.0)
+    home_html = _poedb_get(f"{POEDB_BASE_URL}/{lang}/", proxy=proxy, client=client)
 
     cn_m = re.search(r"(https?://cdn\.poedb\.tw/json/)?(autocomplete_cn\.[A-Za-z0-9_-]+\.json)", home_html)
     us_m = re.search(r"(https?://cdn\.poedb\.tw/json/)?(autocomplete_us\.[A-Za-z0-9_-]+\.json)", home_html)
@@ -353,7 +418,7 @@ def _discover_autocomplete_urls(lang: str = "cn", *, proxy: str | None = None) -
     else:
         hdr_url = hdr_m.group(1)
 
-    hdr_js = _poedb_get(hdr_url, proxy=proxy, timeout=20.0)
+    hdr_js = _poedb_get(hdr_url, proxy=proxy, client=client)
     cn_js_m = re.search(r"(autocomplete_cn\.[A-Za-z0-9_-]+\.json)", hdr_js)
     us_js_m = re.search(r"(autocomplete_us\.[A-Za-z0-9_-]+\.json)", hdr_js)
     if not cn_js_m or not us_js_m:
@@ -367,9 +432,10 @@ def _load_autocomplete_index(
     lang: str = "cn",
     proxy: str | None = None,
     ttl_sec: int = 86400,
+    client: httpx.Client | _LazyClient | None = None,
 ) -> list[dict[str, str]]:
     """Load merged CN + US PoEDB autocomplete index with 24h local disk cache."""
-    cache_file = _get_cache_dir() / "poedb_autocomplete_index.json"
+    cache_file = _shared_cache_dir() / "poedb_autocomplete_index.json"
     now = time.time()
     if cache_file.exists():
         try:
@@ -379,18 +445,30 @@ def _load_autocomplete_index(
         except Exception:
             pass
 
-    cn_url, us_url = _discover_autocomplete_urls(lang=lang, proxy=proxy)
+    def _fetch_json(http_client: httpx.Client, target_url: str) -> Any:
+        resp = http_client.get(target_url)
+        resp.raise_for_status()
+        return resp.json()
+
     try:
-        with _make_httpx_client(timeout=25.0, proxy=proxy) as client:
-            cn_resp = client.get(cn_url)
-            cn_resp.raise_for_status()
-            cn_raw = cn_resp.json()
-            us_resp = client.get(us_url)
-            us_resp.raise_for_status()
-            us_raw = us_resp.json()
-    except (httpx.HTTPError, OSError) as exc:
+        with _LazyClient(proxy=proxy, client=client if isinstance(client, httpx.Client) else None) as own_holder:
+            active_holder: httpx.Client | _LazyClient = client if client is not None else own_holder
+            cn_url, us_url = _discover_autocomplete_urls(lang=lang, proxy=proxy, client=active_holder)
+            http_client = active_holder.get_client() if isinstance(active_holder, _LazyClient) else active_holder
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                fut_cn = pool.submit(_fetch_json, http_client, cn_url)
+                fut_us = pool.submit(_fetch_json, http_client, us_url)
+                cn_raw = fut_cn.result()
+                us_raw = fut_us.result()
+    except (httpx.HTTPError, OSError, RuntimeError) as exc:
+        stale_entries, _ = read_stale_cache(cache_file, data_key="entries")
+        if isinstance(stale_entries, list):
+            _LAST_STALE.value = True
+            return stale_entries
+        if isinstance(exc, RuntimeError):
+            raise
         raise RuntimeError(
-            f"Failed to download PoEDB autocomplete index ({cn_url} / {us_url}): {exc}. "
+            f"Failed to download PoEDB autocomplete index: {exc}. "
             "Check network access or set POB_PROXY / HTTPS_PROXY / --proxy."
         ) from exc
 
@@ -420,13 +498,11 @@ def _load_autocomplete_index(
             item["usDesc"] = desc
 
     entries = list(by_slug.values())
-    try:
-        cache_file.write_text(
-            json.dumps({"_ts": now, "cnUrl": cn_url, "usUrl": us_url, "entries": entries}, ensure_ascii=False),
-            encoding="utf-8",
-        )
-    except Exception:
-        pass
+    _atomic_write_json(
+        cache_file,
+        {"_ts": now, "cnUrl": cn_url, "usUrl": us_url, "entries": entries},
+        ensure_ascii=False,
+    )
     return entries
 
 
@@ -495,13 +571,14 @@ def _fetch_poedb_page(
     lang: str = "cn",
     proxy: str | None = None,
     ttl_sec: int = 43200,
+    client: httpx.Client | _LazyClient | None = None,
 ) -> tuple[str, str]:
-    """Fetch a PoEDB HTML page with 12h disk cache. Returns `(url, html)`."""
+    """Fetch a PoEDB HTML page with 12h disk cache and stale fallback. Returns `(url, html)`."""
     norm_lang = "us" if lang.strip().lower() in ("us", "en") else "cn"
     clean_slug = slug.strip().lstrip("/")
     url = f"{POEDB_BASE_URL}/{norm_lang}/{clean_slug}"
     slug_hash = hashlib.sha1(f"{norm_lang}:{clean_slug}".encode("utf-8")).hexdigest()[:16]
-    cache_file = _get_cache_dir() / f"poedb_page_{norm_lang}_{slug_hash}.json"
+    cache_file = _shared_cache_dir() / f"poedb_page_{norm_lang}_{slug_hash}.json"
     now = time.time()
 
     if cache_file.exists():
@@ -512,11 +589,19 @@ def _fetch_poedb_page(
         except Exception:
             pass
 
-    page_html = _poedb_get(url, proxy=proxy, timeout=25.0)
     try:
-        cache_file.write_text(json.dumps({"_ts": now, "url": url, "html": page_html}), encoding="utf-8")
-    except Exception:
-        pass
+        page_html = _poedb_get(url, proxy=proxy, client=client)
+    except RuntimeError:
+        stale_html, _ = read_stale_cache(cache_file, data_key="html")
+        if isinstance(stale_html, str):
+            _LAST_STALE.value = True
+            return url, stale_html
+        raise
+    _atomic_write_json(
+        cache_file,
+        {"_ts": now, "url": url, "html": page_html},
+        ensure_ascii=False,
+    )
     return url, page_html
 
 
@@ -781,25 +866,26 @@ def _extract_inline_mod_cards(page_html: str) -> list[dict[str, Any]]:
     return cards
 
 
-def query_poedb(
+def _query_poedb_with_entries(
     query: str,
+    entries: list[dict[str, str]],
     *,
     include_mods: bool = False,
-    lang: str = "cn",
+    norm_lang: str = "cn",
     proxy: str | None = None,
     limit_mods: int = 80,
+    client: httpx.Client | _LazyClient | None = None,
+    index_stale: bool = False,
 ) -> dict[str, Any]:
-    """Search PoEDB autocomplete index (CN+US) and parse page + optional mod pool into compact JSON."""
+    _LAST_STALE.value = bool(index_stale)
     q = query.strip()
     if not q:
         raise ValueError("PoEDB query cannot be empty.")
 
-    norm_lang = "us" if lang.strip().lower() in ("us", "en") else "cn"
-    entries = _load_autocomplete_index(lang=norm_lang, proxy=proxy)
     primary, close_hits = _resolve_poedb_slug(q, entries)
     slug = primary["slug"]
 
-    page_url, page_html = _fetch_poedb_page(slug, lang=norm_lang, proxy=proxy)
+    page_url, page_html = _fetch_poedb_page(slug, lang=norm_lang, proxy=proxy, client=client)
     parser = _PoedbPageParser()
     parser.feed(page_html)
 
@@ -866,7 +952,9 @@ def query_poedb(
         if mv is None:
             for cand_slug in _derive_mod_pool_candidates(slug, parser):
                 try:
-                    mp_url, mp_html = _fetch_poedb_page(cand_slug, lang=norm_lang, proxy=proxy)
+                    mp_url, mp_html = _fetch_poedb_page(
+                        cand_slug, lang=norm_lang, proxy=proxy, client=client
+                    )
                 except RuntimeError:
                     continue
                 cand_mv = _extract_mods_view_json(mp_html)
@@ -890,4 +978,89 @@ def query_poedb(
             result["modCountTotal"] = 0
             result["mods"] = []
 
+    if getattr(_LAST_STALE, "value", False):
+        result["stale"] = True
     return result
+
+
+def query_poedb(
+    query: str,
+    *,
+    include_mods: bool = False,
+    lang: str = "cn",
+    proxy: str | None = None,
+    limit_mods: int = 80,
+) -> dict[str, Any]:
+    """Search PoEDB autocomplete index (CN+US) and parse page + optional mod pool into compact JSON."""
+    q = query.strip()
+    if not q:
+        raise ValueError("PoEDB query cannot be empty.")
+
+    norm_lang = "us" if lang.strip().lower() in ("us", "en") else "cn"
+    _LAST_STALE.value = False
+    with _LazyClient(proxy=proxy) as holder:
+        entries = _load_autocomplete_index(lang=norm_lang, proxy=proxy, client=holder)
+        index_stale = bool(getattr(_LAST_STALE, "value", False))
+        return _query_poedb_with_entries(
+            query,
+            entries,
+            include_mods=include_mods,
+            norm_lang=norm_lang,
+            proxy=proxy,
+            limit_mods=limit_mods,
+            client=holder,
+            index_stale=index_stale,
+        )
+
+
+def query_poedb_multi(
+    queries: list[str],
+    *,
+    include_mods: bool = False,
+    lang: str = "cn",
+    proxy: str | None = None,
+    limit_mods: int = 80,
+    max_workers: int = 4,
+) -> dict[str, Any]:
+    """Query multiple PoEDB entities concurrently with a shared HTTP client and stale-cache fallback."""
+    clean_queries = [q.strip() for q in queries if isinstance(q, str) and q.strip()]
+    if not clean_queries:
+        raise ValueError("PoEDB queries cannot be empty.")
+
+    norm_lang = "us" if lang.strip().lower() in ("us", "en") else "cn"
+    _LAST_STALE.value = False
+    with _LazyClient(proxy=proxy) as holder:
+        entries = _load_autocomplete_index(lang=norm_lang, proxy=proxy, client=holder)
+        index_stale = bool(getattr(_LAST_STALE, "value", False))
+
+        def _run_one(q: str) -> dict[str, Any]:
+            try:
+                return _query_poedb_with_entries(
+                    q,
+                    entries,
+                    include_mods=include_mods,
+                    norm_lang=norm_lang,
+                    proxy=proxy,
+                    limit_mods=limit_mods,
+                    client=holder,
+                    index_stale=index_stale,
+                )
+            except Exception as exc:
+                return {"query": q, "error": str(exc)}
+
+        if len(clean_queries) == 1:
+            results = [_run_one(clean_queries[0])]
+        else:
+            workers = max(1, min(int(max_workers), len(clean_queries)))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+                results = list(pool.map(_run_one, clean_queries))
+
+    out: dict[str, Any] = {
+        "queries": clean_queries,
+        "lang": norm_lang,
+        "count": len(results),
+        "results": results,
+    }
+    if index_stale or any(bool(r.get("stale")) for r in results):
+        out["stale"] = True
+    return out

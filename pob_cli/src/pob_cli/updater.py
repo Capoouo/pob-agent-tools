@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import collections
-import concurrent.futures
 import hashlib
 import json
 import os
@@ -15,18 +14,16 @@ import shutil
 import stat
 import subprocess
 import sys
-import tarfile
 import tempfile
 import threading
 import time
 import urllib.parse
-import xml.etree.ElementTree as ET
-import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
-import httpx
+if TYPE_CHECKING:
+    import httpx
 
 from . import __version__
 
@@ -44,11 +41,32 @@ POSIX_LUAJIT_TARBALL_URL = f"https://github.com/LuaJIT/LuaJIT/archive/{POSIX_LUA
 POSIX_LUAUTF8_TAG = "0.1.6"
 POSIX_LUAUTF8_TARBALL_URL = f"https://github.com/starwing/luautf8/archive/refs/tags/{POSIX_LUAUTF8_TAG}.tar.gz"
 
-# Strict fast-fail budget for metadata checks (no retries on connect timeout)
-AUTO_CHECK_TIMEOUT = httpx.Timeout(connect=1.5, read=5.0, write=5.0, pool=1.5)
-CHECK_TIMEOUT = httpx.Timeout(connect=3.0, read=8.0, write=8.0, pool=3.0)
-ASSET_TIMEOUT = httpx.Timeout(connect=5.0, read=20.0, write=20.0, pool=5.0)
+# Strict fast-fail budget for metadata checks (lazy httpx.Timeout construction avoids ~196ms eager import)
+_AUTO_CHECK_TIMEOUT_SPEC = (1.5, 5.0, 5.0, 1.5)
+_CHECK_TIMEOUT_SPEC = (3.0, 8.0, 8.0, 3.0)
+_ASSET_TIMEOUT_SPEC = (5.0, 20.0, 20.0, 5.0)
 ASSET_MAX_RETRIES = 1
+MANIFEST_STAT_CACHE_FILENAME = "manifest_stat_cache.json"
+
+
+def _to_httpx_timeout(timeout: Any) -> "httpx.Timeout":
+    import httpx
+
+    if isinstance(timeout, httpx.Timeout):
+        return timeout
+    if isinstance(timeout, tuple) and len(timeout) == 4:
+        return httpx.Timeout(connect=timeout[0], read=timeout[1], write=timeout[2], pool=timeout[3])
+    return httpx.Timeout(timeout)
+
+
+def __getattr__(name: str) -> Any:
+    if name == "AUTO_CHECK_TIMEOUT":
+        return _to_httpx_timeout(_AUTO_CHECK_TIMEOUT_SPEC)
+    if name == "CHECK_TIMEOUT":
+        return _to_httpx_timeout(_CHECK_TIMEOUT_SPEC)
+    if name == "ASSET_TIMEOUT":
+        return _to_httpx_timeout(_ASSET_TIMEOUT_SPEC)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 UPDATE_STATE_FILENAME = "update_state.json"
 POBTOOLS_META_FILENAME = ".pobtools_version.json"
@@ -366,6 +384,69 @@ def resolve_engine_root(
     return managed
 
 
+def get_shared_cache_dir(
+    runtime_dir: Path | None = None,
+    *,
+    pob_root: Path | None = None,
+) -> Path:
+    """Resolve the shared cache directory for SQLite gamedata, external caches, and rate limits.
+
+    Priority:
+      1. `POB_CACHE_DIR` environment variable if set.
+      2. If the effective engine dir (`pob_root` if explicitly given, else `resolve_engine_root(runtime_dir)`)
+         lives outside `runtime_dir` and its parent already contains `cache/` or is named
+         `.runtime` / `pob-agent-tools`, share `<engine_dir.parent>/cache` (falling back to
+         `<runtime_dir>/cache` on read-only/permission errors).
+      3. Fallback `<runtime_dir>/cache`.
+    """
+    env_cache = os.environ.get("POB_CACHE_DIR", "").strip()
+    if env_cache:
+        cache_dir = Path(env_cache)
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            return cache_dir
+        except OSError:
+            pass
+
+    rt = get_runtime_dir(runtime_dir)
+    eng = Path(pob_root) if pob_root is not None else resolve_engine_root(runtime_dir=rt)
+
+    try:
+        eng_res = eng.resolve()
+        rt_res = rt.resolve()
+    except OSError:
+        eng_res = eng
+        rt_res = rt
+
+    try:
+        eng_res.relative_to(rt_res)
+        inside_rt = True
+    except ValueError:
+        inside_rt = False
+
+    if not inside_rt:
+        eng_parent = eng_res.parent
+        parent_cache = eng_parent / "cache"
+        if parent_cache.is_dir() or eng_parent.name.lower() in (".runtime", "pob-agent-tools"):
+            try:
+                parent_cache.mkdir(parents=True, exist_ok=True)
+                return parent_cache
+            except OSError:
+                pass
+
+    fallback = rt / "cache"
+    try:
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
+    except OSError:
+        tmp_fallback = Path(tempfile.gettempdir()) / "pob-agent-tools-cache"
+        try:
+            tmp_fallback.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        return tmp_fallback
+
+
 def seed_from_legacy_dir(legacy_dir: Path, target_dir: Path) -> bool:
     """Losslessly copy clean host + PoE1 assets from legacy_dir into an uninitialized target_dir.
 
@@ -426,15 +507,17 @@ def rewrite_github_url(url: str, mirror: str | None = None) -> str:
 
 def _make_http_client(
     *,
-    timeout: httpx.Timeout,
+    timeout: Any,
     proxy: str | None = None,
     follow_redirects: bool = True,
     max_connections: int = 16,
-) -> httpx.Client:
+) -> "httpx.Client":
+    import httpx
+
     eff_proxy = resolve_proxy(proxy)
     limits = httpx.Limits(max_connections=max_connections, max_keepalive_connections=max_connections)
     kwargs: dict[str, Any] = {
-        "timeout": timeout,
+        "timeout": _to_httpx_timeout(timeout),
         "follow_redirects": follow_redirects,
         "headers": {"User-Agent": USER_AGENT},
         "trust_env": False,
@@ -496,6 +579,8 @@ def verify_pob_sha1(data: bytes, expected_sha1: str) -> bool:
 
 def parse_pob_manifest(xml_text: str, *, include_win32_runtime: bool | None = None) -> PobManifest:
     """Parse a PathOfBuilding manifest.xml string into structured metadata & file entries."""
+    import xml.etree.ElementTree as ET
+
     root = ET.fromstring(xml_text)
     if root.tag != "PoBVersion":
         raise UpdateError(f"Invalid PoB manifest root element: {root.tag}")
@@ -581,25 +666,135 @@ def build_manifest_file_url(manifest: PobManifest, entry: ManifestFileEntry, mir
     return rewrite_github_url(url, mirror=mirror)
 
 
-def find_local_manifest_mismatches(poe1_dir: Path) -> list[ManifestFileEntry]:
-    """Verify local PoE1/ files against local PoE1/manifest.xml and return missing/tampered entries."""
-    manifest_path = Path(poe1_dir) / "manifest.xml"
+def _stat_cache_path(cache_dir: Path | None) -> Path:
+    base = Path(cache_dir) if cache_dir is not None else get_shared_cache_dir()
+    return base / MANIFEST_STAT_CACHE_FILENAME
+
+
+def _load_manifest_stat_cache(
+    cache_path: Path,
+    poe1_key: str,
+    manifest_sha1: str,
+) -> dict[str, list[Any]]:
+    if not cache_path.is_file():
+        return {}
+    try:
+        raw = json.loads(cache_path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return {}
+        entry = raw.get(poe1_key)
+        if not isinstance(entry, dict) or entry.get("manifestSha1") != manifest_sha1:
+            return {}
+        files = entry.get("files")
+        return files if isinstance(files, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_manifest_stat_cache(
+    cache_path: Path,
+    poe1_key: str,
+    manifest_sha1: str,
+    files_map: dict[str, list[Any]],
+) -> None:
+    tmp: Path | None = None
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        existing: dict[str, Any] = {}
+        if cache_path.is_file():
+            try:
+                loaded = json.loads(cache_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    existing = loaded
+            except Exception:
+                existing = {}
+        existing[poe1_key] = {
+            "manifestSha1": manifest_sha1,
+            "updatedAt": time.time(),
+            "files": files_map,
+        }
+        tmp = cache_path.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
+        tmp.write_text(json.dumps(existing, separators=(",", ":")), encoding="utf-8")
+        os.replace(tmp, cache_path)
+        tmp = None
+    except Exception:
+        if tmp is not None:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def find_local_manifest_mismatches(
+    poe1_dir: Path,
+    *,
+    fast_stat: bool = False,
+    cache_dir: Path | None = None,
+) -> list[ManifestFileEntry]:
+    """Verify local PoE1/ files against local PoE1/manifest.xml and return missing/tampered entries.
+
+    When `fast_stat=True`, uses a `(size, mtime_ns, sha1)` cache (`manifest_stat_cache.json`)
+    keyed by `manifest.xml` SHA1 so unchanged files skip re-hashing (<20ms vs ~1s), while any
+    missing, resized, or mtime-changed file is still SHA1-verified.
+    """
+    poe1 = Path(poe1_dir)
+    manifest_path = poe1 / "manifest.xml"
     if not manifest_path.is_file():
         return []
-    manifest = parse_pob_manifest(manifest_path.read_text(encoding="utf-8", errors="replace"))
+    manifest_bytes = manifest_path.read_bytes()
+    manifest_sha1 = hashlib.sha1(manifest_bytes).hexdigest()
+    manifest = parse_pob_manifest(manifest_bytes.decode("utf-8", errors="replace"))
+
+    use_cache = fast_stat or cache_dir is not None
+    cache_path = _stat_cache_path(cache_dir) if use_cache else None
+    try:
+        poe1_key = str(poe1.resolve())
+    except OSError:
+        poe1_key = str(poe1)
+
+    cached_files = (
+        _load_manifest_stat_cache(cache_path, poe1_key, manifest_sha1)
+        if (fast_stat and cache_path is not None)
+        else {}
+    )
+    updated_cache: dict[str, list[Any]] = {}
+    cache_dirty = not bool(cached_files)
+
     mismatched: list[ManifestFileEntry] = []
     for entry in manifest.files.values():
-        fp = Path(poe1_dir) / entry.local_rel
-        if not fp.is_file():
+        fp = poe1 / entry.local_rel
+        try:
+            st = fp.stat()
+        except OSError:
             mismatched.append(entry)
+            cache_dirty = True
             continue
+        if not stat.S_ISREG(st.st_mode):
+            mismatched.append(entry)
+            cache_dirty = True
+            continue
+
+        sig = [st.st_size, st.st_mtime_ns, entry.sha1]
+        if fast_stat and cached_files.get(entry.local_rel) == sig:
+            updated_cache[entry.local_rel] = sig
+            continue
+
         try:
             data = fp.read_bytes()
         except OSError:
             mismatched.append(entry)
+            cache_dirty = True
             continue
         if not verify_pob_sha1(data, entry.sha1):
             mismatched.append(entry)
+            cache_dirty = True
+        else:
+            updated_cache[entry.local_rel] = sig
+            cache_dirty = True
+
+    if cache_path is not None and cache_dirty:
+        _save_manifest_stat_cache(cache_path, poe1_key, manifest_sha1, updated_cache)
+
     return mismatched
 
 
@@ -608,28 +803,57 @@ def diff_pob_manifest(
     remote_manifest: PobManifest,
     *,
     verify_local_sha1: bool = True,
+    fast_stat: bool = False,
+    cache_dir: Path | None = None,
 ) -> tuple[list[ManifestFileEntry], list[Path]]:
     """Compute PoE1/ files to download and obsolete files to delete against remote_manifest.
 
     When verify_local_sha1=True (default), hashes actual files on disk against remote_manifest
     so tampered files (such as PoE1/UpdateCheck.lua) are always detected and repaired.
+    When fast_stat=True is also set, unchanged files matching the cached `(size, mtime_ns, sha1)`
+    tuple avoid re-reading/re-hashing disk bytes.
     """
     poe1 = Path(poe1_dir)
     local_manifest: PobManifest | None = None
+    local_manifest_sha1: str | None = None
     local_manifest_path = poe1 / "manifest.xml"
     if local_manifest_path.is_file():
         try:
-            local_manifest = parse_pob_manifest(local_manifest_path.read_text(encoding="utf-8", errors="replace"))
+            local_bytes = local_manifest_path.read_bytes()
+            local_manifest_sha1 = hashlib.sha1(local_bytes).hexdigest()
+            local_manifest = parse_pob_manifest(local_bytes.decode("utf-8", errors="replace"))
         except Exception:
             local_manifest = None
+
+    cached_files: dict[str, list[Any]] = {}
+    cache_path: Path | None = None
+    poe1_key = ""
+    if verify_local_sha1 and fast_stat and local_manifest_sha1 is not None:
+        cache_path = _stat_cache_path(cache_dir)
+        try:
+            poe1_key = str(poe1.resolve())
+        except OSError:
+            poe1_key = str(poe1)
+        cached_files = _load_manifest_stat_cache(cache_path, poe1_key, local_manifest_sha1)
+
+    updated_cache: dict[str, list[Any]] = dict(cached_files)
+    cache_dirty = False
 
     to_download: list[ManifestFileEntry] = []
     for entry in remote_manifest.files.values():
         local_path = poe1 / entry.local_rel
-        if not local_path.is_file():
+        try:
+            st = local_path.stat()
+        except OSError:
+            to_download.append(entry)
+            continue
+        if not stat.S_ISREG(st.st_mode):
             to_download.append(entry)
             continue
         if verify_local_sha1:
+            sig = [st.st_size, st.st_mtime_ns, entry.sha1]
+            if fast_stat and cached_files.get(entry.local_rel) == sig:
+                continue
             try:
                 data = local_path.read_bytes()
             except OSError:
@@ -637,12 +861,20 @@ def diff_pob_manifest(
                 continue
             if not verify_pob_sha1(data, entry.sha1):
                 to_download.append(entry)
+            elif fast_stat and local_manifest is not None:
+                local_entry = local_manifest.files.get(entry.raw_name)
+                if local_entry is not None and local_entry.sha1 == entry.sha1:
+                    updated_cache[entry.local_rel] = sig
+                    cache_dirty = True
         elif local_manifest is not None:
             local_entry = local_manifest.files.get(entry.raw_name)
             if local_entry is None or local_entry.sha1 != entry.sha1:
                 to_download.append(entry)
         else:
             to_download.append(entry)
+
+    if cache_path is not None and local_manifest_sha1 is not None and cache_dirty:
+        _save_manifest_stat_cache(cache_path, poe1_key, local_manifest_sha1, updated_cache)
 
     to_delete: list[Path] = []
     if local_manifest is not None:
@@ -657,6 +889,8 @@ def diff_pob_manifest(
 
 def _render_local_manifest_xml(remote_manifest: PobManifest) -> str:
     """Serialize remote manifest XML ensuring platform/branch attributes exist on <Version>."""
+    import xml.etree.ElementTree as ET
+
     root = ET.fromstring(remote_manifest.raw_xml)
     ver_elem = root.find("Version")
     if ver_elem is not None:
@@ -677,6 +911,8 @@ def detect_local_versions(engine_dir: Path | None, runtime_dir: Path | None = No
         manifest_path = eng / "PoE1" / "manifest.xml"
         if manifest_path.is_file():
             try:
+                import xml.etree.ElementTree as ET
+
                 root = ET.parse(manifest_path).getroot()
                 v = root.find("Version")
                 if v is not None and v.attrib.get("number"):
@@ -986,12 +1222,13 @@ def fetch_pobtools_latest_info(
     *,
     proxy: str | None = None,
     mirror: str | None = None,
-    timeout: httpx.Timeout = CHECK_TIMEOUT,
+    timeout: Any = None,
     fetch_manifest: bool = True,
 ) -> dict[str, Any]:
     """Resolve latest PobTools-zh tag via 302 redirect (NEVER api.github.com) and optional manifest JSON."""
+    eff_timeout = _to_httpx_timeout(_CHECK_TIMEOUT_SPEC if timeout is None else timeout)
     latest_url = rewrite_github_url(POBTOOLS_LATEST_URL, mirror=mirror)
-    with _make_http_client(timeout=timeout, proxy=proxy, follow_redirects=False) as client:
+    with _make_http_client(timeout=eff_timeout, proxy=proxy, follow_redirects=False) as client:
         resp = client.get(latest_url)
         if resp.status_code in (301, 302, 303, 307, 308):
             loc = resp.headers.get("location", "")
@@ -1014,7 +1251,7 @@ def fetch_pobtools_latest_info(
         f"{POBTOOLS_DOWNLOAD_BASE}/{tag}/PobTools-manifest-{tag}.json",
         mirror=mirror,
     )
-    with _make_http_client(timeout=timeout, proxy=proxy, follow_redirects=True) as client:
+    with _make_http_client(timeout=eff_timeout, proxy=proxy, follow_redirects=True) as client:
         mresp = client.get(manifest_url)
         mresp.raise_for_status()
         manifest_data = mresp.json()
@@ -1039,18 +1276,19 @@ def fetch_pob_manifest_remote(
     etag: str | None = None,
     proxy: str | None = None,
     mirror: str | None = None,
-    timeout: httpx.Timeout = CHECK_TIMEOUT,
+    timeout: Any = None,
 ) -> tuple[str, PobManifest | None, str | None]:
     """Fetch official PathOfBuilding manifest.xml with optional If-None-Match ETag.
 
     Returns ("not_modified", None, etag) on 304, or ("ok", PobManifest, new_etag) on 200.
     """
+    eff_timeout = _to_httpx_timeout(_CHECK_TIMEOUT_SPEC if timeout is None else timeout)
     url = rewrite_github_url(POB_MANIFEST_URL, mirror=mirror)
     headers: dict[str, str] = {}
     if etag:
         headers["If-None-Match"] = etag
 
-    with _make_http_client(timeout=timeout, proxy=proxy, follow_redirects=True) as client:
+    with _make_http_client(timeout=eff_timeout, proxy=proxy, follow_redirects=True) as client:
         resp = client.get(url, headers=headers)
         if resp.status_code == 304:
             return ("not_modified", None, resp.headers.get("etag") or etag)
@@ -1061,7 +1299,7 @@ def fetch_pob_manifest_remote(
 
 
 def _download_bytes_with_retry(
-    client: httpx.Client,
+    client: "httpx.Client",
     url: str,
     retries: int = ASSET_MAX_RETRIES,
 ) -> bytes:
@@ -1095,7 +1333,7 @@ def _download_pob_files_to_staging(
         return staged
 
     with _make_http_client(
-        timeout=ASSET_TIMEOUT,
+        timeout=_to_httpx_timeout(_ASSET_TIMEOUT_SPEC),
         proxy=proxy,
         follow_redirects=True,
         max_connections=max(max_workers, 8),
@@ -1115,6 +1353,8 @@ def _download_pob_files_to_staging(
             out_path.write_bytes(data)
             return (rel_path, out_path)
 
+        import concurrent.futures
+
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(max_workers, len(entries))) as pool:
             futures = [pool.submit(_fetch_one, e) for e in entries]
             for fut in concurrent.futures.as_completed(futures):
@@ -1132,6 +1372,8 @@ def _extract_zip_safely(
     only_prefixes: tuple[str, ...] = (),
 ) -> dict[Path, Path]:
     """Extract a zip safely into dest_dir (guarding against Zip Slip and single wrapper dir)."""
+    import zipfile
+
     extracted: dict[Path, Path] = {}
     dest_resolved = dest_dir.resolve()
     with zipfile.ZipFile(zip_path, "r") as zf:
@@ -1222,7 +1464,7 @@ def _download_and_stage_release_zip(
 
     zip_tmp = staging_dir / "_downloads" / name
     zip_tmp.parent.mkdir(parents=True, exist_ok=True)
-    with _make_http_client(timeout=ASSET_TIMEOUT, proxy=proxy, follow_redirects=True) as client:
+    with _make_http_client(timeout=_to_httpx_timeout(_ASSET_TIMEOUT_SPEC), proxy=proxy, follow_redirects=True) as client:
         data = _download_bytes_with_retry(client, url, retries=ASSET_MAX_RETRIES)
     if expected_sha256:
         actual = hashlib.sha256(data).hexdigest().lower()
@@ -1241,6 +1483,8 @@ def _download_and_stage_release_zip(
 
 
 def _extract_tar_gz_safely(tar_path: Path, dest_dir: Path, *, strip_components: int = 0) -> None:
+    import tarfile
+
     dest_resolved = dest_dir.resolve()
     with tarfile.open(tar_path, "r:gz") as tf:
         for member in tf.getmembers():
@@ -1282,7 +1526,7 @@ def _try_download_prebuilt_posix_runtime(
     asset_name = f"pob-runtime-{plat_tag}.tar.gz"
     latest_url = rewrite_github_url(POB_AGENT_RELEASES_LATEST_URL, mirror=mirror)
     try:
-        with _make_http_client(timeout=CHECK_TIMEOUT, proxy=proxy, follow_redirects=False) as client:
+        with _make_http_client(timeout=_to_httpx_timeout(_CHECK_TIMEOUT_SPEC), proxy=proxy, follow_redirects=False) as client:
             resp = client.get(latest_url)
             if resp.status_code in (301, 302, 303, 307, 308):
                 tag = _extract_tag_from_location(resp.headers.get("location", ""))
@@ -1295,7 +1539,7 @@ def _try_download_prebuilt_posix_runtime(
             f"{POB_AGENT_DOWNLOAD_BASE}/{tag}/{asset_name}",
             mirror=mirror,
         )
-        with _make_http_client(timeout=ASSET_TIMEOUT, proxy=proxy, follow_redirects=True) as client:
+        with _make_http_client(timeout=_to_httpx_timeout(_ASSET_TIMEOUT_SPEC), proxy=proxy, follow_redirects=True) as client:
             aresp = client.get(asset_url)
             if aresp.status_code != 200:
                 return None
@@ -1344,7 +1588,7 @@ def _build_posix_runtime_from_source(
             f"Cannot build native POSIX LuaJIT runtime (missing C compiler or make). {hint}"
         )
 
-    build_timeout = httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=10.0)
+    build_timeout = _to_httpx_timeout((10.0, 60.0, 10.0, 10.0))
     lj_url = rewrite_github_url(POSIX_LUAJIT_TARBALL_URL, mirror=mirror)
     u8_url = rewrite_github_url(POSIX_LUAUTF8_TARBALL_URL, mirror=mirror)
 
@@ -1619,14 +1863,18 @@ def bootstrap_engine(
         )
 
     # 3. Clean online dual-upstream bootstrap from GitHub (PobTools-zh + PathOfBuilding master)
+    import concurrent.futures
+    import httpx
+
     staging_dir = eng_dir / ".staging"
+    check_timeout = _to_httpx_timeout(_CHECK_TIMEOUT_SPEC)
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
             fut_tools = pool.submit(
                 fetch_pobtools_latest_info,
                 proxy=proxy,
                 mirror=mirror,
-                timeout=CHECK_TIMEOUT,
+                timeout=check_timeout,
                 fetch_manifest=True,
             )
             fut_pob = pool.submit(
@@ -1634,7 +1882,7 @@ def bootstrap_engine(
                 etag=None,
                 proxy=proxy,
                 mirror=mirror,
-                timeout=CHECK_TIMEOUT,
+                timeout=check_timeout,
             )
             tools_info = fut_tools.result()
             _, pob_manifest, pob_etag = fut_pob.result()
@@ -1892,7 +2140,7 @@ def check_and_apply_updates(
         return state
 
     # Concurrent fast-fail metadata checks (1.5s connect on auto-check, 3.0s on --force)
-    check_timeout = CHECK_TIMEOUT if force else AUTO_CHECK_TIMEOUT
+    check_timeout = _to_httpx_timeout(_CHECK_TIMEOUT_SPEC if force else _AUTO_CHECK_TIMEOUT_SPEC)
     prev_etag = None if force else prev_state.get("pobManifestEtag")
     # Only send ETag if previous state was for the same local PoB version
     if prev_etag and prev_state.get("localPobVersion") != local_pob_ver:
@@ -1903,6 +2151,8 @@ def check_and_apply_updates(
     remote_manifest: PobManifest | None = None
     new_etag: str | None = prev_etag
     net_errors: list[str] = []
+
+    import concurrent.futures
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
         fut_pob = pool.submit(
@@ -1954,8 +2204,15 @@ def check_and_apply_updates(
     to_delete: list[Path] = []
     remote_pob_ver = local_pob_ver
 
+    cache_dir = get_shared_cache_dir(rt_dir, pob_root=active_dir)
+    use_fast_stat = not force
+
     if pob_status == "not_modified":
-        tampered = find_local_manifest_mismatches(poe1_dir)
+        tampered = find_local_manifest_mismatches(
+            poe1_dir,
+            fast_stat=use_fast_stat,
+            cache_dir=cache_dir,
+        )
         if tampered:
             # Fetch full manifest (without ETag) to repair tampered files against latest upstream
             try:
@@ -1985,7 +2242,13 @@ def check_and_apply_updates(
 
     if remote_manifest is not None:
         remote_pob_ver = remote_manifest.version
-        to_download, to_delete = diff_pob_manifest(poe1_dir, remote_manifest, verify_local_sha1=True)
+        to_download, to_delete = diff_pob_manifest(
+            poe1_dir,
+            remote_manifest,
+            verify_local_sha1=True,
+            fast_stat=use_fast_stat and check_only,
+            cache_dir=cache_dir,
+        )
 
     # Evaluate PobTools-zh & DataV2 update availability
     assert tools_info is not None

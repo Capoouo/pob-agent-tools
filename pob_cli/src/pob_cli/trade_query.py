@@ -797,7 +797,11 @@ def translate_stat_query(text: str) -> str:
 
             query_term = cleaned or raw
             res = game_data.query_local_data("translate", query_term, limit=12)
-            rows = res.get("results") or []
+            rows = [
+                r
+                for r in (res.get("results") or [])
+                if str(r.get("match_type") or "") != "partial"
+            ]
             if rows:
                 cat_rank = {"mod": 0, "stat": 1, "passive": 2, "base": 3, "gem": 4, "unique": 5}
                 match_rank = {"exact": 0, "prefix": 1, "substring": 2}

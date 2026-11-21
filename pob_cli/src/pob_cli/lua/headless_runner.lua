@@ -803,6 +803,9 @@ end
 
 local dkjson = require("dkjson")
 
+-- Prevent PoB Main.lua:Init() from treating runner CLI args (arg[1]=<game_dir>) as a pob:// import URI.
+arg = {}
+
 dofile("Launch.lua")
 runCallback("OnInit")
 runCallback("OnFrame")

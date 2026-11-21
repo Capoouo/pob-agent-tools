@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+import math
+import re
 from typing import Any
 
 from .analyzer import (
@@ -11,10 +14,18 @@ from .analyzer import (
     resolve_slot_name,
 )
 from .bridge_client import BridgeWorker
-from .formatters import fmt_delta, fmt_num, strip_pob_escapes
+from .formatters import _parse_numeric_or_none, fmt_delta, fmt_num, strip_pob_escapes
 from .importers import load_build_into_worker
 from .mutators import _apply_config_in_place
-from .snapshot import CORE_STAT_KEYS, capture_digest, diff_digest, run_mutation
+from .snapshot import (
+    CORE_STAT_KEYS,
+    _call_batch,
+    _json_safe_stat,
+    capture_digest,
+    compact_digest_summary,
+    diff_digest,
+    run_mutation,
+)
 
 EXTERNAL_ENV_WHITELIST = (
     "enemyIsBoss",
@@ -147,17 +158,17 @@ def rank_gems(
                 },
             )
             ranked = search_res.get("gems", [])
-            # Enrich top 5 with candidate tooltip details
-            for cand in ranked[:5]:
-                if cand.get("gemId"):
-                    try:
-                        tip = worker.call(
-                            "gem_candidate_tooltip",
-                            {"group": g_idx, "index": target_idx, "gemId": cand["gemId"]},
-                        )
+            # Enrich top 5 with candidate tooltip details in ONE pipelined batch
+            top_cands = [c for c in ranked[:5] if c.get("gemId")]
+            if top_cands:
+                tip_calls = [
+                    ("gem_candidate_tooltip", {"group": g_idx, "index": target_idx, "gemId": c["gemId"]})
+                    for c in top_cands
+                ]
+                tips = _call_batch(worker, tip_calls, raise_on_error=False)
+                for cand, tip in zip(top_cands, tips):
+                    if isinstance(tip, dict) and not tip.get("_error") and tip.get("ok") is not False and "dps" in tip:
                         cand["tooltipDps"] = tip.get("dps")
-                    except Exception:
-                        pass
         finally:
             try:
                 restore_payload: dict[str, Any] = {}
@@ -181,8 +192,7 @@ def rank_gems(
         }
 
 
-def _extract_env_config(worker: BridgeWorker) -> dict[str, Any]:
-    cfg = worker.call("list_config", {})
+def _extract_env_config_from_cfg(cfg: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for sec in cfg.get("sections", []):
         for item in sec.get("items", []):
@@ -192,16 +202,24 @@ def _extract_env_config(worker: BridgeWorker) -> dict[str, Any]:
     return out
 
 
+def _extract_env_config(worker: BridgeWorker) -> dict[str, Any]:
+    cfg = worker.call("list_config", {})
+    return _extract_env_config_from_cfg(cfg)
+
+
 def _apply_env_config(worker: BridgeWorker, env_map: dict[str, Any]) -> None:
+    calls: list[tuple[str, dict[str, Any]]] = []
     for var in EXTERNAL_ENV_WHITELIST:
         val = env_map.get(var)
-        if val in (None, False, ""):
-            worker.call("reset_config", {"var": var})
+        if val is None or val is False or val == "":
+            calls.append(("reset_config", {"var": var}))
         else:
-            worker.call("set_config", {"var": var, "value": val})
+            calls.append(("set_config", {"var": var, "value": val}))
     # Ensure presetBossSkills sees updated enemyIsBoss selIndex
     if env_map.get("presetBossSkills"):
-        worker.call("set_config", {"var": "presetBossSkills", "value": env_map["presetBossSkills"]})
+        calls.append(("set_config", {"var": "presetBossSkills", "value": env_map["presetBossSkills"]}))
+    if calls:
+        _call_batch(worker, calls)
 
 
 def _build_pair_table(main_dig: dict[str, Any], ref_dig: dict[str, Any]) -> list[dict[str, Any]]:
@@ -209,22 +227,49 @@ def _build_pair_table(main_dig: dict[str, Any], ref_dig: dict[str, Any]) -> list
     r_stats = ref_dig.get("stats", {})
     rows: list[dict[str, Any]] = []
     for key, label, unit in CORE_STAT_KEYS:
-        mv = float(m_stats.get(key) or 0.0)
-        rv = float(r_stats.get(key) or 0.0)
-        if abs(mv) < 1e-4 and abs(rv) < 1e-4:
+        m_raw = m_stats.get(key)
+        r_raw = r_stats.get(key)
+        mf = _parse_numeric_or_none(m_raw)
+        rf = _parse_numeric_or_none(r_raw)
+        if mf is not None and rf is not None:
+            if math.isfinite(mf) and math.isfinite(rf) and abs(mf) < 1e-4 and abs(rf) < 1e-4:
+                continue
+        elif m_raw is None and r_raw is None:
             continue
         rows.append(
             {
                 "stat": key,
                 "label": label,
-                "main": mv,
-                "ref": rv,
-                "mainStr": f"{fmt_num(mv)}{unit}",
-                "refStr": f"{fmt_num(rv)}{unit}",
-                "diffRefVsMainStr": fmt_delta(mv, rv, unit),
+                "main": _json_safe_stat(m_raw),
+                "ref": _json_safe_stat(r_raw),
+                "mainStr": f"{fmt_num(m_raw if m_raw is not None else 0.0)}{unit}",
+                "refStr": f"{fmt_num(r_raw if r_raw is not None else 0.0)}{unit}",
+                "diffRefVsMainStr": fmt_delta(
+                    m_raw if m_raw is not None else 0.0,
+                    r_raw if r_raw is not None else 0.0,
+                    unit,
+                ),
             }
         )
     return rows
+
+
+def _run_worker_pair(
+    main_worker: BridgeWorker,
+    ref_worker: BridgeWorker,
+    fn_main: Any,
+    fn_ref: Any,
+) -> tuple[Any, Any]:
+    """Run independent main/ref evaluation closures concurrently unless both share a worker or lock."""
+    same_lock = (main_worker is ref_worker) or (
+        getattr(main_worker, "lock", None) is getattr(ref_worker, "lock", None)
+    )
+    if same_lock:
+        return fn_main(), fn_ref()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        fut_main = pool.submit(fn_main)
+        fut_ref = pool.submit(fn_ref)
+        return fut_main.result(), fut_ref.result()
 
 
 def compare_builds(
@@ -234,167 +279,240 @@ def compare_builds(
     ref_source: str | None = None,
     ref_xml_code: str | None = None,
 ) -> dict[str, Any]:
-    """Compare `main` build vs `ref` build across 3 baselines + tree, skill, and item diffs."""
+    """Compare `main` build vs `ref` build across 3 baselines + tree, skill, and item diffs (concurrent main/ref)."""
     if ref_source or ref_xml_code:
         load_build_into_worker(ref_worker, source=ref_source, xml_code=ref_xml_code)
 
-    with main_worker.lock, ref_worker.lock:
-        # 1. Baseline ①: Original panels
-        main_orig = capture_digest(main_worker)
-        ref_orig = capture_digest(ref_worker)
-        baseline_1 = _build_pair_table(main_orig, ref_orig)
-
-        # Structural diffs (captured on original state)
-        main_tree = inspect_tree(main_worker)
-        ref_tree = inspect_tree(ref_worker)
-
-        def _diff_node_lists(m_list: list[dict[str, Any]], r_list: list[dict[str, Any]]) -> dict[str, Any]:
-            m_map = {
-                int(n["id"]): strip_pob_escapes(n.get("nameZh") or n.get("name") or str(n["id"]))
-                for n in m_list
-            }
-            r_map = {
-                int(n["id"]): strip_pob_escapes(n.get("nameZh") or n.get("name") or str(n["id"]))
-                for n in r_list
-            }
-            m_ids = set(m_map.keys())
-            r_ids = set(r_map.keys())
-            return {
-                "onlyInMain": [{"id": i, "name": m_map[i]} for i in sorted(m_ids - r_ids)],
-                "onlyInRef": [{"id": i, "name": r_map[i]} for i in sorted(r_ids - m_ids)],
-                "sharedCount": len(m_ids & r_ids),
-            }
-
-        tree_diff = {
-            "mainPoints": main_tree.get("points"),
-            "refPoints": ref_tree.get("points"),
-            "keystones": _diff_node_lists(main_tree.get("keystones", []), ref_tree.get("keystones", [])),
-            "ascendancy": _diff_node_lists(main_tree.get("ascendancyNodes", []), ref_tree.get("ascendancyNodes", [])),
-            "notables": _diff_node_lists(main_tree.get("notables", []), ref_tree.get("notables", [])),
-            "masteries": _diff_node_lists(main_tree.get("masteries", []), ref_tree.get("masteries", [])),
-        }
-
-        # Skill diff
-        main_skills = main_worker.call("list_skills", {})
-        ref_skills = ref_worker.call("list_skills", {})
-
-        def _active_skill_names(skills_res: dict[str, Any]) -> set[str]:
-            names: set[str] = set()
-            for g in skills_res.get("groups", []):
-                if not g.get("enabled", True):
-                    continue
-                for gm in g.get("gems", []):
-                    if gm.get("enabled", True) and not gm.get("support"):
-                        nm = strip_pob_escapes(gm.get("nameZh") or gm.get("name") or gm.get("nameSpec") or "")
-                        if nm:
-                            names.add(nm)
-            return names
-
-        m_act = _active_skill_names(main_skills)
-        r_act = _active_skill_names(ref_skills)
-        m_main_idx = main_skills.get("mainSocketGroup") or 1
-        r_main_idx = ref_skills.get("mainSocketGroup") or 1
-        m_main_grp = next((g for g in main_skills.get("groups", []) if g["index"] == m_main_idx), None)
-        r_main_grp = next((g for g in ref_skills.get("groups", []) if g["index"] == r_main_idx), None)
-
-        skill_diff = {
-            "mainGroupMain": m_main_grp,
-            "refGroupMain": r_main_grp,
-            "activeSkillsOnlyInMain": sorted(m_act - r_act),
-            "activeSkillsOnlyInRef": sorted(r_act - m_act),
-            "sharedActiveSkills": sorted(m_act & r_act),
-        }
-
-        # Item slot diff
-        main_items_res = main_worker.call("list_items", {})
-        ref_items_res = ref_worker.call("list_items", {})
-        m_items_by_id = {it["id"]: it for it in main_items_res.get("items", [])}
-        r_items_by_id = {it["id"]: it for it in ref_items_res.get("items", [])}
-        m_slots = {s["name"]: s for s in main_items_res.get("slots", [])}
-        r_slots = {s["name"]: s for s in ref_items_res.get("slots", [])}
-
-        compare_slot_names = [
-            "Weapon 1",
-            "Weapon 2",
-            "Helmet",
-            "Body Armour",
-            "Gloves",
-            "Boots",
-            "Amulet",
-            "Ring 1",
-            "Ring 2",
-            "Belt",
-            "Flask 1",
-            "Flask 2",
-            "Flask 3",
-            "Flask 4",
-            "Flask 5",
-        ]
-        slot_comparison: list[dict[str, Any]] = []
-        for sname in compare_slot_names:
-            ms = m_slots.get(sname, {})
-            rs = r_slots.get(sname, {})
-            m_it = m_items_by_id.get(ms.get("selItemId") or 0)
-            r_it = r_items_by_id.get(rs.get("selItemId") or 0)
-            slot_comparison.append(
-                {
-                    "slot": sname,
-                    "mainItem": strip_pob_escapes(
-                        (m_it.get("titleZh") or m_it.get("title") or m_it.get("nameZh") or m_it.get("name"))
-                        if m_it
-                        else "-"
-                    ),
-                    "mainRarity": m_it.get("rarity") if m_it else "-",
-                    "refItem": strip_pob_escapes(
-                        (r_it.get("titleZh") or r_it.get("title") or r_it.get("nameZh") or r_it.get("name"))
-                        if r_it
-                        else "-"
-                    ),
-                    "refRarity": r_it.get("rarity") if r_it else "-",
-                }
+    # Phase 1: Capture original digests, trees, skills, items, main_env, and snapshot codes concurrently
+    def _capture_main_phase1() -> dict[str, Any]:
+        with main_worker.lock:
+            prev_last_good = getattr(main_worker, "last_good_code", None)
+            orig = capture_digest(main_worker)
+            tree = inspect_tree(main_worker)
+            skills, items, cfg, exp = _call_batch(
+                main_worker,
+                [
+                    ("list_skills", {}),
+                    ("list_items", {}),
+                    ("list_config", {}),
+                    ("export_code", {}),
+                ],
             )
+            if hasattr(main_worker, "last_good_code"):
+                main_worker.last_good_code = prev_last_good
+            return {
+                "orig": orig,
+                "tree": tree,
+                "skills": skills,
+                "items": items,
+                "env": _extract_env_config_from_cfg(cfg),
+                "snap": exp["code"],
+                "prev_last_good": prev_last_good,
+            }
 
-        # 2. Baseline ②: External target environment aligned to `main`
-        main_env = _extract_env_config(main_worker)
-        ref_snap = ref_worker.call("export_code", {})["code"]
-        try:
-            _apply_env_config(ref_worker, main_env)
-            ref_env_aligned = capture_digest(ref_worker)
-            baseline_2 = _build_pair_table(main_orig, ref_env_aligned)
-        finally:
-            ref_worker.call("import_code", {"code": ref_snap, "mode": "replace"})
+    def _capture_ref_phase1() -> dict[str, Any]:
+        with ref_worker.lock:
+            prev_last_good = getattr(ref_worker, "last_good_code", None)
+            orig = capture_digest(ref_worker)
+            tree = inspect_tree(ref_worker)
+            skills, items, exp = _call_batch(
+                ref_worker,
+                [
+                    ("list_skills", {}),
+                    ("list_items", {}),
+                    ("export_code", {}),
+                ],
+            )
+            if hasattr(ref_worker, "last_good_code"):
+                ref_worker.last_good_code = prev_last_good
+            return {
+                "orig": orig,
+                "tree": tree,
+                "skills": skills,
+                "items": items,
+                "snap": exp["code"],
+                "prev_last_good": prev_last_good,
+            }
 
-        # 3. Baseline ③: Both de-watered + Pinnacle Boss
-        main_snap = main_worker.call("export_code", {})["code"]
-        try:
-            main_stripped = dewater_build_in_place(main_worker)
-            ref_stripped = dewater_build_in_place(ref_worker)
-            main_dewatered = capture_digest(main_worker)
-            ref_dewatered = capture_digest(ref_worker)
-            baseline_3 = _build_pair_table(main_dewatered, ref_dewatered)
-        finally:
-            main_worker.call("import_code", {"code": main_snap, "mode": "replace"})
-            ref_worker.call("import_code", {"code": ref_snap, "mode": "replace"})
+    main_p1, ref_p1 = _run_worker_pair(main_worker, ref_worker, _capture_main_phase1, _capture_ref_phase1)
 
-        return {
-            "mainBuildInfo": main_orig["buildInfo"],
-            "refBuildInfo": ref_orig["buildInfo"],
-            "baselines": {
-                "original": baseline_1,
-                "envAlignedToMain": {
-                    "envConfig": main_env,
-                    "rows": baseline_2,
-                },
-                "pinnacleDewatered": {
-                    "mainStripped": main_stripped,
-                    "refStripped": ref_stripped,
-                    "rows": baseline_3,
-                },
-            },
-            "treeDiff": tree_diff,
-            "skillDiff": skill_diff,
-            "itemSlotDiff": slot_comparison,
+    main_orig = main_p1["orig"]
+    ref_orig = ref_p1["orig"]
+    main_tree = main_p1["tree"]
+    ref_tree = ref_p1["tree"]
+    main_skills = main_p1["skills"]
+    ref_skills = ref_p1["skills"]
+    main_items_res = main_p1["items"]
+    ref_items_res = ref_p1["items"]
+    main_env = main_p1["env"]
+    main_snap = main_p1["snap"]
+    ref_snap = ref_p1["snap"]
+
+    # 1. Baseline ①: Original panels
+    baseline_1 = _build_pair_table(main_orig, ref_orig)
+
+    def _diff_node_lists(m_list: list[dict[str, Any]], r_list: list[dict[str, Any]]) -> dict[str, Any]:
+        m_map = {
+            int(n["id"]): strip_pob_escapes(n.get("nameZh") or n.get("name") or str(n["id"]))
+            for n in m_list
         }
+        r_map = {
+            int(n["id"]): strip_pob_escapes(n.get("nameZh") or n.get("name") or str(n["id"]))
+            for n in r_list
+        }
+        m_ids = set(m_map.keys())
+        r_ids = set(r_map.keys())
+        return {
+            "onlyInMain": [{"id": i, "name": m_map[i]} for i in sorted(m_ids - r_ids)],
+            "onlyInRef": [{"id": i, "name": r_map[i]} for i in sorted(r_ids - m_ids)],
+            "sharedCount": len(m_ids & r_ids),
+        }
+
+    tree_diff = {
+        "mainPoints": main_tree.get("points"),
+        "refPoints": ref_tree.get("points"),
+        "keystones": _diff_node_lists(main_tree.get("keystones", []), ref_tree.get("keystones", [])),
+        "ascendancy": _diff_node_lists(main_tree.get("ascendancyNodes", []), ref_tree.get("ascendancyNodes", [])),
+        "notables": _diff_node_lists(main_tree.get("notables", []), ref_tree.get("notables", [])),
+        "masteries": _diff_node_lists(main_tree.get("masteries", []), ref_tree.get("masteries", [])),
+    }
+
+    def _active_skill_names(skills_res: dict[str, Any]) -> set[str]:
+        names: set[str] = set()
+        for g in skills_res.get("groups", []):
+            if not g.get("enabled", True):
+                continue
+            for gm in g.get("gems", []):
+                if gm.get("enabled", True) and not gm.get("support"):
+                    nm = strip_pob_escapes(gm.get("nameZh") or gm.get("name") or gm.get("nameSpec") or "")
+                    if nm:
+                        names.add(nm)
+        return names
+
+    m_act = _active_skill_names(main_skills)
+    r_act = _active_skill_names(ref_skills)
+    m_main_idx = main_skills.get("mainSocketGroup") or 1
+    r_main_idx = ref_skills.get("mainSocketGroup") or 1
+    m_main_grp = next((g for g in main_skills.get("groups", []) if g["index"] == m_main_idx), None)
+    r_main_grp = next((g for g in ref_skills.get("groups", []) if g["index"] == r_main_idx), None)
+
+    skill_diff = {
+        "mainGroupMain": m_main_grp,
+        "refGroupMain": r_main_grp,
+        "activeSkillsOnlyInMain": sorted(m_act - r_act),
+        "activeSkillsOnlyInRef": sorted(r_act - m_act),
+        "sharedActiveSkills": sorted(m_act & r_act),
+    }
+
+    m_items_by_id = {it["id"]: it for it in main_items_res.get("items", [])}
+    r_items_by_id = {it["id"]: it for it in ref_items_res.get("items", [])}
+    m_slots = {s["name"]: s for s in main_items_res.get("slots", [])}
+    r_slots = {s["name"]: s for s in ref_items_res.get("slots", [])}
+
+    compare_slot_names = [
+        "Weapon 1",
+        "Weapon 2",
+        "Helmet",
+        "Body Armour",
+        "Gloves",
+        "Boots",
+        "Amulet",
+        "Ring 1",
+        "Ring 2",
+        "Belt",
+        "Flask 1",
+        "Flask 2",
+        "Flask 3",
+        "Flask 4",
+        "Flask 5",
+    ]
+    slot_comparison: list[dict[str, Any]] = []
+    for sname in compare_slot_names:
+        ms = m_slots.get(sname, {})
+        rs = r_slots.get(sname, {})
+        m_it = m_items_by_id.get(ms.get("selItemId") or 0)
+        r_it = r_items_by_id.get(rs.get("selItemId") or 0)
+        slot_comparison.append(
+            {
+                "slot": sname,
+                "mainItem": strip_pob_escapes(
+                    (m_it.get("titleZh") or m_it.get("title") or m_it.get("nameZh") or m_it.get("name"))
+                    if m_it
+                    else "-"
+                ),
+                "mainRarity": m_it.get("rarity") if m_it else "-",
+                "refItem": strip_pob_escapes(
+                    (r_it.get("titleZh") or r_it.get("title") or r_it.get("nameZh") or r_it.get("name"))
+                    if r_it
+                    else "-"
+                ),
+                "refRarity": r_it.get("rarity") if r_it else "-",
+            }
+        )
+
+    # Phase 2: Concurrently evaluate Baseline ③ on `main` while `ref` runs Baseline ② + Baseline ③
+    main_prev_last_good = main_p1["prev_last_good"]
+    ref_prev_last_good = ref_p1["prev_last_good"]
+
+    def _eval_main_phase2() -> tuple[dict[str, list[str]], dict[str, Any]]:
+        with main_worker.lock:
+            try:
+                stripped = dewater_build_in_place(main_worker)
+                dewatered = capture_digest(main_worker)
+                return stripped, dewatered
+            finally:
+                main_worker.call("import_code", {"code": main_snap, "mode": "replace"})
+                if hasattr(main_worker, "last_good_code"):
+                    main_worker.last_good_code = main_prev_last_good
+
+    def _eval_ref_phase2() -> tuple[dict[str, Any], dict[str, list[str]], dict[str, Any]]:
+        with ref_worker.lock:
+            try:
+                _apply_env_config(ref_worker, main_env)
+                env_aligned = capture_digest(ref_worker)
+            finally:
+                ref_worker.call("import_code", {"code": ref_snap, "mode": "replace"})
+                if hasattr(ref_worker, "last_good_code"):
+                    ref_worker.last_good_code = ref_prev_last_good
+
+            try:
+                stripped = dewater_build_in_place(ref_worker)
+                dewatered = capture_digest(ref_worker)
+                return env_aligned, stripped, dewatered
+            finally:
+                ref_worker.call("import_code", {"code": ref_snap, "mode": "replace"})
+                if hasattr(ref_worker, "last_good_code"):
+                    ref_worker.last_good_code = ref_prev_last_good
+
+    (main_stripped, main_dewatered), (ref_env_aligned, ref_stripped, ref_dewatered) = _run_worker_pair(
+        main_worker,
+        ref_worker,
+        _eval_main_phase2,
+        _eval_ref_phase2,
+    )
+
+    baseline_2 = _build_pair_table(main_orig, ref_env_aligned)
+    baseline_3 = _build_pair_table(main_dewatered, ref_dewatered)
+
+    return {
+        "mainBuildInfo": main_orig["buildInfo"],
+        "refBuildInfo": ref_orig["buildInfo"],
+        "baselines": {
+            "original": baseline_1,
+            "envAlignedToMain": {
+                "envConfig": main_env,
+                "rows": baseline_2,
+            },
+            "pinnacleDewatered": {
+                "mainStripped": main_stripped,
+                "refStripped": ref_stripped,
+                "rows": baseline_3,
+            },
+        },
+        "treeDiff": tree_diff,
+        "skillDiff": skill_diff,
+        "itemSlotDiff": slot_comparison,
+    }
 
 
 def borrow_from_ref(
@@ -580,6 +698,12 @@ def borrow_from_ref(
 DEFAULT_MATRIX_SCENARIOS: list[str] = ["Original", "Pinnacle", "Uber", "FlasksOff"]
 
 
+_MATRIX_TOKEN_SPLIT_RE = re.compile(
+    r",\s*(?=[A-Za-z_][A-Za-z0-9_]*\s*=|(?:original|pinnacle|uber|flasks?_?(?:on|off)|no_?flasks)(?=\s*(?:,|$)))",
+    re.IGNORECASE,
+)
+
+
 def _parse_matrix_scenario(spec: str | dict[str, Any]) -> dict[str, Any]:
     """Normalize a string or dict matrix scenario specification into a canonical execution plan."""
     if isinstance(spec, dict):
@@ -647,7 +771,7 @@ def _parse_matrix_scenario(spec: str | dict[str, Any]) -> dict[str, Any]:
     custom_mods: str | None = None
     append_custom_mods: str | None = None
 
-    tokens = [tok.strip() for tok in body.split(",") if tok.strip()]
+    tokens = [tok.strip() for tok in _MATRIX_TOKEN_SPLIT_RE.split(body) if tok.strip()]
     if not tokens:
         raise ValueError(f"Matrix scenario '{raw}' has an empty specification body.")
 
@@ -701,21 +825,36 @@ def _parse_matrix_scenario(spec: str | dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _apply_matrix_scenario_in_place(worker: BridgeWorker, plan: dict[str, Any]) -> dict[str, Any]:
+def _apply_matrix_scenario_in_place(
+    worker: BridgeWorker,
+    plan: dict[str, Any],
+    *,
+    already_dewatered: bool = False,
+    cached_stripped: dict[str, list[str]] | None = None,
+) -> dict[str, Any]:
     """Apply a single parsed matrix scenario in place on the worker."""
-    applied_info: dict[str, Any] = {"base": plan["base"], "stripped": None, "config": [], "flasks": plan["flasks"]}
+    applied_info: dict[str, Any] = {
+        "base": plan["base"],
+        "stripped": cached_stripped if already_dewatered else None,
+        "config": [],
+        "flasks": plan["flasks"],
+    }
 
     if plan["base"] == "Pinnacle":
-        applied_info["stripped"] = dewater_build_in_place(worker)
+        if not already_dewatered:
+            applied_info["stripped"] = dewater_build_in_place(worker)
     elif plan["base"] == "Uber":
-        applied_info["stripped"] = dewater_build_in_place(worker)
+        if not already_dewatered:
+            applied_info["stripped"] = dewater_build_in_place(worker)
         worker.call("set_config", {"var": "enemyIsBoss", "value": "Uber"})
         applied_info["config"].append({"var": "enemyIsBoss", "action": "set", "value": "Uber"})
 
     if plan["flasks"] is not None:
         active_flag = bool(plan["flasks"])
-        for idx in range(1, 6):
-            worker.call("set_slot_active", {"slotName": f"Flask {idx}", "active": active_flag})
+        _call_batch(
+            worker,
+            [("set_slot_active", {"slotName": f"Flask {idx}", "active": active_flag}) for idx in range(1, 6)],
+        )
 
     if plan["config"] or plan["customMods"] is not None or plan["appendCustomMods"] is not None:
         cfg_res = _apply_config_in_place(
@@ -729,45 +868,121 @@ def _apply_matrix_scenario_in_place(worker: BridgeWorker, plan: dict[str, Any]) 
     return applied_info
 
 
+def _plan_has_post_base_mutations(plan: dict[str, Any]) -> bool:
+    return bool(
+        plan["base"] == "Uber"
+        or plan["flasks"] is not None
+        or plan["config"]
+        or plan["customMods"] is not None
+        or plan["appendCustomMods"] is not None
+    )
+
+
 def run_matrix(
     worker: BridgeWorker,
-    *,
     scenarios: list[str | dict[str, Any]] | None = None,
+    *,
+    full: bool = False,
 ) -> dict[str, Any]:
     """Evaluate multiple build scenarios in a single atomic 0-residue transaction.
 
-    Preserves the worker's loaded build, undo_stack, redo_stack, and last_good_code.
+    Caches the dewatered `Pinnacle` base build code once when 2+ scenarios require
+    `Pinnacle`/`Uber` dewatering, and emits compact `summary` + `coreStats` + `deltasVsFirst`
+    by default (`full=False`, ~85% smaller JSON) while preserving full digests when `full=True`.
     """
     raw_scenarios = list(scenarios) if scenarios else list(DEFAULT_MATRIX_SCENARIOS)
     parsed_plans = [_parse_matrix_scenario(s) for s in raw_scenarios]
+    pinnacle_count = sum(1 for p in parsed_plans if p["base"] in ("Pinnacle", "Uber"))
 
     with worker.lock:
+        prev_last_good = getattr(worker, "last_good_code", None)
         baseline_code = worker.call("export_code", {})["code"]
         results: list[dict[str, Any]] = []
         first_digest: dict[str, Any] | None = None
 
+        pinnacle_code: str | None = None
+        pinnacle_stripped: dict[str, list[str]] | None = None
+        # Track current worker build state: "original", "pinnacle", or "dirty"
+        worker_state = "original"
+
         try:
-            for idx, plan in enumerate(parsed_plans):
-                if idx > 0:
-                    worker.call("import_code", {"code": baseline_code, "mode": "replace"})
-                applied_info = _apply_matrix_scenario_in_place(worker, plan)
+            for plan in parsed_plans:
+                needs_pinnacle = plan["base"] in ("Pinnacle", "Uber")
+                want_base = "pinnacle" if (needs_pinnacle and pinnacle_code is not None) else "original"
+
+                if worker_state != want_base:
+                    target_code = pinnacle_code if want_base == "pinnacle" else baseline_code
+                    worker_state = "dirty"
+                    worker.call("import_code", {"code": target_code, "mode": "replace"})
+                    worker_state = want_base
+
+                has_post_mutations = _plan_has_post_base_mutations(plan)
+
+                if needs_pinnacle and pinnacle_code is None:
+                    # Mark dirty before mutating so finally always restores baseline_code on error
+                    worker_state = "dirty"
+                    pinnacle_stripped = dewater_build_in_place(worker)
+                    if pinnacle_count >= 2:
+                        pinnacle_code = worker.call("export_code", {})["code"]
+                        if not has_post_mutations:
+                            worker_state = "pinnacle"
+                    applied_info = _apply_matrix_scenario_in_place(
+                        worker,
+                        plan,
+                        already_dewatered=True,
+                        cached_stripped=pinnacle_stripped,
+                    )
+                elif needs_pinnacle and pinnacle_code is not None:
+                    if has_post_mutations:
+                        worker_state = "dirty"
+                    applied_info = _apply_matrix_scenario_in_place(
+                        worker,
+                        plan,
+                        already_dewatered=True,
+                        cached_stripped=pinnacle_stripped,
+                    )
+                else:
+                    if has_post_mutations:
+                        worker_state = "dirty"
+                    applied_info = _apply_matrix_scenario_in_place(worker, plan)
+
                 digest = capture_digest(worker)
                 if first_digest is None:
                     first_digest = digest
                 deltas_vs_first = diff_digest(first_digest, digest)
+
+                compact = compact_digest_summary(digest)
+                summary_only = {k: v for k, v in compact.items() if k != "coreStats"}
+                if full:
+                    entry_digest = digest
+                else:
+                    entry_digest = {
+                        "primaryDpsKey": compact["primaryDpsKey"],
+                        "primaryDps": compact["primaryDps"],
+                        "totalEhp": compact["totalEhp"],
+                        "life": compact["life"],
+                        "warnings": compact["warnings"],
+                    }
+
                 results.append(
                     {
                         "name": plan["name"],
                         "base": plan["base"],
                         "applied": applied_info,
-                        "digest": digest,
+                        "summary": summary_only,
+                        "coreStats": compact["coreStats"],
+                        "digest": entry_digest,
                         "deltasVsFirst": deltas_vs_first,
                     }
                 )
         finally:
-            worker.call("import_code", {"code": baseline_code, "mode": "replace"})
+            if worker_state != "original":
+                worker.call("import_code", {"code": baseline_code, "mode": "replace"})
+            if hasattr(worker, "last_good_code"):
+                worker.last_good_code = prev_last_good
 
         return {
             "baseline": results[0]["name"] if results else "Original",
+            "full": bool(full),
             "scenarios": results,
         }

@@ -124,14 +124,17 @@ class BridgeWorker:
         slot_name: str = "main",
         pob_root: Path | None = None,
         pob_dir: Path | None = None,
+        *,
+        runtime_dir: Path | None = None,
     ) -> None:
         self.slot_name = slot_name
+        self.runtime_dir: Path | None = Path(runtime_dir) if runtime_dir is not None else None
         if pob_dir is not None:
             resolved_root = Path(pob_dir)
         elif pob_root is not None:
             resolved_root = Path(pob_root)
         else:
-            resolved_root = resolve_engine_root()
+            resolved_root = resolve_engine_root(runtime_dir=self.runtime_dir)
         self.pob_root = resolved_root
         self.exe_path = self.pob_root / "pob-zh.exe"
         self.game_dir = self.pob_root / "PoE1"
@@ -139,6 +142,7 @@ class BridgeWorker:
         self._lock = threading.RLock()
         self.lock = self._lock
         self._proc: subprocess.Popen[str] | None = None
+        self._closing = False
         self._stdout_queue: queue.Queue[dict[str, Any] | Exception | None] = queue.Queue()
         self._stderr_tail: collections.deque[str] = collections.deque(maxlen=100)
         self._req_counter = 0
@@ -147,6 +151,7 @@ class BridgeWorker:
         self.bridge_version: str | None = None
         self.hello_info: dict[str, Any] = {}
         self.caps: dict[str, Any] = {}
+        self.translate_enabled: bool | None = None
         self.last_used: float = time.time()
         self.source_label: str | None = None
         self.last_good_code: str | None = None
@@ -174,11 +179,17 @@ class BridgeWorker:
             if not self.is_running:
                 self.start()
 
-    def start(self) -> None:
-        """Start pob-zh.exe --engine-headless and execute the mandatory 6-step handshake (R4, R8)."""
+    def start(self, *, restore_code: str | None = None) -> None:
+        """Start pob-zh.exe --engine-headless and execute the mandatory handshake (R4, R8).
+
+        When `restore_code` (or a persisted `last_good_code`) is available and the engine already
+        has a build context loaded, skip the redundant `new_build{}` (-430ms) and directly call
+        `import_code`, falling back to `new_build{}` if restore fails.
+        """
         with self._lock:
             if self.is_running:
                 return
+            self._closing = False
             self._kill_unlocked()
 
             if not self.game_dir.is_dir():
@@ -258,32 +269,86 @@ class BridgeWorker:
                     self.bridge_version = data.get("bridge")
                     hello_seen = True
 
-            # Step 4: Call version{} to cache caps
+            # Step 4: Call version{} to cache caps and initial translate state
             ver_info = self._raw_call_unlocked("version", {}, timeout=10.0)
             self.caps = ver_info.get("caps") or {}
             self.pob_version = ver_info.get("pobVersion") or self.pob_version
 
-            # Step 5: Enable bilingual display translation
-            if self.caps.get("translateToggle", True):
+            # Step 5: Enable bilingual display translation (skip redundant RPC if already enabled)
+            if self.caps.get("translateToggle", True) and self.translate_enabled is not True:
                 self._raw_call_unlocked("set_translate", {"enabled": True}, timeout=5.0)
+                if self.translate_enabled is None:
+                    self.translate_enabled = True
 
-            # Step 6 (R4): Always call new_build{} regardless of initial buildLoaded state
-            self._raw_call_unlocked("new_build", {}, timeout=10.0)
-            if not self.last_good_code:
-                self.load_slot_state()
-            if self.last_good_code:
-                try:
-                    self._raw_call_unlocked("import_code", {"code": self.last_good_code, "mode": "replace"}, timeout=15.0)
-                except Exception:
+            # Step 6 (R4): Restore build directly when possible (skipping redundant new_build{}),
+            # otherwise initialize a clean empty build.
+            if restore_code is not None:
+                target_code = restore_code or None
+                if target_code is None:
+                    self.last_good_code = None
+            else:
+                if not self.last_good_code:
+                    self.load_slot_state()
+                target_code = self.last_good_code
+
+            if target_code:
+                build_loaded = (
+                    ver_info["buildLoaded"]
+                    if "buildLoaded" in ver_info
+                    else self.hello_info.get("buildLoaded")
+                )
+                restored = False
+                if build_loaded is False:
+                    self._raw_call_unlocked("new_build", {}, timeout=10.0)
                     try:
-                        self._raw_call_unlocked("new_build", {}, timeout=10.0)
+                        self._raw_call_unlocked(
+                            "import_code",
+                            {"code": target_code, "mode": "replace"},
+                            timeout=15.0,
+                        )
+                        restored = True
                     except Exception:
-                        pass
+                        try:
+                            self._raw_call_unlocked("new_build", {}, timeout=10.0)
+                        except Exception:
+                            pass
+                else:
+                    try:
+                        self._raw_call_unlocked(
+                            "import_code",
+                            {"code": target_code, "mode": "new"},
+                            timeout=15.0,
+                        )
+                        restored = True
+                    except Exception as exc:
+                        if "no build is loaded" in str(exc).lower():
+                            try:
+                                self._raw_call_unlocked("new_build", {}, timeout=10.0)
+                                self._raw_call_unlocked(
+                                    "import_code",
+                                    {"code": target_code, "mode": "replace"},
+                                    timeout=15.0,
+                                )
+                                restored = True
+                            except Exception:
+                                try:
+                                    self._raw_call_unlocked("new_build", {}, timeout=10.0)
+                                except Exception:
+                                    pass
+                        else:
+                            try:
+                                self._raw_call_unlocked("new_build", {}, timeout=10.0)
+                            except Exception:
+                                pass
+                self.last_good_code = target_code if restored else None
+            else:
+                self._raw_call_unlocked("new_build", {}, timeout=10.0)
+
             self.last_used = time.time()
 
     @property
     def slot_state_path(self) -> Path:
-        return get_runtime_dir() / f"slot_{self.slot_name}.json"
+        return get_runtime_dir(self.runtime_dir) / f"slot_{self.slot_name}.json"
 
     def save_slot_state(self) -> None:
         """Persist slot build code and undo/redo stacks so daemon restarts never lose state."""
@@ -357,10 +422,43 @@ class BridgeWorker:
             except Exception:  # noqa: BLE001
                 pass
             self._proc = None
+        self.translate_enabled = None
+
+    def abort(self) -> None:
+        """Non-blocking subprocess termination to immediately unblock any in-flight RPC during shutdown."""
+        self._closing = True
+        proc = self._proc
+        if proc is not None:
+            try:
+                proc.kill()
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            self._stdout_queue.put_nowait(None)
+        except Exception:  # noqa: BLE001
+            pass
 
     def stop(self) -> None:
+        self._closing = True
         with self._lock:
             self._kill_unlocked()
+
+    def _sync_state_from_rpc(
+        self,
+        method: str,
+        params: dict[str, Any] | None,
+        result: dict[str, Any],
+    ) -> None:
+        if method == "set_translate":
+            if isinstance(result.get("enabled"), bool):
+                self.translate_enabled = result["enabled"]
+            elif isinstance(result.get("translate"), bool):
+                self.translate_enabled = result["translate"]
+            elif params is not None and "enabled" in params:
+                self.translate_enabled = bool(params["enabled"])
+        elif method == "version":
+            if isinstance(result.get("translate"), bool):
+                self.translate_enabled = result["translate"]
 
     def _raw_call_unlocked(
         self,
@@ -424,11 +522,153 @@ class BridgeWorker:
                 raise BridgeError(f"RPC '{method}' failed: {err_text}")
 
             result = msg.get("result")
-            return result if isinstance(result, dict) else {"value": result}
+            res_dict = result if isinstance(result, dict) else {"value": result}
+            self._sync_state_from_rpc(method, params, res_dict)
+            return res_dict
+
+    def call_batch(
+        self,
+        calls: list[tuple[str, dict[str, Any] | None]],
+        timeout: float = 30.0,
+        raise_on_error: bool = True,
+    ) -> list[dict[str, Any]]:
+        """Pipeline multiple JSON-RPC calls in a single stdin write+flush under `self._lock`.
+
+        Beats the ~62.5ms/RPC Win32 frame-tick floor in `pob-zh.exe --engine-headless`,
+        turning N×62.5ms roundtrips into 1×62.5ms while matching responses by request `id`.
+        """
+        if not calls:
+            return []
+
+        with self._lock:
+            for method, _ in calls:
+                if method in FORBIDDEN_METHODS:
+                    raise BridgeError(FORBIDDEN_METHODS[method])
+
+            if not self.is_running:
+                self.start()
+
+            for method, _ in calls:
+                if method == "sidebar_breakdown" and not bool(self.caps.get("sidebarBreakdown")):
+                    raise BridgeError(
+                        "R2: sidebarBreakdown is false on this engine version; use get_calcs + calcs_breakdown."
+                    )
+
+            assert self._proc is not None and self._proc.stdin is not None
+
+            pre_errors: dict[int, str] = {}
+            send_entries: list[tuple[int, int, str, dict[str, Any]]] = []
+            lines: list[str] = []
+            id_to_index: dict[int, int] = {}
+
+            for idx, (method, raw_params) in enumerate(calls):
+                params = raw_params or {}
+                if method == "import_code":
+                    tv_mismatch = self._check_tree_version_mismatch(str(params.get("code") or ""))
+                    if tv_mismatch:
+                        err_msg = f"RPC 'import_code' failed: {tv_mismatch}"
+                        if raise_on_error:
+                            raise BridgeError(err_msg)
+                        pre_errors[idx] = err_msg
+                        continue
+
+                self._req_counter += 1
+                req_id = self._req_counter
+                id_to_index[req_id] = idx
+                send_entries.append((idx, req_id, method, params))
+                lines.append(json.dumps({"id": req_id, "method": method, "params": params}, ensure_ascii=False))
+
+            raw_responses: dict[int, dict[str, Any]] = {}
+            if lines:
+                batch_payload = "\n".join(lines) + "\n"
+                try:
+                    self._proc.stdin.write(batch_payload)
+                    self._proc.stdin.flush()
+                except Exception as exc:
+                    self._recover_after_crash_unlocked()
+                    raise BridgeError(
+                        f"Failed writing batch ({len(send_entries)} RPCs) to pob-zh stdin: {exc}"
+                    ) from exc
+
+                deadline = time.monotonic() + timeout
+                expected = len(send_entries)
+                while len(raw_responses) < expected:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        self._recover_after_crash_unlocked()
+                        raise BridgeTimeoutError(
+                            f"Batch RPC timed out after {timeout:.1f}s "
+                            f"(received {len(raw_responses)}/{expected} responses); worker restarted and healed."
+                        )
+                    try:
+                        msg = self._stdout_queue.get(timeout=remaining)
+                    except queue.Empty as exc:
+                        self._recover_after_crash_unlocked()
+                        raise BridgeTimeoutError(
+                            f"Batch RPC timed out after {timeout:.1f}s "
+                            f"(received {len(raw_responses)}/{expected} responses); worker restarted and healed."
+                        ) from exc
+
+                    if msg is None or isinstance(msg, Exception):
+                        self._recover_after_crash_unlocked()
+                        raise BridgeError(
+                            f"Headless engine crashed during batch RPC "
+                            f"(received {len(raw_responses)}/{expected} responses): {msg}"
+                        )
+
+                    msg_id = msg.get("id")
+                    if msg_id not in id_to_index:
+                        # Ignore asynchronous events or stale response IDs (R8)
+                        continue
+                    raw_responses[id_to_index[msg_id]] = msg
+
+                self.last_used = time.time()
+
+            results: list[dict[str, Any]] = [{} for _ in range(len(calls))]
+            first_error: str | None = None
+            had_import_error = False
+
+            for idx, err_msg in pre_errors.items():
+                results[idx] = {"ok": False, "error": err_msg, "_error": err_msg, "method": calls[idx][0]}
+                if first_error is None:
+                    first_error = err_msg
+
+            for idx, _, method, params in send_entries:
+                msg = raw_responses[idx]
+                if msg.get("ok") is False or ("error" in msg and msg["error"] is not None):
+                    err_obj = msg.get("error")
+                    if isinstance(err_obj, dict):
+                        err_text = err_obj.get("message") or json.dumps(err_obj, ensure_ascii=False)
+                    else:
+                        err_text = str(err_obj or "unknown bridge error")
+                    full_err = f"RPC '{method}' failed: {err_text}"
+                    if method == "import_code":
+                        had_import_error = True
+                        tv_hint = self._check_tree_version_mismatch(str(params.get("code") or ""))
+                        if tv_hint and tv_hint not in full_err:
+                            full_err = f"{full_err} | {tv_hint}"
+                    results[idx] = {"ok": False, "error": err_text, "_error": err_text, "method": method}
+                    if first_error is None:
+                        first_error = full_err
+                else:
+                    result = msg.get("result")
+                    res_dict = result if isinstance(result, dict) else {"value": result}
+                    self._sync_state_from_rpc(method, params, res_dict)
+                    results[idx] = res_dict
+
+            if had_import_error:
+                self._restore_after_failed_import_unlocked()
+
+            if raise_on_error and first_error is not None:
+                raise BridgeError(first_error)
+
+            return results
 
     def _recover_after_crash_unlocked(self) -> None:
         """Kill hung/crashed subprocess, restart cleanly, and restore last_good_code if available."""
         self._kill_unlocked()
+        if self._closing:
+            return
         try:
             self.start()
         except Exception:  # noqa: BLE001
@@ -472,6 +712,7 @@ class BridgeWorker:
                         timeout=15.0,
                     )
                 except Exception:  # noqa: BLE001
+                    self.last_good_code = None
                     self._raw_call_unlocked("new_build", {}, timeout=10.0)
         except Exception:  # noqa: BLE001
             self._recover_after_crash_unlocked()

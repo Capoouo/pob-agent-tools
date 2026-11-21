@@ -130,3 +130,16 @@ def test_release_tools_pack_and_scoop_manifest_update(tmp_path: Path) -> None:
     assert updated["architecture"]["64bit"]["hash"] == zip_sha
     assert updated["architecture"]["64bit"]["url"].endswith("/v0.2.0/pob-v0.2.0-windows-x64.zip")
 
+
+def test_lazy_subcommands_listed_in_pyinstaller_hiddenimports() -> None:
+    from pob_cli.cli import _LAZY_SUBCOMMANDS
+
+    spec_path = Path(__file__).resolve().parents[1] / "packaging" / "pob.spec"
+    spec_text = spec_path.read_text(encoding="utf-8")
+    for cmd_name, (mod_path, _attr, _help) in _LAZY_SUBCOMMANDS.items():
+        full_mod = f"pob_cli{mod_path}" if mod_path.startswith(".") else mod_path
+        assert f'"{full_mod}"' in spec_text or f"'{full_mod}'" in spec_text, (
+            f"Lazy subcommand {cmd_name!r} module {full_mod!r} must be listed in pob.spec hiddenimports"
+        )
+
+
