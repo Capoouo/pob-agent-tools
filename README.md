@@ -34,12 +34,24 @@
 ## 主要功能
 
 - **安装与更新 PoB 引擎**（`pob bootstrap` / `pob update`）：Windows 使用 PobTools-zh；macOS 和 Linux 使用本机编译的 LuaJIT 运行时。工具会定期检查 PobTools-zh 和 PoB 的更新，更新失败时保留可用的旧版本。GitHub 暂时连不上，也可以继续使用本地引擎。
+  - Windows x64 使用 `pob-zh.exe --engine-headless`，支持中英双语；macOS（Apple Silicon / Intel）和 Linux 使用原生编译的 `LuaJIT 2.1 + lua-utf8`，通过 `headless_runner.lua` 运行官方 PoB 与 `bridge.lua`。
+  - 启动时及之后每 30 分钟检查一次更新：从 PobTools-zh 的 `302` 重定向获取版本，不调用 `api.github.com`；再按官方 `manifest.xml` 的 SHA1 增量下载 PoB 文件。更新会先通过 `gate_result` 检查，再刷新已加载的构筑槽位；失败则从 `.bak/` 回滚。
+  - GitHub 无法访问时，连接会在 3 秒内失败并转用本地引擎；`stderr`、JSON `updateWarning` 和 Markdown 告警会说明更新状态。
 - **同时管理多份构筑**：用 `--target <slug>` 给构筑命名，例如 `main`、`ref` 或 `mageblood_test`。每份构筑都有独立的撤销与重做记录；`pob serve` 可让引擎保持运行，省去反复启动的时间。
+  - 槽位数量不再固定为两个，例如可同时使用 `main`、`ref`、`pinnacle_test`、`mageblood_test`；也可用环境变量 `POB_SLOT` 设置默认槽位。每个槽位保存 30 步 `undo` / `redo` 历史。
+  - 引擎调用支持 `call_batch` 批处理；CLI 按需加载模块，并在发现失效进程锁时快速清理（目标 `<1ms`）。热查询通常以毫秒计。普通命令会自动启动后台进程；容器或 Agent 环境可改用 `pob serve` 前台常驻。
 - **检查 PoB 面板有没有“水分”**（`pob audit` / `pob matrix`）：分别检查配置项、药剂、临时或瓦尔技能、组队增益对面板的影响，并用 PoB 重新计算每项带来的 DPS 和有效生命变化。法师之血提供的魔法药剂效果、基础技能和常驻光环会按实际情况保留。确定能稳定触发的条件可用 `--keep` 留下；检查结束后会核对构筑是否恢复原样。
+  - 审计会逐项关闭 PoB Config 配置、非常驻药剂、临时防御或爆发技能、瓦尔爆发和组队增益，再单独恢复每一项，测出它对 DPS / EHP 的影响。瓦尔技能会关闭爆发版本 `enableGlobal1`，保留基础技能 `enableGlobal2`，必要时切换 `mainActiveSkill`。
+  - 自定义词缀 `customMods` 按分组禁用，不改动原有标题和文本；内部使用哨兵分组维持配置结构。每次重算前会回读配置，确认改动生效。`--keep` 可指定单个条件、药剂、技能或 `customMods:<分组名>`；条件拼错时会在 `keepRejected` 中提示。最后用 `verify_restored` 核对原构筑。
 - **试配和批量比较**（`pob batch` / `pob sweep`）：换装备、改技能、调整天赋与配置默认只做试算，结束后恢复原构筑。加 `--apply` 才保存修改。也可以把多项改动组合起来，或一次比较多套配装和技能连法。
+  - 单步和批量改动都在内存中的构筑快照上运行。`pob batch` 可组合 19 类操作并返回指定分析视图；`pob sweep` 在同一个已启动的引擎中比较多套配装、天赋或技能连法，单套方案出错不会中断其他结果。
 - **搜索永恒珠宝种子**（`pob timeless list` / `pob timeless search`）：按已点亮的珠宝孔和天赋，用 PoB 逐个计算候选种子的收益；支持中文和英文珠宝名。需要遍历所有候选时可加 `--exact`。
+  - 从 PoB 的 `Data/Uniques/jewel.lua` 读取 11 种永恒珠宝数据。对致命的骄傲、残酷的约束、军团的信仰、优雅的狂妄、英雄的悲剧等珠宝，先按已分配及涂油取得的核心天赋去重，再预筛候选种子；`--exact` 跳过预筛。搜索可用多个临时引擎进程并行运行，并处理其他珠宝孔中冲突的 `Historic` 珠宝。
 - **查询游戏数据和物价**（`pob data` / `pob price` / `pob meta` / `pob poedb` / `pob wiki`）：本地中英双语索引可查宝石、传奇装备、词缀和底材；联网时还能查 poe.ninja 物价与构筑分布、流亡编年史和 PoE Wiki。
+  - 本地数据库由 PoB 的 Lua 数据建立 SQLite/FTS5 索引；无需启动 PoB，查询通常在 15ms 内完成。覆盖秽生传奇变体、工艺台/古灵/腐化词缀和中英名称互查，一条命令可同时查多个词。
 - **找装备、补词缀**（`pob trade` / `pob bench`）：搜索官方交易市集的在售装备，用 PoB 比较换装收益；还能查看工艺台可补的词缀，并试算丰收同阶元素抗性转换。交易功能只负责搜索和计算，不会代替玩家购买。
+  - `TradeSiteStats.lua` 在本地匹配中英文交易词缀，并区分装备局部词缀与全局词缀；交易搜索遵守 GGG 响应头给出的请求频率限制，支持 3.30 一口价搜索和 `chaos_equiv` 折算。
+  - `--allow-conversion` 只在满足条件时考虑丰收同阶转抗，并检查词缀组冲突；候选装备的 DPS / EHP 变化由 PoB 批量计算。`pob bench` 结合 `ModMaster.lua` 与本地费用/解锁数据给出可验证的工艺台词缀建议。
 
 ---
 
@@ -150,7 +162,7 @@ pob update --proxy http://127.0.0.1:7890        # 更新引擎，并刷新已加
 
 ### 输出格式与构筑槽位
 
-命令可以输出 JSON、压缩为单行，或直接写入 UTF-8 文件。在 Windows 上，直接写文件也能避开 PowerShell 重定向可能造成的编码问题：
+命令可以输出 JSON、压缩为单行，或直接写入 UTF-8 无 BOM 文件。在 Windows 上，直接写文件也能避开 PowerShell 重定向可能造成的编码问题：
 
 ```powershell
 # 全局参数放在 pob 之后；多数子命令也支持同名选项
@@ -175,7 +187,7 @@ pob stop
 
 ### 导入、创建和导出构筑
 
-`pob load` 可以读取本地 `.xml` / `.txt` 文件、Base64 分享码、常见的 PoB 分享链接，以及 `poe.ninja` 角色页面链接：
+`pob load` 支持本地 `.xml` / `.txt` 文件（直接传路径或 `@path`）、原始 Base64 分享码，以及 `pobb.in`、`poedb.tw/pob`、`poe.ninja/pob`、`maxroll.gg/poe/pob`、`pob.codes`、`pastebin.com`、`pastebinp.com`、`rentry.co` 这 8 个分享站。`poe.ninja` 角色主页链接也能直接导入：
 
 ```powershell
 # 1. 将构筑导入默认的 main 槽位
@@ -255,7 +267,7 @@ pob calc "Average Hit" "Spell Suppression" "Mana Regen"
 
 ### 2. 比较不同战斗场景 (`pob matrix`)
 
-一次运行就能比较同一份构筑在**当前配置 (`Original`)**、**巅峰首领 (`Pinnacle`)**、**超级首领 (`Uber`)**、**关闭药剂 (`FlasksOff`)**等场景下的表现，也可以添加自定义场景。比较结束后会核对构筑是否恢复原样：
+一次运行就能比较同一份构筑在**当前配置 (`Original`)**、**去水后的 84 级巅峰首领 (`Pinnacle`)**、**去水后的 85 级超级首领 (`Uber`)**、**关闭药剂 (`FlasksOff`)**等场景下的表现，也可以添加自定义场景。比较结束后会核对构筑是否恢复原样。默认显示常用指标；`--full` 可输出 200 多项原始统计：
 
 ```powershell
 # 默认四场景对比（Original / Pinnacle / Uber / FlasksOff）
@@ -275,7 +287,7 @@ pob matrix Original Pinnacle --full --json --out matrix_full.json
 
 ### 3. 试配装备、药剂、涂油、技能和天赋
 
-换装备、改天赋、换宝石等命令默认只做试算：显示改动前后的差值，随后恢复原构筑。想保留修改，再加 `--apply`；保存后可用 `pob undo` / `pob redo` 撤销或重做。
+换装备、改天赋、换宝石等命令默认只做试算：显示改动前后的差值，随后恢复原构筑。想保留修改，再加 `--apply`；保存后可用 `pob undo` / `pob redo` 撤销或重做。项链涂油使用 PoB 自己的涂油流程，并校验核心天赋是否合法；改天赋时也可指定专精的 `effectId`。配置命令兼容旧首领别名、下拉菜单的 `None` 选项，以及向现有 `customMods` 追加词缀。
 
 ```powershell
 # --- 试穿装备、调整词缀、切换药剂与项链涂油 ---
@@ -403,13 +415,13 @@ pob timeless search `
 pob timeless search --jewel "Militant Faith" --socket 41263 --stat TotalEHP --exact --workers 4
 ```
 
-> **内存占用**：每个并行运行的 PoB 进程约占 1.3–1.7 GB 内存。`--workers` 最多默认启用 4 个进程；后台搜索时可加 `--idle`，降低 CPU 占用优先级。
+> **性能与内存**：`pob timeless list` 通常在 100ms 内返回。每个并行运行的 PoB 进程约占 1.3–1.7 GB 内存。`--workers` 默认取 CPU 核心数的一半，最多 4 个进程；后台搜索时可加 `--idle`，降低 CPU 占用优先级。
 
 ---
 
 ### 7. 查询游戏数据、物价与构筑分布
 
-这些查询命令一次可接收多个关键词。本地游戏数据无需启动 PoB；物价和百科查询会联网，并在本地缓存结果：
+这些查询命令一次可接收多个关键词。本地游戏数据无需启动 PoB；poe.ninja 物价覆盖 52 个分类并缓存 15 分钟，流亡编年史查询可查看词缀池、权重和化石标签；百科查询也会在本地缓存结果：
 
 ```powershell
 # --- 本地游戏数据库：宝石、传奇、词缀、底材和中英名称 ---
@@ -465,7 +477,7 @@ pob trade convert --file .\dropped_gloves.txt --to lightning
 
 ## 退出码说明
 
-写脚本或让 Agent 调用时，可以根据退出码判断下一步。命令报错时会显示简短提示：
+写脚本或让 Agent 调用时，可以根据退出码判断下一步。命令报错时会显示简短提示，不会直接打印 Python Traceback：
 
 | 命令范围 | 退出码 | 含义与处理方式 |
 |---|---|---|
@@ -499,7 +511,7 @@ pyinstaller --noconfirm --clean pob_cli/packaging/pob.spec
 
 1. 修改 `pob_cli/src/pob_cli/__init__.py` 中的 `__version__`，并合入 `main`。
 2. 创建并推送版本标签：`git tag -s v0.4.0 -m "pob-agent-tools v0.4.0" && git push origin main v0.4.0`。
-3. GitHub Actions 检查版本号、运行测试、构建并检查 Windows 压缩包及 Python 安装包，随后发布 GitHub Release，并更新 Scoop 清单 `bucket/pob.json`。
+3. GitHub Actions 检查版本号、运行测试、构建并冒烟测试 `pob-vX.Y.Z-windows-x64.zip`、Wheel / sdist 和 `SHA256SUMS.txt`，随后发布 GitHub Release，并更新 Scoop 清单 `bucket/pob.json`。
 
 Agent 命令速查见 [AGENTS.md](AGENTS.md)。
 
