@@ -25,6 +25,7 @@ from .bridge_client import (
     BridgeError,
     BridgeWorker,
 )
+from .errors import DaemonRequestError
 from .updater import (
     OK_STATES,
     STATE_BOOTSTRAP_MISSING,
@@ -851,7 +852,7 @@ class DaemonManager:
         if action == "borrow":
             if not rw.last_good_code:
                 ref_slot = getattr(rw, "slot_name", None) or "ref"
-                raise RuntimeError(
+                raise DaemonRequestError(
                     f"No reference build loaded in '{ref_slot}' slot. "
                     f"Run `pob load <source> --target {ref_slot}` or `pob compare <source>` first."
                 )
@@ -892,6 +893,8 @@ class DaemonManager:
                     )
                     if isinstance(exc, BridgeError):
                         raise BridgeError(f"{exc}{guidance}") from exc
+                    if isinstance(exc, (DaemonRequestError, ValueError)):
+                        raise DaemonRequestError(f"{exc}{guidance}") from exc
                     raise RuntimeError(f"{exc}{guidance}") from exc
                 raise
             return self._attach_warning_if_degraded(load_res)
@@ -906,7 +909,11 @@ class DaemonManager:
                 if params.get("include_xml"):
                     xml_res = w.call("save_xml", {})
                     xml_str = xml_res.get("xml") or share_code_to_xml(code_str)
-                return {"code": code_str, "xml": xml_str}
+                return {
+                    "code": code_str,
+                    "xml": xml_str,
+                    "pobDir": str(self.pob_dir) if self.pob_dir else None,
+                }
 
         if action == "undo":
             from .snapshot import undo_build
@@ -927,7 +934,14 @@ class DaemonManager:
         if action == "audit":
             from .analyzer import audit_build
 
-            return audit_build(w)
+            raw_keep = params.get("keep")
+            keep_val = [raw_keep] if isinstance(raw_keep, str) else (list(raw_keep) if raw_keep is not None else None)
+            return _call_compat(
+                audit_build,
+                w,
+                keep=keep_val,
+                attribution=bool(params.get("attribution", True)),
+            )
 
         if action == "items":
             from .analyzer import inspect_items
@@ -1011,11 +1025,14 @@ class DaemonManager:
         if action == "matrix":
             from .comparator import run_matrix
 
+            raw_keep = params.get("keep")
+            keep_val = [raw_keep] if isinstance(raw_keep, str) else (list(raw_keep) if raw_keep is not None else None)
             return _call_compat(
                 run_matrix,
                 w,
                 scenarios=params.get("scenarios"),
                 full=bool(params.get("full", False)),
+                keep=keep_val,
             )
 
         if action == "rank_nodes":
@@ -1125,9 +1142,14 @@ class DaemonManager:
             )
 
         if action == "item_flask":
+            flask_idx = params.get("flask_index")
+            if flask_idx is None:
+                raise ValueError("Missing required parameter 'flask_index'.")
+            if "active" not in params or params["active"] is None:
+                raise ValueError("Missing required parameter 'active'.")
             return mutators.set_flask_active(
                 w,
-                flask_index=params["flask_index"],
+                flask_index=flask_idx,
                 active=bool(params["active"]),
                 apply=bool(params.get("apply", False)),
             )
@@ -1168,10 +1190,13 @@ class DaemonManager:
             )
 
         if action == "skill_rm":
+            gem_sel = params.get("gem")
+            if gem_sel is None or (isinstance(gem_sel, str) and not gem_sel.strip()):
+                raise ValueError("Missing required parameter 'gem'.")
             return mutators.remove_skill_gem(
                 w,
                 group_selector=str(params.get("group") or "main"),
-                gem_selector=params["gem"],
+                gem_selector=gem_sel,
                 apply=bool(params.get("apply", False)),
             )
 
@@ -1247,6 +1272,8 @@ class DaemonManager:
             )
 
         if action == "batch":
+            raw_keep = params.get("keep")
+            keep_val = [raw_keep] if isinstance(raw_keep, str) else (list(raw_keep) if raw_keep is not None else None)
             return _call_compat(
                 mutators.run_batch,
                 w,
@@ -1254,9 +1281,12 @@ class DaemonManager:
                 apply=bool(params.get("apply", False)),
                 no_undo=bool(params.get("no_undo", params.get("noUndo", False))),
                 return_sections=params.get("return_sections") or params.get("returnSections"),
+                keep=keep_val,
             )
 
         if action == "sweep":
+            raw_keep = params.get("keep")
+            keep_val = [raw_keep] if isinstance(raw_keep, str) else (list(raw_keep) if raw_keep is not None else None)
             return _call_compat(
                 mutators.run_sweep,
                 w,
@@ -1264,7 +1294,13 @@ class DaemonManager:
                 base_ops=params.get("base_ops") or params.get("baseOps"),
                 calc_keywords=params.get("calc_keywords") or params.get("calcKeywords"),
                 scenario=params.get("scenario"),
+                keep=keep_val,
             )
+
+        if action == "timeless_list":
+            from .timeless import describe_worker
+
+            return describe_worker(w, pob_dir=self.pob_dir, runtime_dir=self.runtime_dir)
 
         if action == "trade_eval_items":
             from . import trade_eval
@@ -1313,17 +1349,47 @@ def make_handler(manager: DaemonManager) -> type["BaseHTTPRequestHandler"]:
                 if length < 0:
                     raise ValueError("negative Content-Length")
             except ValueError:
-                self._send_json(400, {"ok": False, "error": "Invalid Content-Length header"})
+                self._send_json(
+                    400,
+                    {
+                        "ok": False,
+                        "error": "Invalid Content-Length header",
+                        "type": "ValueError",
+                        "errorKind": "request",
+                    },
+                )
                 return
             raw_body = self.rfile.read(length).decode("utf-8", errors="replace")
             try:
                 req = json.loads(raw_body) if raw_body else {}
+                if not isinstance(req, dict):
+                    raise ValueError("RPC request payload must be a JSON object.")
                 action = req.get("action")
                 params = req.get("params") or {}
+                if not isinstance(params, dict):
+                    raise ValueError("RPC 'params' must be a JSON object.")
                 result = manager.dispatch(action, params)
                 self._send_json(200, {"ok": True, "result": result})
+            except (DaemonRequestError, ValueError) as exc:
+                self._send_json(
+                    400,
+                    {
+                        "ok": False,
+                        "error": str(exc),
+                        "type": type(exc).__name__,
+                        "errorKind": "request",
+                    },
+                )
             except BridgeError as exc:
-                self._send_json(400, {"ok": False, "error": str(exc), "type": "BridgeError"})
+                self._send_json(
+                    400,
+                    {
+                        "ok": False,
+                        "error": str(exc),
+                        "type": "BridgeError",
+                        "errorKind": "daemon",
+                    },
+                )
             except Exception as exc:
                 self._send_json(
                     400,
@@ -1331,6 +1397,7 @@ def make_handler(manager: DaemonManager) -> type["BaseHTTPRequestHandler"]:
                         "ok": False,
                         "error": str(exc),
                         "type": exc.__class__.__name__,
+                        "errorKind": "daemon",
                         "trace": traceback.format_exc(limit=4),
                     },
                 )
@@ -1546,21 +1613,36 @@ def _http_post_rpc(
     return status, data
 
 
+def _parse_daemon_endpoint(state: dict[str, Any]) -> tuple[int, str]:
+    """Validate and extract `(port, token)` from a `daemon.json` state dict."""
+    raw_port = state["port"]
+    if isinstance(raw_port, bool):
+        raise TypeError("Invalid boolean port in daemon.json")
+    port = int(raw_port)
+    if not (1 <= port <= 65535):
+        raise ValueError(f"Out-of-range port in daemon.json: {port}")
+    raw_token = state["token"]
+    if raw_token is None:
+        raise TypeError("Missing token in daemon.json")
+    return port, str(raw_token)
+
+
 def _probe_daemon(state: dict[str, Any], *, timeout: float = 5.0) -> dict[str, Any] | None:
     """Return daemon status result if alive and reachable, else None."""
     pid = state.get("pid")
     if isinstance(pid, int) and not _is_pid_alive(pid):
         return None
     try:
+        port, token = _parse_daemon_endpoint(state)
         status_code, data = _http_post_rpc(
-            int(state["port"]),
-            str(state["token"]),
+            port,
+            token,
             {"action": "status", "params": {"skip_periodic_check": True}},
             timeout=timeout,
         )
         if status_code == 200 and data.get("ok"):
             return data.get("result")
-    except (OSError, http.client.HTTPException, TimeoutError, ValueError, KeyError):
+    except (OSError, http.client.HTTPException, TimeoutError, KeyError, TypeError, ValueError):
         return None
     return None
 
@@ -1582,9 +1664,10 @@ def stop_daemon(runtime_dir: Path | None = None, *, timeout: float = 10.0) -> di
         return {"stopped": False, "staleCleaned": True}
 
     try:
+        port, token = _parse_daemon_endpoint(state)
         status_code, data = _http_post_rpc(
-            int(state["port"]),
-            str(state["token"]),
+            port,
+            token,
             {"action": "stop", "params": {}},
             timeout=timeout,
         )
@@ -1597,7 +1680,7 @@ def stop_daemon(runtime_dir: Path | None = None, *, timeout: float = 10.0) -> di
         if not data.get("ok"):
             raise RuntimeError(data.get("error") or "Daemon stop error")
         return data.get("result") or {"stopped": True}
-    except (OSError, http.client.HTTPException, TimeoutError):
+    except (OSError, http.client.HTTPException, TimeoutError, KeyError, TypeError, ValueError):
         try:
             state_file.unlink()
         except OSError:
@@ -1741,6 +1824,18 @@ def _ensure_daemon(
     return final_state, ping_status_result
 
 
+def _rpc_result(data: dict[str, Any]) -> dict[str, Any]:
+    """Preserve the daemon's request/failure classification in the CLI process."""
+    if not data.get("ok"):
+        message = data.get("error") or "Daemon error"
+        if data.get("errorKind") == "request":
+            raise DaemonRequestError(message)
+        raise RuntimeError(message)
+    if "result" not in data:
+        raise RuntimeError("Malformed daemon RPC response: missing 'result'.")
+    return data["result"]
+
+
 def call_daemon(
     action: str,
     params: dict[str, Any] | None = None,
@@ -1766,9 +1861,10 @@ def call_daemon(
             state = None
         else:
             try:
+                port, token = _parse_daemon_endpoint(state)
                 status_code, data = _http_post_rpc(
-                    int(state["port"]),
-                    str(state["token"]),
+                    port,
+                    token,
                     {"action": action, "params": params or {}},
                     timeout=timeout,
                 )
@@ -1781,8 +1877,8 @@ def call_daemon(
                 except OSError:
                     pass
                 state = None
-            except (ConnectionError, OSError, http.client.HTTPException):
-                # Stale/unreachable daemon.json; clean up and fall through to auto_start
+            except (ConnectionError, OSError, http.client.HTTPException, KeyError, TypeError, ValueError):
+                # Stale/corrupt/unreachable daemon.json; clean up and fall through to auto_start
                 try:
                     state_file.unlink()
                 except OSError:
@@ -1797,9 +1893,7 @@ def call_daemon(
                         pass
                     state = None
                 else:
-                    if not data.get("ok"):
-                        raise RuntimeError(data.get("error") or "Daemon error")
-                    result = data["result"]
+                    result = _rpc_result(data)
                     if emit_cold_start_alert:
                         _maybe_emit_degraded_alert(result, rt_dir)
                     return result
@@ -1821,15 +1915,17 @@ def call_daemon(
     if action == "status" and ping_status_result is not None:
         return ping_status_result
 
+    try:
+        port, token = _parse_daemon_endpoint(st)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError(f"Corrupt PoB daemon state after startup: {exc}") from exc
     _, data = _http_post_rpc(
-        int(st["port"]),
-        str(st["token"]),
+        port,
+        token,
         {"action": action, "params": params or {}},
         timeout=timeout,
     )
-    if not data.get("ok"):
-        raise RuntimeError(data.get("error") or "Daemon error")
-    result = data["result"]
+    result = _rpc_result(data)
     if emit_cold_start_alert:
         _maybe_emit_degraded_alert(result, rt_dir)
     return result

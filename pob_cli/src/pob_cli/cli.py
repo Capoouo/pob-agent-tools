@@ -28,6 +28,11 @@ _LAZY_SUBCOMMANDS: dict[str, tuple[str, str, str]] = {
         "bench_group",
         "Look up PoE1 crafting bench modifiers (ModMaster.lua authoritative + cost overlay).",
     ),
+    "timeless": (
+        ".cli_timeless",
+        "timeless_group",
+        "Find optimal timeless jewel seeds verified by headless PoB.",
+    ),
 }
 
 
@@ -226,6 +231,9 @@ def _parse_gem_spec(spec: str) -> dict[str, Any]:
     return {"name": s}
 
 
+DAEMON_FAILURE_EXIT_CODE = 5  # same code as upstream/API failures in the exit-code contract
+
+
 def _daemon_call(
     action: str,
     params: dict[str, Any] | None = None,
@@ -233,8 +241,17 @@ def _daemon_call(
     auto_start: bool = True,
     timeout: float = 150.0,
 ) -> dict[str, Any]:
-    """Call daemon and translate BootstrapMissingError into clean stderr guidance + exit(1)."""
-    from .daemon import BootstrapMissingError, call_daemon
+    """Call the daemon; report known failures as clean messages instead of tracebacks.
+
+    - BootstrapMissingError: engine not installed -> update/bootstrap guidance, exit 1.
+    - DaemonRequestError: the daemon rejected the request (invalid arg/build state)
+      -> `Error: <message>`, exit 1.
+    - Any other RuntimeError / OSError / HTTP / ValueError: daemon itself failed
+      (not running, boot failure, startup timeout, crash) -> `Error: PoB daemon failure ...`, exit 5.
+    """
+    import http.client
+
+    from .daemon import BootstrapMissingError, DaemonRequestError, call_daemon
     from .updater import format_stderr_update_alert
 
     try:
@@ -242,7 +259,53 @@ def _daemon_call(
     except BootstrapMissingError as exc:
         alert = format_stderr_update_alert(exc.update_status) or str(exc)
         _echo_stderr_utf8(alert)
-        sys.exit(1)
+        raise click.exceptions.Exit(1) from exc
+    except DaemonRequestError as exc:
+        msg = str(exc).strip() or f"Daemon rejected '{action}'."
+        raise click.ClickException(msg) from exc
+    except (RuntimeError, OSError, http.client.HTTPException, ValueError) as exc:
+        detail = str(exc).strip() or type(exc).__name__
+        err = click.ClickException(
+            f"PoB daemon failure during '{action}': {detail}\n"
+            "Run `pob stop` and retry; check daemon logs in the runtime directory if this persists."
+        )
+        err.exit_code = DAEMON_FAILURE_EXIT_CODE
+        raise err from exc
+
+
+def _fmt_signed_pct(delta: Any, pct: Any = None) -> str:
+    """Lazy wrapper delegating to `formatters.fmt_signed_pct`."""
+    from .formatters import fmt_signed_pct
+
+    return fmt_signed_pct(delta, pct)
+
+
+def _keep_rejected_warning(stripped: Any) -> list[str]:
+    """Lazy wrapper delegating to `formatters.keep_rejected_warning`."""
+    from .formatters import keep_rejected_warning
+
+    return keep_rejected_warning(stripped)
+
+
+def _restore_warning(check: Any) -> str | None:
+    """Lazy wrapper delegating to `formatters.restore_warning`."""
+    from .formatters import restore_warning
+
+    return restore_warning(check)
+
+
+def _merge_keep_tokens(*sources: Any) -> list[str]:
+    """Merge repeatable CLI `--keep` values with optional JSON dict `keep` preserving order."""
+    merged: list[str] = []
+    for src in sources:
+        if src is None:
+            continue
+        items = [src] if isinstance(src, str) else (list(src) if isinstance(src, (list, tuple)) else [str(src)])
+        for item in items:
+            token = str(item).strip()
+            if token and token not in merged:
+                merged.append(token)
+    return merged
 
 
 def _prepend_warning(body: str, res: dict[str, Any]) -> str:
@@ -414,16 +477,27 @@ def cmd_serve(
     from pathlib import Path
 
     from . import daemon as daemon_mod
+    from .updater import format_stderr_update_alert
 
     runner = getattr(daemon_mod, "run_daemon_forever", None) or daemon_mod.run_daemon_server
-    _call_with_supported_kwargs(
-        runner,
-        port=port,
-        runtime_dir=Path(runtime_dir) if runtime_dir else None,
-        offline=True if offline else None,
-        proxy=proxy,
-        mirror=mirror,
-    )
+    try:
+        _call_with_supported_kwargs(
+            runner,
+            port=port,
+            runtime_dir=Path(runtime_dir) if runtime_dir else None,
+            offline=True if offline else None,
+            proxy=proxy,
+            mirror=mirror,
+        )
+    except daemon_mod.BootstrapMissingError as exc:
+        alert = format_stderr_update_alert(exc.update_status) or str(exc)
+        _echo_stderr_utf8(alert)
+        raise click.exceptions.Exit(1) from exc
+    except (OSError, RuntimeError) as exc:
+        detail = str(exc).strip() or type(exc).__name__
+        err = click.ClickException(f"PoB daemon failed to start: {detail}")
+        err.exit_code = DAEMON_FAILURE_EXIT_CODE
+        raise err from exc
 
 
 # --- 4.1 Lifecycle, Engine Updates & Build I/O ---
@@ -456,7 +530,13 @@ def cmd_bootstrap(
 
     from .daemon import call_daemon, emit_stderr_update_alert, read_daemon_state
     from .formatters import render_table
-    from .updater import STATE_BOOTSTRAP_MISSING, bootstrap_engine, get_update_warning
+    from .updater import (
+        STATE_BOOTSTRAP_MISSING,
+        EngineGateError,
+        UpdateError,
+        bootstrap_engine,
+        get_update_warning,
+    )
 
     if read_daemon_state() is not None:
         try:
@@ -467,12 +547,26 @@ def cmd_bootstrap(
         except Exception:
             pass
 
-    res = bootstrap_engine(
-        proxy=proxy,
-        mirror=mirror,
-        include_zh=not no_zh,
-        from_dir=Path(from_dir) if from_dir else None,
-    )
+    try:
+        res = bootstrap_engine(
+            proxy=proxy,
+            mirror=mirror,
+            include_zh=not no_zh,
+            from_dir=Path(from_dir) if from_dir else None,
+        )
+    except EngineGateError as exc:
+        detail = str(exc).strip() or type(exc).__name__
+        err = click.ClickException(f"PoB engine bootstrap gate check failed: {detail}")
+        err.exit_code = DAEMON_FAILURE_EXIT_CODE
+        raise err from exc
+    except UpdateError as exc:
+        detail = str(exc).strip() or type(exc).__name__
+        raise click.ClickException(detail) from exc
+    except OSError as exc:
+        detail = str(exc).strip() or type(exc).__name__
+        err = click.ClickException(f"PoB engine bootstrap failed: {detail}")
+        err.exit_code = DAEMON_FAILURE_EXIT_CODE
+        raise err from exc
     warn = get_update_warning(res)
     if warn:
         res["updateWarning"] = warn
@@ -518,7 +612,9 @@ def cmd_update(
     out_path: str | None,
 ) -> None:
     """Check or incrementally update managed PoB & PobTools-zh engine (preserving loaded builds if daemon is alive)."""
-    from .daemon import call_daemon, emit_stderr_update_alert, read_daemon_state
+    import http.client
+
+    from .daemon import DaemonRequestError, call_daemon, emit_stderr_update_alert, read_daemon_state
     from .formatters import render_table
     from .updater import STATE_BOOTSTRAP_MISSING, check_and_apply_updates, get_update_warning
 
@@ -538,9 +634,18 @@ def cmd_update(
                 auto_start=False,
                 timeout=180.0,
             )
-        except RuntimeError as exc:
+        except DaemonRequestError as exc:
+            msg = str(exc).strip() or "Daemon rejected 'update'."
+            raise click.ClickException(msg) from exc
+        except (RuntimeError, OSError, http.client.HTTPException, ValueError) as exc:
             if "not running" not in str(exc).lower():
-                raise
+                detail = str(exc).strip() or type(exc).__name__
+                err = click.ClickException(
+                    f"PoB daemon failure during 'update': {detail}\n"
+                    "Run `pob stop` and retry; check daemon logs in the runtime directory if this persists."
+                )
+                err.exit_code = DAEMON_FAILURE_EXIT_CODE
+                raise err from exc
 
     if res is None:
         res = check_and_apply_updates(
@@ -652,12 +757,26 @@ def cmd_status(as_json: bool, compact: bool, out_path: str | None) -> None:
 @_output_options
 def cmd_stop(as_json: bool, compact: bool, out_path: str | None) -> None:
     """Stop the background PoB daemon and release headless processes."""
-    from .daemon import call_daemon
+    import http.client
+
+    from .daemon import DaemonRequestError, call_daemon
 
     try:
         res = call_daemon("stop", auto_start=False)
-    except RuntimeError:
-        res = {"stopped": True, "note": "Daemon was not running"}
+    except DaemonRequestError as exc:
+        msg = str(exc).strip() or "Daemon rejected 'stop'."
+        raise click.ClickException(msg) from exc
+    except (RuntimeError, OSError, http.client.HTTPException, ValueError) as exc:
+        if "not running" in str(exc).lower():
+            res = {"stopped": True, "note": "Daemon was not running"}
+        else:
+            detail = str(exc).strip() or type(exc).__name__
+            err = click.ClickException(
+                f"PoB daemon failure during 'stop': {detail}\n"
+                "Check daemon logs in the runtime directory or terminate the stale process manually if this persists."
+            )
+            err.exit_code = DAEMON_FAILURE_EXIT_CODE
+            raise err from exc
     if as_json:
         _emit_json(res, compact=compact, out_path=out_path)
     else:
@@ -745,6 +864,9 @@ def _prepare_load_source(source: str) -> tuple[str | None, str | None]:
             return None, xml_to_share_code(text)
         return text, None
 
+    if raw.startswith("@"):
+        raise click.ClickException(f"Build file not found: {candidate_path or raw}")
+
     if raw.lstrip().startswith("<"):
         from .importers import xml_to_share_code
 
@@ -773,6 +895,13 @@ def cmd_load(source: str, target: str, as_json: bool, compact: bool, out_path: s
 
     try:
         res = _daemon_call("load", params)
+    except click.exceptions.Exit:
+        raise
+    except click.ClickException:
+        upd_state = load_update_state()
+        if str(upd_state.get("state") or "").startswith("degraded_"):
+            emit_stderr_update_alert(upd_state)
+        raise
     except Exception as exc:
         upd_state = load_update_state()
         if str(upd_state.get("state") or "").startswith("degraded_"):
@@ -1023,19 +1152,44 @@ def cmd_summary(target: str, as_json: bool, compact: bool, out_path: str | None)
 
 
 @main.command("audit")
+@click.option(
+    "--keep",
+    "keep",
+    multiple=True,
+    help="Keep build-guaranteed config/flask/skill/customMods/party items during dewatering (repeatable or comma-separated).",
+)
+@click.option(
+    "--no-attribution",
+    "no_attribution",
+    is_flag=True,
+    help="Skip per-item water attribution recalculations.",
+)
 @_target_option(allow_slot_alias=True)
 @click.option("--json", "as_json", is_flag=True, help="Output raw JSON.")
 @_output_options
-def cmd_audit(target: str, as_json: bool, compact: bool, out_path: str | None) -> None:
+def cmd_audit(
+    keep: tuple[str, ...],
+    no_attribution: bool,
+    target: str,
+    as_json: bool,
+    compact: bool,
+    out_path: str | None,
+) -> None:
     """Run build health check and non-destructive 4-part PoB inflation ('water') audit."""
     from .formatters import fmt_delta, fmt_num, render_table
 
-    res = _daemon_call("audit", {"target": target})
+    params: dict[str, Any] = {"target": target, "attribution": not no_attribution}
+    if keep:
+        params["keep"] = list(keep)
+    res = _daemon_call("audit", params)
     if as_json:
         _emit_json(res, compact=compact, out_path=out_path)
         return
 
     lines = ["### Build Health & Inflation ('Water') Audit"]
+    r_warn = _restore_warning(res)
+    if r_warn:
+        lines.append(r_warn)
     issues = res.get("healthIssues", [])
     if issues:
         lines.append("\n#### 1. Health & Hard Gaps")
@@ -1051,6 +1205,44 @@ def cmd_audit(target: str, as_json: bool, compact: bool, out_path: str | None) -
         items = stripped.get(dim) or []
         s_rows.append([dim.capitalize(), len(items), "; ".join(items) if items else "_(Clean)_"])
     lines.append(render_table(["Dimension", "Count", "Stripped Items"], s_rows))
+    kept = stripped.get("kept") or []
+    if kept:
+        lines.append("\n**Kept (--keep)**: " + "; ".join(kept))
+    rej_lines = _keep_rejected_warning(stripped)
+    if rej_lines:
+        lines.append("\n" + "\n".join(rej_lines))
+
+    attr = res.get("waterAttribution") or []
+    if attr:
+        dps_key = (res.get("original") or {}).get("primaryDpsKey") or "DPS"
+        lines.append(
+            "\n#### 2b. Per-Item Water Attribution (PoB re-calc, restoring ONE item on the de-watered baseline)"
+        )
+        a_rows = []
+        for r in attr:
+            if r.get("error"):
+                a_rows.append([r.get("dimension") or "-", r.get("label") or "-", "error", r["error"], "", ""])
+                continue
+            a_rows.append(
+                [
+                    r.get("dimension") or "-",
+                    r.get("label") or "-",
+                    _fmt_signed_pct(r.get("dpsDelta"), r.get("dpsPct")),
+                    _fmt_signed_pct(r.get("totalEhpDelta"), r.get("totalEhpPct")),
+                    _fmt_signed_pct(r.get("physMaxHitDelta"), r.get("physMaxHitPct")),
+                    _fmt_signed_pct(r.get("eleMaxHitDelta"), r.get("eleMaxHitPct")),
+                ]
+            )
+        lines.append(
+            render_table(
+                ["Dim", "Item", f"Δ{dps_key}", "ΔTotalEHP", "ΔPhys MaxHit", "ΔEle MaxHit"],
+                a_rows,
+            )
+        )
+        lines.append(
+            "_Items your build guarantees in a real boss fight (ascendancy/keystone conditions, "
+            "self-applied ailments, always-on charges) can be re-run with `--keep <var>`._"
+        )
 
     orig = res.get("original", {})
     dew = res.get("dewateredPinnacle", {})
@@ -2219,11 +2411,17 @@ def cmd_config_set(
 @click.option("--apply", is_flag=True, help="Persist batch changes into build.")
 @click.option("--no-undo", "no_undo", is_flag=True, help="Skip undo snapshot overhead when --apply is set.")
 @click.option(
+    "--keep",
+    "keep",
+    multiple=True,
+    help="Keep build-guaranteed items in audit/matrix/Pinnacle scenarios.",
+)
+@click.option(
     "--return",
     "return_spec",
     type=str,
     default=None,
-    help="Comma-separated readouts to attach (e.g. 'summary,audit,matrix,calc:DPS;Mana,export').",
+    help="Comma-separated readouts to attach (e.g. 'summary,audit,audit:full,matrix,calc:DPS;Mana,export').",
 )
 @_target_option(allow_slot_alias=True)
 @click.option("--json", "as_json", is_flag=True, help="Output raw JSON.")
@@ -2233,6 +2431,7 @@ def cmd_batch(
     json_ops: str | None,
     apply: bool,
     no_undo: bool,
+    keep: tuple[str, ...],
     return_spec: str | None,
     target: str,
     as_json: bool,
@@ -2245,18 +2444,19 @@ def cmd_batch(
     if not isinstance(ops, list):
         raise click.UsageError('Batch input must be a JSON list of operation objects (or `{"ops": [...]}`).')
 
+    json_keep = parsed.get("keep") if isinstance(parsed, dict) else None
+    eff_keep = _merge_keep_tokens(json_keep, keep)
     return_sections = [s.strip() for s in (return_spec or "").split(",") if s.strip()] or None
-    res = _daemon_call(
-        "batch",
-        {
-            "target": target,
-            "ops": ops,
-            "apply": apply,
-            "no_undo": no_undo,
-            "return_sections": return_sections,
-        },
-        timeout=300.0,
-    )
+    params: dict[str, Any] = {
+        "target": target,
+        "ops": ops,
+        "apply": apply,
+        "no_undo": no_undo,
+        "return_sections": return_sections,
+    }
+    if eff_keep:
+        params["keep"] = eff_keep
+    res = _daemon_call("batch", params, timeout=300.0)
     if as_json:
         _emit_json(res, compact=compact, out_path=out_path)
         return
@@ -2270,6 +2470,18 @@ def cmd_batch(
         for sec_name, sec_val in returns.items():
             if sec_name == "matrix" and isinstance(sec_val, dict):
                 parts.append(format_matrix_markdown(sec_val, target=target))
+            elif sec_name == "audit" and isinstance(sec_val, dict):
+                parts.append("- **audit**: attached (`--json` for full payload)")
+                r_warn = _restore_warning(sec_val)
+                if r_warn:
+                    parts.append(r_warn)
+                stripped = sec_val.get("inflationStripped")
+                if isinstance(stripped, dict):
+                    kept = stripped.get("kept") or []
+                    if kept:
+                        parts.append("**Kept (--keep)**: " + "; ".join(kept))
+                    for line in _keep_rejected_warning(stripped):
+                        parts.append(line)
             elif sec_name == "export":
                 code_str = (
                     sec_val
@@ -2292,6 +2504,12 @@ def cmd_batch(
 @click.option("--base-ops", "base_ops_str", help="Optional base ops JSON array (or '@path') applied once before variants.")
 @click.option("--calc", "calc_keywords", multiple=True, help="Calcs keyword(s) to extract per variant (repeatable).")
 @click.option("--scenario", "scenario", help="Optional baseline scenario (e.g. Pinnacle, Uber, FlasksOff).")
+@click.option(
+    "--keep",
+    "keep",
+    multiple=True,
+    help="Keep build-guaranteed items in audit/matrix/Pinnacle scenarios.",
+)
 @_target_option(allow_slot_alias=True)
 @click.option("--json", "as_json", is_flag=True, help="Output raw JSON.")
 @_output_options
@@ -2301,6 +2519,7 @@ def cmd_sweep(
     base_ops_str: str | None,
     calc_keywords: tuple[str, ...],
     scenario: str | None,
+    keep: tuple[str, ...],
     target: str,
     as_json: bool,
     compact: bool,
@@ -2313,9 +2532,11 @@ def cmd_sweep(
     base_ops: list[dict[str, Any]] | None = None
     eff_calcs = list(calc_keywords)
     eff_scenario: Any = scenario
+    json_keep: Any = None
 
     if isinstance(parsed, dict):
         variants = parsed.get("variants")
+        json_keep = parsed.get("keep")
         if base_ops_str is None and isinstance(parsed.get("base_ops") or parsed.get("baseOps"), list):
             base_ops = parsed.get("base_ops") or parsed.get("baseOps")
         if not eff_calcs and isinstance(parsed.get("calc_keywords") or parsed.get("calcKeywords"), list):
@@ -2338,17 +2559,17 @@ def cmd_sweep(
         else:
             raise click.UsageError("--base-ops must be a JSON list of operation objects.")
 
-    res = _daemon_call(
-        "sweep",
-        {
-            "target": target,
-            "variants": variants,
-            "base_ops": base_ops,
-            "calc_keywords": eff_calcs or None,
-            "scenario": eff_scenario,
-        },
-        timeout=300.0,
-    )
+    eff_keep = _merge_keep_tokens(json_keep, keep)
+    params: dict[str, Any] = {
+        "target": target,
+        "variants": variants,
+        "base_ops": base_ops,
+        "calc_keywords": eff_calcs or None,
+        "scenario": eff_scenario,
+    }
+    if eff_keep:
+        params["keep"] = eff_keep
+    res = _daemon_call("sweep", params, timeout=300.0)
     if as_json:
         _emit_json(res, compact=compact, out_path=out_path)
         return
@@ -2364,6 +2585,12 @@ def cmd_sweep(
     multiple=True,
     help="Scenario spec (e.g. Original, Pinnacle, Uber, FlasksOff, 'Wither15:Pinnacle,MultiplierWitheredStackCount=15').",
 )
+@click.option(
+    "--keep",
+    "keep",
+    multiple=True,
+    help="Keep build-guaranteed items in Pinnacle/Uber scenarios (repeatable or comma-separated).",
+)
 @click.option("--full", "full_payload", is_flag=True, help="Include full raw 200-key stats & headers per scenario (default is compact).")
 @_target_option(allow_slot_alias=True)
 @click.option("--json", "as_json", is_flag=True, help="Output raw JSON.")
@@ -2371,6 +2598,7 @@ def cmd_sweep(
 def cmd_matrix(
     scenarios: tuple[str, ...],
     opt_scenarios: tuple[str, ...],
+    keep: tuple[str, ...],
     full_payload: bool,
     target: str,
     as_json: bool,
@@ -2381,7 +2609,10 @@ def cmd_matrix(
     from .formatters import format_matrix_markdown
 
     all_specs = [*scenarios, *opt_scenarios] or None
-    res = _daemon_call("matrix", {"target": target, "scenarios": all_specs, "full": full_payload})
+    params: dict[str, Any] = {"target": target, "scenarios": all_specs, "full": full_payload}
+    if keep:
+        params["keep"] = list(keep)
+    res = _daemon_call("matrix", params)
     if as_json:
         _emit_json(res, compact=compact, out_path=out_path)
         return

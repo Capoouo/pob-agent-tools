@@ -894,6 +894,19 @@ class _FakeBridgeWorker:
             for j, gm in enumerate(grp["gems"], start=1):
                 gm["index"] = j
             return {"ok": True}
+        if method == "add_group":
+            new_idx = max((int(g["index"]) for g in self.groups), default=0) + 1
+            grp = {
+                "index": new_idx,
+                "label": p.get("label", ""),
+                "slot": p.get("slot"),
+                "enabled": True,
+                "includeInFullDPS": False,
+                "isMain": False,
+                "gems": [],
+            }
+            self.groups.append(grp)
+            return {"index": new_idx, "group": grp}
         if method == "add_gem":
             grp = next(g for g in self.groups if g["index"] == int(p["group"]))
             new_gem = {
@@ -904,11 +917,21 @@ class _FakeBridgeWorker:
                 "quality": p.get("quality", 20),
                 "enabled": p.get("enabled", True),
                 "count": p.get("count", 1),
+                "enableGlobal1": True,
+                "enableGlobal2": True,
             }
             grp["gems"].append(new_gem)
             if new_gem["name"] == "Arc":
                 self.dps = 180000.0
-            return {"gem": new_gem}
+            return {"gem": dict(new_gem)}
+        if method == "set_gem":
+            grp = next(g for g in self.groups if g["index"] == int(p["group"]))
+            idx = int(p["index"])
+            gm = next(g for g in grp["gems"] if int(g["index"]) == idx)
+            for k in ("nameSpec", "gemId", "level", "quality", "enabled", "count", "enableGlobal1", "enableGlobal2"):
+                if k in p:
+                    gm[k] = p[k]
+            return {"gem": dict(gm)}
         if method == "set_group":
             grp = next(g for g in self.groups if g["index"] == int(p["index"]))
             for k in ("label", "enabled", "includeInFullDPS", "slot"):
@@ -1537,3 +1560,410 @@ def test_run_sweep_real_engine_with_scenario_calcs_and_fault_isolation(pob_worke
     assert pob_worker.undo_stack == before_undo
     assert pob_worker.redo_stack == before_redo
     assert pob_worker.last_good_code == before_last_good
+
+
+# ---------------------------------------------------------------------------
+# Pure unit tests for Vaal gem defaults, Config list/alias matching,
+# DaemonRequestError classification, batch/sweep keep & guards
+# ---------------------------------------------------------------------------
+
+
+def test_vaal_vs_non_vaal_add_gem_default_skill_flags() -> None:
+    """Vaal gems default to enableGlobal1=False (Vaal burst OFF) & enableGlobal2=True (base ON); non-Vaal gets 0 set_gem RPCs."""
+    from pob_cli.mutators import _add_gem_with_default_skill_flags, _is_vaal_gem_entry, add_skill_gem
+
+    assert _is_vaal_gem_entry({"skillId": "VaalHaste"}) is True
+    assert _is_vaal_gem_entry({"skillId": "Vaal"}) is False
+    assert _is_vaal_gem_entry({"name": "Vaal Discipline"}) is True
+    assert _is_vaal_gem_entry({"nameZh": "瓦尔·迅捷"}) is True
+    assert _is_vaal_gem_entry({"name": "Anomalous Vaal Grace"}) is True
+    assert _is_vaal_gem_entry({"name": "Determination"}, fallback_name="Determination") is False
+
+    # 1. _add_gem_with_default_skill_flags on Vaal gem calls set_gem(enableGlobal1=False, enableGlobal2=True)
+    w = _FakeBridgeWorker()
+    res_vaal = _add_gem_with_default_skill_flags(
+        w, {"group": 1, "nameSpec": "Vaal Discipline", "level": 20, "quality": 20, "enabled": True}
+    )
+    assert res_vaal["gem"]["enableGlobal1"] is False
+    assert res_vaal["gem"]["enableGlobal2"] is True
+    set_gem_calls = [p for m, p in w.calls if m == "set_gem"]
+    assert set_gem_calls == [
+        {"group": 1, "index": 3, "enableGlobal1": False, "enableGlobal2": True},
+    ]
+
+    # 2. _add_gem_with_default_skill_flags on non-Vaal gem performs 0 set_gem RPCs
+    w2 = _FakeBridgeWorker()
+    res_base = _add_gem_with_default_skill_flags(
+        w2, {"group": 1, "nameSpec": "Determination", "level": 20, "quality": 20, "enabled": True}
+    )
+    assert res_base["gem"]["nameSpec"] == "Determination"
+    assert [m for m, _ in w2.calls if m == "set_gem"] == []
+
+    # 3. Missing gem index on Vaal gem raises RuntimeError (daemon/engine contract fault)
+    class _BrokenAddGemWorker:
+        def call(self, method: str, params: dict) -> dict:
+            assert method == "add_gem"
+            return {"gem": {"nameSpec": "Vaal Haste"}}
+
+    with pytest.raises(RuntimeError, match="add_gem did not return the added gem index"):
+        _add_gem_with_default_skill_flags(_BrokenAddGemWorker(), {"group": 1, "nameSpec": "Vaal Haste"})  # type: ignore[arg-type]
+
+    # 4. add_skill_gem, add_skill_group, replace_skill_group, and batch skill.addGem apply Vaal defaults ONLY to Vaal gems
+    w3 = _FakeBridgeWorker()
+    add_skill_gem(w3, group_selector="main", gem_name="Vaal Haste", apply=True)
+    add_skill_gem(w3, group_selector="main", gem_name="Grace", apply=True)
+    set_calls_3 = [p for m, p in w3.calls if m == "set_gem"]
+    assert len(set_calls_3) == 1
+    assert set_calls_3[0]["enableGlobal1"] is False and set_calls_3[0]["enableGlobal2"] is True
+
+    w4 = _FakeBridgeWorker()
+    add_skill_group(w4, gems=["Vaal Grace:20:20", "Determination:20:20", "瓦尔迅捷:20:20"], apply=True)
+    set_calls_4 = [p for m, p in w4.calls if m == "set_gem"]
+    assert len(set_calls_4) == 2
+    assert all(c["enableGlobal1"] is False and c["enableGlobal2"] is True for c in set_calls_4)
+    assert [c["index"] for c in set_calls_4] == [1, 3]
+
+    w5 = _FakeBridgeWorker()
+    replace_skill_group(w5, "main", ["Arc:20:20", "Vaal Righteous Fire:20:20"], apply=True)
+    set_calls_5 = [p for m, p in w5.calls if m == "set_gem"]
+    assert set_calls_5 == [{"group": 1, "index": 2, "enableGlobal1": False, "enableGlobal2": True}]
+
+    w6 = _FakeBridgeWorker()
+    run_batch(
+        w6,
+        [
+            {"op": "skill", "group": "main", "addGem": "Vaal Molten Shell"},
+            {"op": "skill", "group": "main", "addGem": "Enduring Cry"},
+        ],
+        apply=True,
+    )
+    set_calls_6 = [p for m, p in w6.calls if m == "set_gem"]
+    assert len(set_calls_6) == 1
+    assert set_calls_6[0]["enableGlobal1"] is False and set_calls_6[0]["enableGlobal2"] is True
+
+
+def test_config_list_matching_boss_aliases_resistance_penalty_and_r12_guard() -> None:
+    """Verify enemyIsBoss=No/Shaper/labelZh, resistancePenalty=None->0, reset/default/nil, and R12 presetBossSkills guard."""
+    from pob_cli.mutators import _apply_config_in_place
+
+    class _CfgWorker:
+        def __init__(self, preset_boss_skill_val: object = "None") -> None:
+            self.calls: list[tuple[str, dict]] = []
+            self.preset_boss_skill_val = preset_boss_skill_val
+
+        def call(self, method: str, params: dict) -> dict:
+            self.calls.append((method, dict(params)))
+            if method == "list_config":
+                return {
+                    "sections": [
+                        {
+                            "items": [
+                                {
+                                    "var": "enemyIsBoss",
+                                    "type": "list",
+                                    "list": [
+                                        {"val": "None", "label": "No", "labelZh": "否"},
+                                        {"val": "Boss", "label": "Standard Boss", "labelZh": "普通首领"},
+                                        {"val": "Pinnacle", "label": "Guardian/Pinnacle Boss", "labelZh": "^xFFFFFF终局首领"},
+                                        {"val": "Uber", "label": "Uber Pinnacle Boss", "labelZh": "超级终局首领"},
+                                    ],
+                                },
+                                {
+                                    "var": "resistancePenalty",
+                                    "type": "list",
+                                    "list": [
+                                        {"val": 0, "label": "None"},
+                                        {"val": -30, "label": "Act 5 (-30%)"},
+                                        {"val": -60, "label": "Act 10 (-60%)"},
+                                    ],
+                                },
+                                {
+                                    "var": "deliriousPercentage",
+                                    "type": "list",
+                                    "list": [
+                                        {"val": 0, "label": "None"},
+                                        {"val": 100, "label": "100%"},
+                                    ],
+                                },
+                                {
+                                    "var": "bandit",
+                                    "type": "list",
+                                    "list": [{"val": "None", "label": "Kill all"}],
+                                },
+                                {
+                                    "var": "presetBossSkills",
+                                    "type": "list",
+                                    "value": self.preset_boss_skill_val,
+                                    "list": [
+                                        {"val": "None", "label": "None"},
+                                        {"val": "Shaper Slam", "label": "Shaper Slam"},
+                                    ],
+                                },
+                                {"var": "usePowerCharges", "type": "check"},
+                            ]
+                        }
+                    ]
+                }
+            if method in ("set_config", "reset_config"):
+                return {"ok": True}
+            raise AssertionError(f"Unexpected call {method}")
+
+    # 1. presetBossSkills="None" must NOT trigger R12 re-apply
+    w = _CfgWorker(preset_boss_skill_val="None")
+    _apply_config_in_place(
+        w,
+        [
+            ("enemyIsBoss", "No"),
+            ("enemyIsBoss", "None"),
+            ("enemyIsBoss", "Shaper"),
+            ("enemyIsBoss", "Uber Atziri"),
+            ("enemyIsBoss", "终局首领"),
+            ("resistancePenalty", "None"),
+            ("deliriousPercentage", "None"),
+            ("resistancePenalty", "reset"),
+            ("resistancePenalty", "default"),
+            ("resistancePenalty", "nil"),
+            ("bandit", "Kill all"),
+            ("usePowerCharges", "none"),
+        ],
+    )
+    edits = [(m, p) for m, p in w.calls if m != "list_config"]
+    assert edits == [
+        ("set_config", {"var": "enemyIsBoss", "value": "None"}),
+        ("set_config", {"var": "enemyIsBoss", "value": "None"}),
+        ("set_config", {"var": "enemyIsBoss", "value": "Pinnacle"}),
+        ("set_config", {"var": "enemyIsBoss", "value": "Boss"}),
+        ("set_config", {"var": "enemyIsBoss", "value": "Pinnacle"}),
+        ("set_config", {"var": "resistancePenalty", "value": 0}),
+        ("set_config", {"var": "deliriousPercentage", "value": 0}),
+        ("reset_config", {"var": "resistancePenalty"}),
+        ("reset_config", {"var": "resistancePenalty"}),
+        ("reset_config", {"var": "resistancePenalty"}),
+        ("set_config", {"var": "bandit", "value": "None"}),
+        ("reset_config", {"var": "usePowerCharges"}),
+    ]
+
+    # 2. Active presetBossSkills ("Shaper Slam") MUST still trigger R12 re-apply
+    w2 = _CfgWorker(preset_boss_skill_val="Shaper Slam")
+    _apply_config_in_place(w2, [("enemyIsBoss", "Pinnacle")])
+    edits2 = [(m, p) for m, p in w2.calls if m != "list_config"]
+    assert edits2 == [
+        ("set_config", {"var": "enemyIsBoss", "value": "Pinnacle"}),
+        ("set_config", {"var": "presetBossSkills", "value": "Shaper Slam"}),
+    ]
+
+
+def test_daemon_request_error_guards_and_rpc_classification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify DaemonRequestError classification across mutators, snapshot, importers, batch/sweep, and daemon RPC."""
+    import http.client
+    import os
+    import sys
+    import threading
+    import types
+    from http.server import ThreadingHTTPServer
+
+    import pob_cli.analyzer as analyzer_mod
+    import pob_cli.comparator as comp_mod
+    import pob_cli.daemon as daemon_mod
+    import pob_cli.importers as importers_mod
+    from pob_cli.bridge_client import BridgeError
+    from pob_cli.errors import DaemonRequestError
+    from pob_cli.mutators import _apply_anoint_in_place, _apply_edit_item_mods_in_place
+    from pob_cli.snapshot import redo_build
+
+    assert issubclass(DaemonRequestError, RuntimeError)
+    assert daemon_mod.DaemonRequestError is DaemonRequestError
+
+    w = _FakeBridgeWorker()
+
+    # 1. Empty slot in _apply_edit_item_mods_in_place, edit_item_mods, and _apply_anoint_in_place -> DaemonRequestError
+    with pytest.raises(DaemonRequestError, match="has no equipped item to edit"):
+        _apply_edit_item_mods_in_place(w, slot_name="Ring 1", add_mods=["+10 to maximum Life"])
+    with pytest.raises(DaemonRequestError, match="has no equipped item to edit"):
+        edit_item_mods(w, slot_name="Ring 1", add_mods=["+10 to maximum Life"])
+    with pytest.raises(DaemonRequestError, match="has no equipped item to anoint"):
+        _apply_anoint_in_place(w, slot_name="Ring 1", notable_query="Beef")
+
+    # 2. Empty undo/redo stacks -> DaemonRequestError
+    with pytest.raises(DaemonRequestError, match="Undo stack is empty"):
+        undo_build(w)
+    with pytest.raises(DaemonRequestError, match="Redo stack is empty"):
+        redo_build(w)
+
+    # 3. Missing raw/notable in batch ops -> ValueError (NOT KeyError!)
+    with pytest.raises(ValueError, match="requires non-empty 'raw'"):
+        run_batch(w, [{"op": "item"}], apply=False)
+    with pytest.raises(ValueError, match="requires non-empty 'notable'"):
+        run_batch(w, [{"op": "anoint", "slot": "Amulet"}], apply=False)
+
+    # 4. batch audit/audit:full/audit:attribution & keep propagation + sweep keep merging
+    seen_calls: dict[str, dict] = {}
+
+    def _fake_audit(_w, keep=None, attribution=True):
+        seen_calls["audit"] = {"keep": keep, "attribution": attribution}
+        return {"ok": True}
+
+    def _fake_matrix(_w, scenarios=None, *, full=False, keep=None):
+        seen_calls["matrix"] = {"scenarios": scenarios, "keep": keep}
+        return {"ok": True}
+
+    def _fake_apply_scenario(_w, plan, keep=None, **_kw):
+        seen_calls["sweep_scenario"] = {"plan": plan, "keep": keep}
+        return {"base": plan["base"]}
+
+    monkeypatch.setattr(analyzer_mod, "audit_build", _fake_audit)
+    monkeypatch.setattr(comp_mod, "run_matrix", _fake_matrix)
+    monkeypatch.setattr(comp_mod, "_apply_matrix_scenario_in_place", _fake_apply_scenario)
+
+    r_b1 = run_batch(
+        w,
+        [{"op": "config", "set": {"usePowerCharges": True}}],
+        return_sections=["audit", "matrix:Original;Pinnacle"],
+        keep=["conditionStationary"],
+        apply=False,
+    )
+    assert "audit" in r_b1["returns"]
+    assert seen_calls["audit"] == {"keep": ["conditionStationary"], "attribution": False}
+    assert seen_calls["matrix"] == {"scenarios": ["Original", "Pinnacle"], "keep": ["conditionStationary"]}
+
+    r_b2 = run_batch(
+        w,
+        [{"op": "config", "set": {"usePowerCharges": True}}],
+        return_sections=["audit:full"],
+        keep="Flask 1,conditionStationary",
+        apply=False,
+    )
+    assert "audit" in r_b2["returns"]
+    assert seen_calls["audit"] == {"keep": ["Flask 1", "conditionStationary"], "attribution": True}
+
+    with pytest.raises(ValueError, match="Unsupported audit return modifier"):
+        run_batch(
+            w,
+            [{"op": "config", "set": {"usePowerCharges": True}}],
+            return_sections=["audit:bogus"],
+            apply=False,
+        )
+
+    run_sweep(
+        w,
+        [{"name": "V1", "ops": []}],
+        scenario={"name": "PinKeep", "base": "Pinnacle", "keep": ["Flask 1", "conditionStationary"]},
+        keep=["conditionStationary", "Molten Shell"],
+    )
+    assert seen_calls["sweep_scenario"]["keep"] == ["conditionStationary", "Molten Shell", "Flask 1"]
+
+    # 5. importers.py invalid league slug: DaemonRequestError when no fetch_errs, RuntimeError when fetch_errs non-empty
+    monkeypatch.setattr(importers_mod, "_fetch_poe_ninja_build_index_state", lambda **_kw: {"leagueBuilds": []})
+    monkeypatch.setattr(importers_mod, "_fetch_poe_ninja_index_state", lambda **_kw: {"buildLeagues": []})
+    with pytest.raises(DaemonRequestError, match="Could not find league slug"):
+        importers_mod.fetch_poe_ninja_character_code("https://poe.ninja/poe1/builds/nosuchleague/character/Acc-1234/Char")
+
+    monkeypatch.setattr(
+        importers_mod,
+        "_fetch_poe_ninja_build_index_state",
+        lambda **_kw: (_ for _ in ()).throw(OSError("upstream down")),
+    )
+    with pytest.raises(RuntimeError) as exc_info:
+        importers_mod.fetch_poe_ninja_character_code("https://poe.ninja/poe1/builds/nosuchleague/character/Acc-1234/Char")
+    assert type(exc_info.value) is RuntimeError
+
+    # 6. DaemonManager + RpcHandler errorKind + export pobDir + timeless_list + call_daemon _rpc_result
+    eng = tmp_path / "eng"
+    (eng / "PoE1").mkdir(parents=True)
+    rt = tmp_path / "rt"
+
+    class _StubWorker:
+        def __init__(self, slot_name: str = "main", pob_dir: Path | None = None, runtime_dir: Path | None = None) -> None:
+            self.slot_name = slot_name
+            self.pob_root = pob_dir or eng
+            self.last_good_code: str | None = None
+            self.undo_stack: list[str] = []
+            self.redo_stack: list[str] = []
+            self.source_label: str | None = None
+            self.hello_info: dict[str, object] = {}
+            self.lock = threading.RLock()
+
+        def is_alive(self) -> bool:
+            return True
+
+        def ensure_alive(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            pass
+
+        def call(self, method: str, params: dict | None = None) -> dict:
+            if method == "export_code":
+                return {"code": "EXPORTED_CODE"}
+            raise BridgeError("simulated engine crash")
+
+    monkeypatch.setattr(daemon_mod, "BridgeWorker", _StubWorker)
+    mgr = daemon_mod.DaemonManager(pob_dir=eng, token="tok-secret", runtime_dir=rt, offline=True, skip_update_check=True)
+
+    # export includes pobDir
+    exp = mgr.dispatch("export", {})
+    assert exp["code"] == "EXPORTED_CODE"
+    assert exp["pobDir"] == str(eng)
+
+    # timeless_list delegates lazily to pob_cli.timeless.describe_worker
+    fake_timeless = types.ModuleType("pob_cli.timeless")
+    fake_timeless.describe_worker = lambda worker, pob_dir=None, runtime_dir=None: {  # type: ignore[attr-defined]
+        "slot": worker.slot_name,
+        "pobDir": str(pob_dir),
+        "runtimeDir": str(runtime_dir),
+    }
+    monkeypatch.setitem(sys.modules, "pob_cli.timeless", fake_timeless)
+    tl_res = mgr.dispatch("timeless_list", {})
+    assert tl_res == {"slot": "main", "pobDir": str(eng), "runtimeDir": str(rt)}
+
+    # Missing flask_index / active / gem raise ValueError (not KeyError)
+    with pytest.raises(ValueError, match="flask_index"):
+        mgr.dispatch("item_flask", {})
+    with pytest.raises(ValueError, match="active"):
+        mgr.dispatch("item_flask", {"flask_index": 1})
+    with pytest.raises(ValueError, match="gem"):
+        mgr.dispatch("skill_rm", {})
+
+    # borrow empty ref raises DaemonRequestError with dynamic slot name
+    with pytest.raises(DaemonRequestError, match=r"No reference build loaded in 'boss_ref' slot"):
+        mgr.dispatch("borrow", {"ref_target": "boss_ref"})
+
+    # HTTP RpcHandler tags errorKind="request" vs "daemon", and call_daemon preserves classification
+    server = ThreadingHTTPServer(("127.0.0.1", 0), daemon_mod.make_handler(mgr))
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        port = server.server_address[1]
+        rt.mkdir(parents=True, exist_ok=True)
+        (rt / "daemon.json").write_text(
+            json.dumps({"pid": os.getpid(), "port": port, "token": "tok-secret"}),
+            encoding="utf-8",
+        )
+
+        # Request error -> errorKind="request" -> call_daemon raises DaemonRequestError
+        with pytest.raises(DaemonRequestError, match="No reference build loaded"):
+            daemon_mod.call_daemon("borrow", {"ref_target": "boss_ref"}, auto_start=False, runtime_dir=rt)
+
+        # BridgeError -> errorKind="daemon" -> call_daemon raises plain RuntimeError (NOT DaemonRequestError)
+        with pytest.raises(RuntimeError, match="simulated engine crash") as bridge_exc:
+            daemon_mod.call_daemon(
+                "load",
+                {"source": importers_mod.xml_to_share_code("<PathOfBuilding/>")},
+                auto_start=False,
+                runtime_dir=rt,
+            )
+        assert type(bridge_exc.value) is RuntimeError
+
+        # Negative Content-Length -> HTTP 400 with errorKind="request"
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5.0)
+        conn.request("POST", "/rpc", body=b"", headers={"X-PoB-Token": "tok-secret", "Content-Length": "-5"})
+        resp = conn.getresponse()
+        payload = json.loads(resp.read().decode("utf-8"))
+        conn.close()
+        assert resp.status == 400
+        assert payload["errorKind"] == "request"
+    finally:
+        server.shutdown()
+        server.server_close()

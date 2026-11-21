@@ -6,10 +6,11 @@ import inspect
 import math
 import re
 import unicodedata
-from typing import Any
+from typing import Any, Iterable
 
 from .analyzer import resolve_skill_group_index, resolve_slot_name
 from .bridge_client import BridgeWorker
+from .errors import DaemonRequestError
 from .formatters import _parse_numeric_or_none, fmt_num, strip_pob_escapes
 from .snapshot import capture_digest, diff_digest, run_mutation
 
@@ -112,6 +113,34 @@ def _resolve_slot_from_items(items_res: dict[str, Any], slot_query: str) -> str:
     raise ValueError(f"Equipment slot '{slot_query}' not found.")
 
 
+def _call_compat(fn: Any, *args: Any, **kwargs: Any) -> Any:
+    """Call `fn` forwarding only keyword arguments accepted by its signature."""
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return fn(*args, **kwargs)
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+        return fn(*args, **kwargs)
+    filtered = {k: v for k, v in kwargs.items() if k in sig.parameters}
+    return fn(*args, **filtered)
+
+
+def _normalize_keep_list(keep: Iterable[str] | str | None) -> list[str]:
+    if keep is None:
+        return []
+    if isinstance(keep, str):
+        return [x.strip() for x in keep.split(",") if x.strip()]
+    out: list[str] = []
+    for item in keep:
+        if item is None:
+            continue
+        for part in str(item).split(","):
+            s = part.strip()
+            if s:
+                out.append(s)
+    return out
+
+
 class _BatchCache:
     """Tab-level read cache scoped to a single `run_batch` / `run_sweep` execution."""
 
@@ -119,6 +148,7 @@ class _BatchCache:
         self.worker = worker
         self.config: dict[str, Any] | None = None
         self.known_config_vars: dict[str, str] | None = None
+        self.known_config_items: dict[str, dict[str, Any]] | None = None
         self.items: dict[str, Any] | None = None
         self.skills: dict[str, Any] | None = None
         self.tree: dict[str, Any] | None = None
@@ -128,23 +158,32 @@ class _BatchCache:
     def get_config(self) -> dict[str, Any]:
         if self.config is None:
             self.config = self.worker.call("list_config", {})
-            if self.known_config_vars is None:
+            if self.known_config_items is None:
                 self._index_config_vars(self.config)
         return self.config
 
     def _index_config_vars(self, cfg_res: dict[str, Any]) -> None:
         known: dict[str, str] = {}
+        items: dict[str, dict[str, Any]] = {}
         for sec in cfg_res.get("sections", []):
             for item in sec.get("items", []):
                 vname = item.get("var")
                 if vname:
-                    known[str(vname).lower()] = str(vname)
+                    key = str(vname).lower()
+                    known[key] = str(vname)
+                    items[key] = item
         self.known_config_vars = known
+        self.known_config_items = items
 
     def get_known_config_vars(self) -> dict[str, str]:
         if self.known_config_vars is None:
             self.get_config()
         return self.known_config_vars or {}
+
+    def get_known_config_items(self) -> dict[str, dict[str, Any]]:
+        if self.known_config_items is None:
+            self.get_config()
+        return self.known_config_items or {}
 
     def get_items(self) -> dict[str, Any]:
         if self.items is None:
@@ -178,6 +217,7 @@ class _BatchCache:
             elif tab == "config_schema":
                 self.config = None
                 self.known_config_vars = None
+                self.known_config_items = None
             elif tab == "items":
                 self.items = None
             elif tab == "skills":
@@ -192,6 +232,7 @@ class _BatchCache:
     def invalidate_all(self) -> None:
         self.config = None
         self.known_config_vars = None
+        self.known_config_items = None
         self.items = None
         self.skills = None
         self.tree = None
@@ -396,14 +437,14 @@ def _apply_anoint_in_place(
     resolved_slot = _resolve_slot_from_items(items_res, slot_name)
     slot_obj = next((s for s in items_res.get("slots", []) if s["name"] == resolved_slot), None)
     if not slot_obj or not slot_obj.get("selItemId"):
-        raise RuntimeError(f"Slot '{resolved_slot}' has no equipped item to anoint.")
+        raise DaemonRequestError(f"Slot '{resolved_slot}' has no equipped item to anoint.")
 
     item_id = int(slot_obj["selItemId"])
     edit_state = w.call("item_edit_begin", {"id": item_id})
     try:
         actions = edit_state.get("actions", {})
         if not actions.get(action_key):
-            raise RuntimeError(
+            raise DaemonRequestError(
                 f"Item '{edit_state.get('name')}' in slot '{resolved_slot}' does not support '{action_key}' "
                 f"(may be Corrupted, Mirrored, or not an anointable base)."
             )
@@ -740,6 +781,108 @@ def _build_add_gem_params(g_idx: int, spec: dict[str, Any]) -> dict[str, Any]:
     return params
 
 
+def _is_vaal_gem_entry(gem: dict[str, Any] | None, fallback_name: str = "") -> bool:
+    """Return True if `gem` or `fallback_name` refers to a Vaal skill gem.
+
+    In PoB (`Data/Gems.lua` & `CalcSetup.lua:1831`), Vaal gems map `grantedEffectList[1]`
+    (`enableGlobal1`) to the VAAL burst skill and `grantedEffectList[2]` (`enableGlobal2`)
+    to the BASE skill, whereas non-Vaal gems keep their active/aura skill on `enableGlobal1`.
+    """
+    g = gem if isinstance(gem, dict) else {}
+    if g.get("support"):
+        return False
+    skill_id = str(g.get("skillId") or "").strip()
+    if skill_id.startswith("Vaal") and skill_id != "Vaal":
+        return True
+    for raw in (
+        g.get("name"),
+        g.get("nameSpec"),
+        g.get("nameZh"),
+        fallback_name,
+    ):
+        if not raw:
+            continue
+        cleaned = strip_pob_escapes(str(raw)).strip()
+        low = cleaned.lower()
+        if low.startswith("vaal ") or " vaal " in low or "瓦尔" in cleaned:
+            return True
+    return False
+
+
+def _add_gem_with_default_skill_flags(w: BridgeWorker, params: dict[str, Any]) -> dict[str, Any]:
+    """Add a gem and, for Vaal gems only, default to base skill ON (`enableGlobal2=True`) and Vaal burst OFF (`enableGlobal1=False`)."""
+    added = w.call("add_gem", params)
+    gem = added.get("gem") if isinstance(added, dict) else None
+    fallback_name = str(params.get("nameSpec") or "")
+    if not _is_vaal_gem_entry(gem, fallback_name):
+        return added
+    gem_index = gem.get("index") if isinstance(gem, dict) else None
+    if gem_index is None:
+        raise RuntimeError("add_gem did not return the added gem index")
+    updated = w.call(
+        "set_gem",
+        {
+            "group": params["group"],
+            "index": gem_index,
+            "enableGlobal1": False,
+            "enableGlobal2": True,
+        },
+    )
+    if isinstance(added, dict):
+        merged = dict(added)
+        if isinstance(updated, dict) and "gem" in updated:
+            merged["gem"] = updated["gem"]
+        return merged
+    return updated
+
+
+def _apply_vaal_defaults_batch(
+    w: BridgeWorker,
+    g_idx: int,
+    resolved_specs: list[dict[str, Any]],
+    gem_results: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Build `added_gems` records and batch `set_gem(enableGlobal1=False, enableGlobal2=True)` ONLY for Vaal gems."""
+    added_gems: list[dict[str, Any]] = []
+    vaal_fix_positions: list[int] = []
+    vaal_fix_calls: list[tuple[str, dict[str, Any]]] = []
+    for pos, (sp, res) in enumerate(zip(resolved_specs, gem_results)):
+        gem_obj = res.get("gem") if isinstance(res, dict) else None
+        if _is_vaal_gem_entry(gem_obj, str(sp.get("name") or "")):
+            gem_idx = gem_obj.get("index") if isinstance(gem_obj, dict) else None
+            if gem_idx is None:
+                raise RuntimeError("add_gem did not return the added gem index")
+            vaal_fix_positions.append(pos)
+            vaal_fix_calls.append(
+                (
+                    "set_gem",
+                    {
+                        "group": g_idx,
+                        "index": gem_idx,
+                        "enableGlobal1": False,
+                        "enableGlobal2": True,
+                    },
+                )
+            )
+        added_gems.append(
+            {
+                "name": sp.get("name"),
+                "gemId": sp.get("gemId"),
+                "level": sp.get("level"),
+                "quality": sp.get("quality"),
+                "enabled": sp.get("enabled"),
+                "count": sp.get("count"),
+                "gem": gem_obj,
+            }
+        )
+    if vaal_fix_calls:
+        fix_results = _call_batch(w, vaal_fix_calls)
+        for pos, fix_res in zip(vaal_fix_positions, fix_results):
+            if isinstance(fix_res, dict) and "gem" in fix_res:
+                added_gems[pos]["gem"] = fix_res["gem"]
+    return added_gems
+
+
 def _apply_add_group_in_place(
     w: BridgeWorker,
     *,
@@ -779,18 +922,7 @@ def _apply_add_group_in_place(
         resolved_specs = _resolve_gem_specs_batch(w, g_idx, norm_specs)
         add_calls = [("add_gem", _build_add_gem_params(g_idx, sp)) for sp in resolved_specs]
         gem_results = _call_batch(w, add_calls)
-        for sp, res in zip(resolved_specs, gem_results):
-            added_gems.append(
-                {
-                    "name": sp.get("name"),
-                    "gemId": sp.get("gemId"),
-                    "level": sp.get("level"),
-                    "quality": sp.get("quality"),
-                    "enabled": sp.get("enabled"),
-                    "count": sp.get("count"),
-                    "gem": res.get("gem"),
-                }
-            )
+        added_gems = _apply_vaal_defaults_batch(w, g_idx, resolved_specs, gem_results)
 
     if make_main:
         w.call("set_build_field", {"field": "mainSocketGroup", "value": g_idx})
@@ -862,7 +994,9 @@ def _apply_replace_group_in_place(
 ) -> dict[str, Any]:
     skills_res = cache.get_skills() if cache is not None else w.call("list_skills", {})
     g_idx = resolve_skill_group_index(skills_res, group_selector)
-    grp = next(g for g in skills_res.get("groups", []) if g["index"] == g_idx)
+    grp = next((g for g in skills_res.get("groups", []) if g["index"] == g_idx), None)
+    if grp is None:
+        raise ValueError(f"Skill group #{g_idx} not found in build.")
     _guard_source_skill_group(grp, action="replace gems")
 
     norm_specs = [_normalize_gem_spec(g) for g in (gems or [])]
@@ -898,18 +1032,7 @@ def _apply_replace_group_in_place(
     if resolved_specs:
         add_calls = [("add_gem", _build_add_gem_params(g_idx, sp)) for sp in resolved_specs]
         gem_results = _call_batch(w, add_calls)
-        for sp, res in zip(resolved_specs, gem_results):
-            added_gems.append(
-                {
-                    "name": sp.get("name"),
-                    "gemId": sp.get("gemId"),
-                    "level": sp.get("level"),
-                    "quality": sp.get("quality"),
-                    "enabled": sp.get("enabled"),
-                    "count": sp.get("count"),
-                    "gem": res.get("gem"),
-                }
-            )
+        added_gems = _apply_vaal_defaults_batch(w, g_idx, resolved_specs, gem_results)
 
     if cache is not None:
         cache.invalidate("skills")
@@ -968,7 +1091,9 @@ def modify_skill(
     def _do_skill_set(w: BridgeWorker) -> dict[str, Any]:
         skills_res = w.call("list_skills", {})
         g_idx = resolve_skill_group_index(skills_res, group_selector)
-        group = next(g for g in skills_res.get("groups", []) if g["index"] == g_idx)
+        group = next((g for g in skills_res.get("groups", []) if g["index"] == g_idx), None)
+        if group is None:
+            raise ValueError(f"Skill group #{g_idx} not found in build.")
 
         group_updates: dict[str, Any] = {"index": g_idx}
         if include_in_full_dps is not None:
@@ -1035,7 +1160,7 @@ def add_skill_gem(
         else:
             add_params["nameSpec"] = gem_name.strip()
 
-        res = w.call("add_gem", add_params)
+        res = _add_gem_with_default_skill_flags(w, add_params)
         return {"groupIndex": g_idx, "addedGem": res, "resolvedCandidate": chosen}
 
     return run_mutation(worker, _do_add, apply=apply)
@@ -1052,7 +1177,9 @@ def remove_skill_gem(
     def _do_rm(w: BridgeWorker) -> dict[str, Any]:
         skills_res = w.call("list_skills", {})
         g_idx = resolve_skill_group_index(skills_res, group_selector)
-        group = next(g for g in skills_res.get("groups", []) if g["index"] == g_idx)
+        group = next((g for g in skills_res.get("groups", []) if g["index"] == g_idx), None)
+        if group is None:
+            raise ValueError(f"Skill group #{g_idx} not found in build.")
         target_gem = _resolve_gem_in_group(group, gem_selector)
         if group.get("source") and int(target_gem.get("index", 0)) == 1:
             _guard_source_skill_group(group, action="remove gem #1")
@@ -1482,7 +1609,7 @@ def _apply_edit_item_mods_in_place(
     resolved_slot = _resolve_slot_from_items(items_res, slot_name)
     slot_obj = next((s for s in items_res.get("slots", []) if s["name"] == resolved_slot), None)
     if not slot_obj or not slot_obj.get("selItemId"):
-        raise RuntimeError(f"Slot '{resolved_slot}' has no equipped item to edit.")
+        raise DaemonRequestError(f"Slot '{resolved_slot}' has no equipped item to edit.")
 
     item_id = int(slot_obj["selItemId"])
     before_raw = w.call("item_raw", {"id": item_id}).get("raw") or ""
@@ -1521,7 +1648,7 @@ def edit_item_mods(
         resolved_slot = _resolve_slot_from_items(items_res, slot_name)
         slot_obj = next((s for s in items_res.get("slots", []) if s["name"] == resolved_slot), None)
         if not slot_obj or not slot_obj.get("selItemId"):
-            raise RuntimeError(f"Slot '{resolved_slot}' has no equipped item to edit.")
+            raise DaemonRequestError(f"Slot '{resolved_slot}' has no equipped item to edit.")
 
         item_id = int(slot_obj["selItemId"])
         before_raw = worker.call("item_raw", {"id": item_id}).get("raw") or ""
@@ -1815,7 +1942,8 @@ def _apply_class_ascendancy_in_place(
     if ascendancy_name is not None and str(ascendancy_name).strip():
         asc_q = str(ascendancy_name).strip()
         if class_name is not None and str(class_name).strip():
-            assert target_class_obj is not None
+            if target_class_obj is None:
+                raise ValueError(f"Unable to resolve class '{class_name}' for ascendancy '{asc_q}'.")
             target_asc_obj = _match_named_option(
                 target_class_obj.get("ascendancies", []),
                 asc_q,
@@ -1823,7 +1951,8 @@ def _apply_class_ascendancy_in_place(
             )
         else:
             try:
-                assert target_class_obj is not None
+                if target_class_obj is None:
+                    raise ValueError(f"Current character class is unknown for ascendancy '{asc_q}'.")
                 target_asc_obj = _match_named_option(
                     target_class_obj.get("ascendancies", []),
                     asc_q,
@@ -2035,6 +2164,14 @@ def _split_custom_mod_lines(raw_text: str) -> list[str]:
     return lines
 
 
+_ENEMY_IS_BOSS_ALIASES: dict[str, str] = {
+    "shaper": "Pinnacle",
+    "sirus": "Pinnacle",
+    "uber atziri": "Boss",
+    "atziri": "Boss",
+}
+
+
 def _apply_config_in_place(
     w: BridgeWorker,
     assignments: list[tuple[str, Any]],
@@ -2046,31 +2183,79 @@ def _apply_config_in_place(
     applied_vars: list[dict[str, Any]] = []
     touched_boss = False
 
-    known_vars: dict[str, str] = {}
+    known_items: dict[str, dict[str, Any]] = {}
     if assignments:
         if cache is not None:
-            known_vars = cache.get_known_config_vars()
+            known_items = cache.get_known_config_items()
         else:
             cfg_meta = w.call("list_config", {})
             for sec in cfg_meta.get("sections", []):
                 for item in sec.get("items", []):
                     vname = item.get("var")
                     if vname:
-                        known_vars[str(vname).lower()] = str(vname)
+                        known_items[str(vname).lower()] = item
 
     if assignments:
         rpc_calls: list[tuple[str, dict[str, Any]]] = []
         meta_rows: list[tuple[str, str, Any]] = []
         for raw_var, raw_val in assignments:
-            var = known_vars.get(str(raw_var).strip().lower(), str(raw_var).strip())
-            v_str = str(raw_val).strip()
-            if v_str.lower() in ("reset", "none", "null", "default"):
+            item = known_items.get(str(raw_var).strip().lower(), {})
+            var = str(item.get("var") or str(raw_var).strip())
+            is_list = item.get("type") == "list"
+            list_options = item.get("list") or []
+            none_is_option = is_list and any(
+                (opt.get("val") is not None and str(opt.get("val")).strip().lower() == "none")
+                or strip_pob_escapes(str(opt.get("label") or "")).strip().lower() == "none"
+                for opt in list_options
+                if isinstance(opt, dict)
+            )
+            v_str = "" if raw_val is None else str(raw_val).strip()
+            v_low = v_str.lower()
+            if (
+                raw_val is None
+                or v_low in ("reset", "null", "nil", "default", "__unset__")
+                or (v_low == "none" and not none_is_option)
+            ):
                 rpc_calls.append(("reset_config", {"var": var}))
                 meta_rows.append((var, "reset", None))
             else:
-                coerced = _coerce_config_value(raw_val)
-                rpc_calls.append(("set_config", {"var": var, "value": coerced}))
-                meta_rows.append((var, "set", coerced))
+                matched_list_val = False
+                coerced: Any = None
+                if is_list and not isinstance(raw_val, bool):
+                    lookup_str = _ENEMY_IS_BOSS_ALIASES.get(v_low, v_str) if var == "enemyIsBoss" else v_str
+                    lookup_low = lookup_str.strip().lower()
+                    for opt in list_options:
+                        if not isinstance(opt, dict) or "val" not in opt:
+                            continue
+                        opt_val_str = str(opt.get("val")).strip().lower()
+                        opt_lbl = strip_pob_escapes(str(opt.get("label") or "")).strip().lower()
+                        opt_lbl_zh = strip_pob_escapes(str(opt.get("labelZh") or "")).strip().lower()
+                        if (
+                            lookup_low == opt_val_str
+                            or (opt_lbl and lookup_low == opt_lbl)
+                            or (opt_lbl_zh and lookup_low == opt_lbl_zh)
+                        ):
+                            coerced = opt["val"]
+                            matched_list_val = True
+                            break
+                    if not matched_list_val and var == "enemyIsBoss" and v_low in _ENEMY_IS_BOSS_ALIASES:
+                        coerced = _ENEMY_IS_BOSS_ALIASES[v_low]
+                        matched_list_val = True
+                if not matched_list_val:
+                    coerced = _coerce_config_value(raw_val)
+                    if var == "enemyIsBoss" and isinstance(coerced, str):
+                        coerced = _ENEMY_IS_BOSS_ALIASES.get(coerced.lower(), coerced)
+                if item.get("type") in ("count", "countAllowZero", "integer", "float") and isinstance(coerced, bool):
+                    if coerced:
+                        coerced = 1
+                        rpc_calls.append(("set_config", {"var": var, "value": coerced}))
+                        meta_rows.append((var, "set", coerced))
+                    else:
+                        rpc_calls.append(("reset_config", {"var": var}))
+                        meta_rows.append((var, "reset", None))
+                else:
+                    rpc_calls.append(("set_config", {"var": var, "value": coerced}))
+                    meta_rows.append((var, "set", coerced))
             if var in ("enemyIsBoss", "presetBossSkills"):
                 touched_boss = True
 
@@ -2087,9 +2272,10 @@ def _apply_config_in_place(
         cfg = w.call("list_config", {})
         if cache is not None:
             cache.config = cfg
+            cache._index_config_vars(cfg)
         for sec in cfg.get("sections", []):
             for item in sec.get("items", []):
-                if item.get("var") == "presetBossSkills" and item.get("value"):
+                if item.get("var") == "presetBossSkills" and item.get("value") not in (None, "", "None"):
                     w.call("set_config", {"var": "presetBossSkills", "value": item["value"]})
                     if cache is not None:
                         cache.invalidate("config")
@@ -2390,8 +2576,14 @@ def _execute_batch_ops(
         kind = raw_kind.replace("-", "_")
 
         if kind == "config":
-            pairs = [(k, v) for k, v in (op.get("set") or {}).items()]
-            for var in op.get("reset") or []:
+            set_map = op.get("set")
+            if set_map is not None and not isinstance(set_map, dict):
+                raise ValueError(f"Batch op 'config' at step {idx} expects 'set' to be a JSON object.")
+            reset_list = op.get("reset")
+            if reset_list is not None and not isinstance(reset_list, list):
+                raise ValueError(f"Batch op 'config' at step {idx} expects 'reset' to be a JSON list.")
+            pairs = [(k, v) for k, v in (set_map or {}).items()]
+            for var in reset_list or []:
                 pairs.append((var, "reset"))
             cm = op.get("customMods") if "customMods" in op else op.get("custom_mods")
             acm = op.get("appendCustomMods") if "appendCustomMods" in op else op.get("append_custom_mods")
@@ -2413,9 +2605,13 @@ def _execute_batch_ops(
             step_results.append({"step": idx, "op": "flask", "slotName": ",".join(slots), "active": act})
 
         elif kind == "item":
+            raw_val = op.get("raw")
+            raw_text = str(raw_val).strip() if raw_val is not None else ""
+            if not raw_text:
+                raise ValueError(f"Batch op 'item' at step {idx} requires non-empty 'raw'.")
             slot_query = op.get("slot") or op.get("slotName")
             slot_name = _resolve_slot_from_items(cache.get_items(), str(slot_query)) if slot_query else None
-            params: dict[str, Any] = {"raw": str(op["raw"]).strip(), "equip": True}
+            params: dict[str, Any] = {"raw": raw_text, "equip": True}
             if slot_name:
                 params["slotName"] = slot_name
             res = w.call("add_item", params)
@@ -2496,11 +2692,15 @@ def _execute_batch_ops(
             step_results.append({"step": idx, "op": "unequip", "slotName": resolved_slot})
 
         elif kind == "anoint":
+            notable_val = op.get("notable")
+            notable_text = str(notable_val).strip() if notable_val is not None else ""
+            if not notable_text:
+                raise ValueError(f"Batch op 'anoint' at step {idx} requires non-empty 'notable'.")
             an_res = _apply_anoint_in_place(
                 w,
                 slot_name=str(op.get("slot") or "Amulet"),
-                notable_query=str(op["notable"]),
-                anoint_index=int(op.get("index", 1)),
+                notable_query=notable_text,
+                anoint_index=int(op["index"]) if op.get("index") is not None else 1,
                 cache=cache,
             )
             step_results.append({"step": idx, "op": "anoint", "notable": an_res.get("notable")})
@@ -2739,7 +2939,9 @@ def _execute_batch_ops(
         elif kind == "skill":
             skills_res = cache.get_skills()
             g_idx = resolve_skill_group_index(skills_res, op.get("group", "main"))
-            group = next(g for g in skills_res.get("groups", []) if g["index"] == g_idx)
+            group = next((g for g in skills_res.get("groups", []) if g["index"] == g_idx), None)
+            if group is None:
+                raise ValueError(f"Skill group #{g_idx} not found in build.")
 
             grp_updates: dict[str, Any] = {"index": g_idx}
             full_dps_val = (
@@ -2760,19 +2962,23 @@ def _execute_batch_ops(
             if add_gem_name:
                 gem_name = str(add_gem_name).strip()
                 cand = _resolve_gem_candidate(w, g_idx, gem_name)
+                raw_level = op.get("level")
+                raw_quality = op.get("quality")
+                raw_enabled = op.get("enabled")
+                raw_count = op.get("count")
                 add_params = {
                     "group": g_idx,
-                    "level": int(op.get("level", 20)),
-                    "quality": int(op.get("quality", 20)),
-                    "enabled": bool(op.get("enabled", True)),
-                    "count": int(op.get("count", 1)),
+                    "level": int(raw_level) if raw_level is not None else 20,
+                    "quality": int(raw_quality) if raw_quality is not None else 20,
+                    "enabled": bool(raw_enabled) if raw_enabled is not None else True,
+                    "count": int(raw_count) if raw_count is not None else 1,
                 }
                 if cand and cand.get("gemId"):
                     add_params["gemId"] = cand["gemId"]
                     add_params["nameSpec"] = cand.get("name") or gem_name
                 else:
                     add_params["nameSpec"] = gem_name
-                w.call("add_gem", add_params)
+                _add_gem_with_default_skill_flags(w, add_params)
             elif remove_gem_sel is not None:
                 t_gem = _resolve_gem_in_group(group, remove_gem_sel)
                 if group.get("source") and int(t_gem.get("index", 0)) == 1:
@@ -2812,11 +3018,17 @@ def _normalize_return_sections(return_sections: list[str] | str | None) -> list[
     return raw_items
 
 
-def _collect_return_sections(worker: BridgeWorker, sections: list[str]) -> dict[str, Any]:
+def _collect_return_sections(
+    worker: BridgeWorker,
+    sections: list[str],
+    *,
+    keep: Iterable[str] | str | None = None,
+) -> dict[str, Any]:
     """Lazily import inspection helpers and collect requested readouts on the active build state."""
     from . import analyzer as _analyzer
     from . import comparator as _comparator
 
+    keep_arg = _normalize_keep_list(keep) if keep is not None else None
     out: dict[str, Any] = {}
     for raw_sec in sections:
         sec = raw_sec.strip()
@@ -2834,10 +3046,30 @@ def _collect_return_sections(worker: BridgeWorker, sections: list[str]) -> dict[
             fn = getattr(_analyzer, "extract_summary", None) or getattr(_analyzer, "get_summary")
             out["summary"] = fn(worker)
         elif head_low == "audit":
-            out["audit"] = _analyzer.audit_build(worker)
+            body_low = body.lower()
+            if body_low == "":
+                attr = False
+            elif body_low in ("full", "attribution"):
+                attr = True
+            else:
+                raise ValueError(
+                    f"Unsupported audit return modifier '{raw_sec}'. "
+                    "Use 'audit', 'audit:full', or 'audit:attribution'."
+                )
+            out["audit"] = _call_compat(
+                _analyzer.audit_build,
+                worker,
+                keep=keep_arg,
+                attribution=attr,
+            )
         elif head_low == "matrix":
             scenarios = [s.strip() for s in body.split(";") if s.strip()] if body else None
-            out["matrix"] = _comparator.run_matrix(worker, scenarios=scenarios)
+            out["matrix"] = _call_compat(
+                _comparator.run_matrix,
+                worker,
+                scenarios=scenarios,
+                keep=keep_arg,
+            )
         elif head_low == "calc":
             kws = [k.strip() for k in body.split(";") if k.strip()] if body else []
             if not kws:
@@ -2863,7 +3095,7 @@ def _collect_return_sections(worker: BridgeWorker, sections: list[str]) -> dict[
         else:
             raise ValueError(
                 f"Unsupported return section '{raw_sec}'. "
-                "Supported: summary, audit, matrix[:s1;s2], calc:<kw1;kw2>, export, items, skills, tree, config."
+                "Supported: summary, audit[:full|attribution], matrix[:s1;s2], calc:<kw1;kw2>, export, items, skills, tree, config."
             )
     return out
 
@@ -2875,6 +3107,7 @@ def run_batch(
     apply: bool = False,
     no_undo: bool = False,
     return_sections: list[str] | str | None = None,
+    keep: Iterable[str] | str | None = None,
 ) -> dict[str, Any]:
     """Execute a composite list of mutations in a single transaction with optional inline readouts.
 
@@ -2897,7 +3130,7 @@ def run_batch(
             try:
                 step_results = _execute_batch_ops(worker, ops, cache)
                 digest_after = capture_digest(worker)
-                returns_map = _collect_return_sections(worker, sections) if sections else None
+                returns_map = _collect_return_sections(worker, sections, keep=keep) if sections else None
             except Exception:
                 if fallback_code:
                     try:
@@ -2945,7 +3178,7 @@ def run_batch(
         cache = _BatchCache(w)
         step_results = _execute_batch_ops(w, ops, cache)
         if sections:
-            captured_returns = _collect_return_sections(w, sections)
+            captured_returns = _collect_return_sections(w, sections, keep=keep)
         return {"steps": step_results}
 
     res = run_mutation(worker, _do_batch, apply=apply)
@@ -3133,6 +3366,7 @@ def run_sweep(
     base_ops: list[dict[str, Any]] | None = None,
     calc_keywords: list[str] | str | None = None,
     scenario: str | dict[str, Any] | None = None,
+    keep: Iterable[str] | str | None = None,
 ) -> dict[str, Any]:
     """Evaluate N named build variants in ONE warm daemon worker with fault isolation and 0-residue rollback.
 
@@ -3151,87 +3385,118 @@ def run_sweep(
     elif calc_keywords:
         kw_list = [str(k).strip() for k in calc_keywords if str(k).strip()]
 
+    merged_keep: list[str] = []
+    for tok in _normalize_keep_list(keep):
+        if tok not in merged_keep:
+            merged_keep.append(tok)
+    if isinstance(scenario, dict) and scenario.get("keep") is not None:
+        for tok in _normalize_keep_list(scenario.get("keep")):
+            if tok not in merged_keep:
+                merged_keep.append(tok)
+    eff_keep: list[str] | None = merged_keep or None
+
     with worker.lock:
         prev_last_good = getattr(worker, "last_good_code", None)
         orig_code = worker.call("export_code", {})["code"]
         results: list[dict[str, Any]] = []
         base_steps: list[dict[str, Any]] = []
         scenario_applied: dict[str, Any] | None = None
+        orig_digest: dict[str, Any] | None = None
+        restore_check: dict[str, Any] | None = None
+        will_mutate_base = bool(base_ops) or (
+            scenario is not None and (not isinstance(scenario, str) or scenario.strip())
+        )
 
         try:
-            sweep_base_code = orig_code
-            mutated_base = False
+            try:
+                if will_mutate_base:
+                    orig_digest = capture_digest(worker)
 
-            if base_ops:
-                base_steps = _execute_batch_ops(worker, base_ops, _BatchCache(worker))
-                mutated_base = True
+                sweep_base_code = orig_code
+                mutated_base = False
 
-            if scenario is not None and (not isinstance(scenario, str) or scenario.strip()):
-                from .comparator import _apply_matrix_scenario_in_place, _parse_matrix_scenario
+                if base_ops:
+                    base_steps = _execute_batch_ops(worker, base_ops, _BatchCache(worker))
+                    mutated_base = True
 
-                plan = _parse_matrix_scenario(scenario)
-                scenario_applied = _apply_matrix_scenario_in_place(worker, plan)
-                mutated_base = True
+                if scenario is not None and (not isinstance(scenario, str) or scenario.strip()):
+                    from .comparator import _apply_matrix_scenario_in_place, _parse_matrix_scenario
 
-            if mutated_base:
-                sweep_base_code = worker.call("export_code", {})["code"]
-
-            base_digest = capture_digest(worker)
-            base_calcs = _extract_compact_calcs(worker, kw_list) if kw_list else None
-
-            dirty = False
-            for idx, var in enumerate(variants):
-                if not isinstance(var, dict):
-                    results.append(
-                        {
-                            "name": f"Variant {idx + 1}",
-                            "ok": False,
-                            "error": f"Variant entry #{idx + 1} must be a JSON object.",
-                        }
+                    plan = _parse_matrix_scenario(scenario)
+                    scenario_applied = _call_compat(
+                        _apply_matrix_scenario_in_place,
+                        worker,
+                        plan,
+                        keep=eff_keep,
                     )
-                    continue
+                    mutated_base = True
 
-                v_name = str(var.get("name") or f"Variant {idx + 1}").strip()
-                v_ops = var.get("ops") or []
+                if mutated_base:
+                    sweep_base_code = worker.call("export_code", {})["code"]
 
-                if dirty:
-                    worker.call("import_code", {"code": sweep_base_code, "mode": "replace"})
-                    dirty = False
+                base_digest = capture_digest(worker)
+                if orig_digest is None:
+                    orig_digest = base_digest
+                base_calcs = _extract_compact_calcs(worker, kw_list) if kw_list else None
 
-                try:
-                    if not isinstance(v_ops, list):
-                        raise ValueError(f"Variant '{v_name}' 'ops' must be a list of batch operations.")
-                    step_results: list[dict[str, Any]] = []
-                    if v_ops:
-                        dirty = True
-                        step_results = _execute_batch_ops(worker, v_ops, _BatchCache(worker))
+                dirty = False
+                for idx, var in enumerate(variants):
+                    if not isinstance(var, dict):
+                        results.append(
+                            {
+                                "name": f"Variant {idx + 1}",
+                                "ok": False,
+                                "error": f"Variant entry #{idx + 1} must be a JSON object.",
+                            }
+                        )
+                        continue
 
-                    v_digest = capture_digest(worker)
-                    v_diff = diff_digest(base_digest, v_digest)
-                    v_calcs = _extract_compact_calcs(worker, kw_list) if kw_list else None
+                    v_name = str(var.get("name") or f"Variant {idx + 1}").strip()
+                    v_ops = var.get("ops") or []
 
-                    entry: dict[str, Any] = {
-                        "name": v_name,
-                        "ok": True,
-                        "steps": step_results,
-                        "summary": _compact_sweep_summary(v_digest),
-                        "diffVsBase": v_diff,
-                        "warnings": v_digest.get("warnings", []),
-                    }
-                    if v_calcs is not None:
-                        entry["calcs"] = v_calcs
-                    results.append(entry)
-                except Exception as exc:  # noqa: BLE001
-                    dirty = True
-                    results.append(
-                        {
+                    if dirty:
+                        worker.call("import_code", {"code": sweep_base_code, "mode": "replace"})
+                        dirty = False
+
+                    try:
+                        if not isinstance(v_ops, list):
+                            raise ValueError(f"Variant '{v_name}' 'ops' must be a list of batch operations.")
+                        step_results: list[dict[str, Any]] = []
+                        if v_ops:
+                            dirty = True
+                            step_results = _execute_batch_ops(worker, v_ops, _BatchCache(worker))
+
+                        v_digest = capture_digest(worker)
+                        v_diff = diff_digest(base_digest, v_digest)
+                        v_calcs = _extract_compact_calcs(worker, kw_list) if kw_list else None
+
+                        entry: dict[str, Any] = {
                             "name": v_name,
-                            "ok": False,
-                            "error": str(exc),
+                            "ok": True,
+                            "steps": step_results,
+                            "summary": _compact_sweep_summary(v_digest),
+                            "diffVsBase": v_diff,
+                            "warnings": v_digest.get("warnings", []),
                         }
-                    )
+                        if v_calcs is not None:
+                            entry["calcs"] = v_calcs
+                        results.append(entry)
+                    except Exception as exc:  # noqa: BLE001
+                        dirty = True
+                        results.append(
+                            {
+                                "name": v_name,
+                                "ok": False,
+                                "error": str(exc),
+                            }
+                        )
+            finally:
+                worker.call("import_code", {"code": orig_code, "mode": "replace"})
+
+            from .analyzer import verify_restored
+
+            restore_check = verify_restored(worker, orig_code, orig_digest or {})
         finally:
-            worker.call("import_code", {"code": orig_code, "mode": "replace"})
             if hasattr(worker, "last_good_code"):
                 worker.last_good_code = prev_last_good
 
@@ -3252,6 +3517,7 @@ def run_sweep(
             "variants": results,
             "succeeded": sum(1 for r in results if r.get("ok")),
             "failed": sum(1 for r in results if not r.get("ok")),
+            "restoreCheck": restore_check,
         }
 
 

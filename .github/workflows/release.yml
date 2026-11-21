@@ -82,6 +82,8 @@ jobs:
           if ($LASTEXITCODE -ne 0 -or $ver -notmatch [regex]::Escape("${{ steps.meta.outputs.version }}")) {
             throw "Unexpected pob.exe --version output: '$ver' (exit $LASTEXITCODE)"
           }
+          & $exe timeless --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "pob.exe timeless --help failed (missing bundled cli_timeless?)" }
           & $exe bench list --slot gloves --limit 3 | Out-Null
           if ($LASTEXITCODE -ne 0) { throw "pob.exe bench list failed (missing bundled bench_costs.json?)" }
           & $exe trade convert --text "Rarity: RARE`nDoom Hand`nSlink Gloves`nImplicits: 0`n+42% to Fire Resistance" --to cold --json | Out-Null

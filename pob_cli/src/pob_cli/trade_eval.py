@@ -435,6 +435,8 @@ def verify_candidates_batch(
     """
     if limit <= 0 or not candidates:
         return
+    from .daemon import BootstrapMissingError
+
     rpc = daemon_call or _default_daemon_call
     subset = candidates[:limit]
     items_payload = [{"id": idx, "raw": candidate.item_text} for idx, candidate in enumerate(subset)]
@@ -448,6 +450,8 @@ def verify_candidates_batch(
                 "items": items_payload,
             },
         )
+    except BootstrapMissingError:
+        raise
     except Exception as exc:
         msg = str(exc)
         if "unknown daemon action" in msg.lower():
@@ -460,6 +464,8 @@ def verify_candidates_batch(
                         daemon_call=rpc,
                     )
                     candidate.pob_error = None
+                except BootstrapMissingError:
+                    raise
                 except Exception as item_exc:
                     candidate.pob = None
                     candidate.pob_error = str(item_exc)

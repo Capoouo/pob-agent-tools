@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import json
 import os
 import re
@@ -18,6 +19,7 @@ import httpx
 from . import __version__
 from . import updater as _updater
 from .bridge_client import BridgeError, BridgeWorker
+from .errors import DaemonRequestError
 from .updater import get_runtime_dir
 
 USER_AGENT = f"pob-cli/{__version__} (+https://github.com/exilemoulei/pob-agent-tools)"
@@ -51,15 +53,23 @@ def xml_to_share_code(xml_text: str) -> str:
 
 def share_code_to_xml(code: str) -> str:
     """Decompress a URL-safe Base64 PoB share code into raw PoB XML text."""
-    cleaned = code.lstrip("\ufeff").strip().replace("-", "+").replace("_", "/")
+    cleaned = re.sub(r"\s+", "", code.lstrip("\ufeff")).replace("-", "+").replace("_", "/")
+    if not cleaned:
+        raise ValueError("Invalid PoB share code: empty share code.")
     pad = (-len(cleaned)) % 4
     if pad:
         cleaned += "=" * pad
-    raw_bytes = base64.b64decode(cleaned)
     try:
-        decompressed = zlib.decompress(raw_bytes)
-    except zlib.error:
-        decompressed = zlib.decompress(raw_bytes, -15)
+        raw_bytes = base64.b64decode(cleaned, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError(f"Invalid PoB share code: {exc}") from exc
+    try:
+        try:
+            decompressed = zlib.decompress(raw_bytes)
+        except zlib.error:
+            decompressed = zlib.decompress(raw_bytes, -15)
+    except (zlib.error, ValueError) as exc:
+        raise ValueError(f"Invalid PoB share code: {exc}") from exc
     return decompressed.decode("utf-8-sig", errors="replace").lstrip("\ufeff")
 
 
@@ -371,9 +381,10 @@ def fetch_poe_ninja_character_code(url: str) -> str:
 
     if not candidates:
         err_note = f" ({'; '.join(fetch_errs)})" if fetch_errs else ""
-        raise RuntimeError(
-            f"Could not find league slug '{league_slug}' in poe.ninja build-index-state or index-state{err_note}."
-        )
+        msg = f"Could not find league slug '{league_slug}' in poe.ninja build-index-state or index-state{err_note}."
+        if not fetch_errs:
+            raise DaemonRequestError(msg)
+        raise RuntimeError(msg)
 
     account_attempts = [raw_account]
     if hash_account != raw_account:
@@ -487,7 +498,10 @@ def load_build_into_worker(
                     res = worker.call("import_code", {"code": code, "mode": "replace"})
                     import_method = "url_fallback"
             else:
-                # Raw Base64 share code
+                # Raw Base64 share code: pre-validate before import_code so malformed share
+                # codes raise ValueError (errorKind="request", exit 1) while engine crashes
+                # stay BridgeError (errorKind="daemon", exit 5).
+                share_code_to_xml(src)
                 res = worker.call("import_code", {"code": src, "mode": "replace"})
                 import_method = "share_code"
         else:

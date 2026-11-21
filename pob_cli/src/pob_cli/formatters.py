@@ -160,6 +160,67 @@ def fmt_delta(before: float | int | str | None, after: float | int | str | None,
     return f"{sign}{diff_str}{unit}"
 
 
+def fmt_signed_pct(delta: Any, pct: Any = None) -> str:
+    """Render '+1,234 (+4.2%)' for a PoB-measured delta; '-' when unavailable/non-finite, '0' when unchanged."""
+    if delta is None or isinstance(delta, bool):
+        return "-"
+    try:
+        d = float(delta)
+    except (TypeError, ValueError):
+        return "-"
+    if not math.isfinite(d):
+        return "-"
+    if d == 0:
+        return "0"
+    sign = "+" if d > 0 else ""
+    out = f"{sign}{fmt_num(d)}"
+    if pct is not None and not isinstance(pct, bool):
+        try:
+            p = float(pct)
+        except (TypeError, ValueError):
+            p = math.nan
+        if math.isfinite(p):
+            pct_sign = "+" if (p > 0 or (p == 0 and d > 0)) else ""
+            out += f" ({pct_sign}{p:.1f}%)"
+    return out
+
+
+def keep_rejected_warning(stripped: dict[str, Any] | list[str] | tuple[str, ...] | None) -> list[str]:
+    """Loud warning lines for --keep tokens that matched nothing (those items were NOT kept)."""
+    if stripped is None:
+        return []
+    if isinstance(stripped, dict):
+        raw_rejected = stripped.get("keepRejected") or []
+    elif isinstance(stripped, (list, tuple)):
+        raw_rejected = stripped
+    else:
+        return []
+    rejected = [str(r).strip() for r in raw_rejected if str(r).strip()]
+    if not rejected:
+        return []
+    return ["> **WARNING --keep not matched (item was NOT kept)**: " + "; ".join(rejected)]
+
+
+def restore_warning(check: dict[str, Any] | None) -> str | None:
+    """Warning when the build could not be verified as restored after a what-if run."""
+    if not isinstance(check, dict) or not check:
+        return None
+    chk = (
+        check.get("restoreCheck")
+        if "restoreCheck" in check and isinstance(check.get("restoreCheck"), dict)
+        else check
+    )
+    if not isinstance(chk, dict) or not chk:
+        return None
+    if not chk.get("verified", True):
+        detail = chk.get("detail") or "build state differs from before the run"
+        return (
+            "> **WARNING build not verified as restored**: "
+            f"{detail}. Reload the build (`pob load ...`) before trusting later results."
+        )
+    return None
+
+
 def render_update_warning(warning: str | None) -> str:
     """Render a top-level Markdown warning banner for degraded engine update states."""
     if not warning or not str(warning).strip():
@@ -376,9 +437,10 @@ def _extract_metrics_block(entry: dict[str, Any]) -> dict[str, Any]:
 
 def format_matrix_markdown(res: dict[str, Any], *, target: str = "main") -> str:
     """Format `pob matrix` results for both compact (default) and `--full` payloads."""
+    warn = restore_warning(res.get("restoreCheck"))
     sc_list = res.get("scenarios") or []
     if not sc_list:
-        return "_(No matrix scenarios evaluated)_"
+        return f"{warn}\n_(No matrix scenarios evaluated)_" if warn else "_(No matrix scenarios evaluated)_"
 
     base_m = _extract_metrics_block(sc_list[0])
     base_dps = base_m["primaryDps"]
@@ -386,6 +448,8 @@ def format_matrix_markdown(res: dict[str, Any], *, target: str = "main") -> str:
     p_key = str(res.get("primaryDpsKey") or base_m["primaryDpsKey"] or "CombinedDPS")
 
     rows: list[list[Any]] = []
+    kept: list[str] = []
+    rejected: list[str] = []
     for idx, sc in enumerate(sc_list):
         m = _extract_metrics_block(sc)
         p_dps = m["primaryDps"]
@@ -426,19 +490,39 @@ def format_matrix_markdown(res: dict[str, Any], *, target: str = "main") -> str:
             ]
         )
 
+        st_info = (sc.get("applied") or {}).get("stripped") or {}
+        if isinstance(st_info, dict):
+            for k in st_info.get("kept") or []:
+                if k not in kept:
+                    kept.append(k)
+            for r in st_info.get("keepRejected") or []:
+                if r not in rejected:
+                    rejected.append(r)
+
     header = f"### Scenario Matrix Comparison (`{target}`, Baseline: `{res.get('baseline')}`, Primary: `{p_key}`)"
     table = render_table(
         ["Scenario", p_key, "DPS Delta", "Avg Hit", "Speed", "TotalEHP", "EHP Delta", "Life / ES", "MaxHit (P/E/C)"],
         rows,
     )
-    return f"{header}\n{table}"
+    parts: list[str] = []
+    if warn:
+        parts.append(warn)
+    parts.append(header)
+    parts.append(table)
+    if kept:
+        parts.append("\n**Kept (--keep)**: " + "; ".join(kept))
+    rej_lines = keep_rejected_warning(rejected)
+    if rej_lines:
+        parts.append("\n" + "\n".join(rej_lines))
+    return "\n".join(parts)
 
 
 def format_sweep_markdown(result: dict[str, Any], *, target: str | None = None) -> str:
     """Format `pob sweep` variant comparison results into a concise Markdown table."""
+    warn = restore_warning(result.get("restoreCheck"))
     variants = result.get("variants") or result.get("results") or []
     if not variants:
-        return "_(No sweep variants evaluated)_"
+        return f"{warn}\n_(No sweep variants evaluated)_" if warn else "_(No sweep variants evaluated)_"
 
     base_entry = result.get("baseline") or result.get("base") or {}
     base_m = _extract_metrics_block(base_entry) if isinstance(base_entry, dict) and base_entry else None
@@ -533,7 +617,20 @@ def format_sweep_markdown(result: dict[str, Any], *, target: str | None = None) 
         meta_bits.append(f"Scenario: `{sc_label}`")
     meta_bits.append(f"Variants: `{len(variants)}`")
     meta_bits.append(f"Primary: `{p_key}`")
-    lines = [f"### Build Variant Sweep ({', '.join(meta_bits)})", render_table(headers, rows)]
+    lines: list[str] = []
+    if warn:
+        lines.append(warn)
+    lines.extend([f"### Build Variant Sweep ({', '.join(meta_bits)})", render_table(headers, rows)])
+
+    sc_applied = result.get("scenarioApplied")
+    st_info = sc_applied.get("stripped") if isinstance(sc_applied, dict) else None
+    if isinstance(st_info, dict):
+        kept = st_info.get("kept") or []
+        if kept:
+            lines.append("\n**Kept (--keep)**: " + "; ".join(kept))
+        rej_lines = keep_rejected_warning(st_info)
+        if rej_lines:
+            lines.append("\n" + "\n".join(rej_lines))
 
     if errors:
         lines.append("\n#### Variant Errors")

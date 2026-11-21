@@ -63,6 +63,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "pob.exe --help failed" }
           & $exe _daemon --help | Out-Null
           if ($LASTEXITCODE -ne 0) { throw "pob.exe _daemon --help failed" }
+          & $exe timeless --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "pob.exe timeless --help failed (missing bundled cli_timeless?)" }
           & $exe bench list --slot gloves --limit 3 | Out-Null
           if ($LASTEXITCODE -ne 0) { throw "pob.exe bench list failed (missing bundled bench_costs.json?)" }
           & $exe bench suggest --slot gloves --stat "to Cold Resistance" --json | Out-Null
@@ -170,6 +172,7 @@ jobs:
           pob load "@$RUNNER_TEMP/test_build.xml" --json
           pob summary --json
           pob audit --json
+          pob audit --keep conditionStationary --no-attribution --json
           pob skills --json
           pob items --json
           pob tree --json
@@ -180,6 +183,27 @@ jobs:
           test -n "$CODE"
           pob load "$CODE" --json
           pob matrix Original Pinnacle --json
+          pob matrix Original Pinnacle --keep flasks --json
+          pob timeless list --json
+          err_rc=0
+          err_out="$(pob switch-main --loadout nonexistent 2>&1)" || err_rc=$?
+          if [ "$err_rc" -ne 1 ]; then
+            echo "Expected exit code 1 for invalid loadout, got $err_rc: $err_out" >&2
+            exit 1
+          fi
+          case "$err_out" in
+            *Traceback*)
+              echo "Unexpected Traceback in error output: $err_out" >&2
+              exit 1
+              ;;
+          esac
+          case "$err_out" in
+            *"Error:"*) ;;
+            *)
+              echo "Expected Error: prefix, got: $err_out" >&2
+              exit 1
+              ;;
+          esac
           pob bench list --slot gloves --limit 3 --json
           pob trade convert --text $'Rarity: RARE\nDoom Hand\nSlink Gloves\nImplicits: 0\n+42% to Fire Resistance' --to cold --json
           pob stop --json

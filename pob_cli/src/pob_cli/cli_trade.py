@@ -255,7 +255,7 @@ def _conversion_payload(plan: Any) -> dict[str, Any]:
     }
 
 
-def _prepend_warning(body: str, update_warning: dict[str, Any] | None) -> str:
+def _prepend_warning(body: str, update_warning: str | None) -> str:
     banner = render_update_warning(update_warning)
     return f"{banner}{body}" if banner else body
 
@@ -495,7 +495,7 @@ def cmd_trade_search(
     # Load current item early (when not --dump-query) so weapon1/weapon2 can infer exact category
     current = None
     current_error: str | None = None
-    update_warning: dict[str, Any] | None = None
+    update_warning: str | None = None
     build_label = f"slot:{target}"
     pob_slot = pob_slot_for_slot(slot or "") if slot else None
 

@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from collections import deque
+import difflib
 import math
 import re
 from typing import Any, Iterable
 
 from .bridge_client import BridgeWorker
-from .formatters import strip_pob_escapes
+from .formatters import _parse_numeric_or_none, strip_pob_escapes
 from .snapshot import (
     _call_batch,
     _finite_float,
@@ -59,8 +60,6 @@ TEMPORARY_SKILL_PATTERNS = (
     "sigil of power",
     "focus",
     "vaal breach",
-    "vaal impurity",
-    "vaal righteous fire",
     "熔岩护盾",
     "钢铁之肤",
     "不朽怒嚎",
@@ -69,9 +68,16 @@ TEMPORARY_SKILL_PATTERNS = (
     "冰霜护盾",
     "威能法印",
     "瓦尔裂隙",
-    "瓦尔不净",
-    "瓦尔正义之火",
 )
+
+# PoB NewConfigSet truthy defaultState values (Modules/ConfigOptions.lua) for inflation-matching
+# vars. bridge.lua's list_config does not serialize defaultState/isDefault, and reset_config
+# restores these to their defaultState (a no-op when already at defaultState).
+_POB_TRUTHY_CONFIG_DEFAULTS: dict[str, Any] = {
+    "conditionCorruptingCryStages": 1,
+    "conditionChampionIntimidate": True,
+    "conditionSacrificeMinion": True,
+}
 
 
 def extract_summary(worker: BridgeWorker) -> dict[str, Any]:
@@ -234,18 +240,112 @@ def _has_mageblood_equipped(items_res: dict[str, Any]) -> bool:
     return False
 
 
-def dewater_build_in_place(worker: BridgeWorker) -> dict[str, list[str]]:
+_KEEP_KEYWORDS = ("flasks", "custommods", "party")
+DEWATER_SENTINEL_TITLE = "pob-cli dewater"
+
+
+def _normalize_keep(keep: Iterable[str] | str | None) -> set[str]:
+    """Normalize user keep tokens (config vars, 'Flask N', 'flasks', gem names, 'customMods', 'party')."""
+    if keep is None:
+        return set()
+    tokens: Iterable[str] = (keep,) if isinstance(keep, str) else keep
+    out: set[str] = set()
+    for tok in tokens:
+        for part in str(tok).split(","):
+            p = part.strip().lower()
+            if p:
+                out.add(p)
+    return out
+
+
+def _unmatched_keep(keep_set: set[str], known: dict[str, str]) -> list[str]:
+    """Keep tokens that name nothing in this build, with a close-match hint.
+
+    pob-mcp rejects an unknown config key per key instead of silently ignoring it;
+    a mistyped ``--keep`` would otherwise strip the item it meant to protect.
+    """
+    out: list[str] = []
+    for tok in sorted(keep_set):
+        if tok in known:
+            continue
+        hint = difflib.get_close_matches(tok, list(known), n=1, cutoff=0.8)
+        msg = f"{tok}: not a config var, flask slot, skill gem, or flasks/customMods/party"
+        if hint:
+            msg += f" (did you mean {known[hint[0]]}?)"
+        out.append(msg)
+    return out
+
+
+def _normalize_custom_mod_blocks(custom_mods: Any) -> list[dict[str, Any]]:
+    """Normalize PoB customMods block list (matching bridge.lua's ``enabled ~= false`` semantics)."""
+    return [
+        {
+            "title": b.get("title") or "Default",
+            "text": b.get("text") or "",
+            "enabled": bool(b.get("enabled", True) is not False),
+        }
+        for b in (custom_mods or [])
+        if isinstance(b, dict)
+    ]
+
+
+def _is_vaal_text(text: str) -> bool:
+    low = strip_pob_escapes(text or "").strip().lower()
+    if not low:
+        return False
+    return low.startswith("vaal ") or " vaal " in low or "瓦尔" in low
+
+
+def _is_vaal_skill_entry(entry: Any) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    for key in ("name", "nameZh"):
+        if _is_vaal_text(str(entry.get(key) or "")):
+            return True
+    sid = strip_pob_escapes(str(entry.get("skillId") or "")).strip().lower()
+    return sid.startswith("vaal")
+
+
+def dewater_build_in_place(
+    worker: BridgeWorker,
+    keep: Iterable[str] | str | None = None,
+) -> dict[str, list[str]]:
     """Strip PoB inflation ('water') in place and set enemyIsBoss='Pinnacle'.
 
     Must be called inside a snapshot wrapper if non-destructive behavior is desired.
-    Returns a dictionary of stripped inflation items across the 4 audit dimensions.
+    Returns a dictionary of stripped inflation items across the 4 audit dimensions,
+    plus ``kept`` (items left untouched because the user listed them in ``keep``)
+    and ``keepRejected`` (unmatched ``keep`` tokens with close-match hints).
     """
+    stripped, _records = dewater_build_with_records(worker, keep=keep)
+    return stripped
+
+
+def dewater_build_with_records(
+    worker: BridgeWorker,
+    keep: Iterable[str] | str | None = None,
+) -> tuple[dict[str, list[str]], list[dict[str, Any]]]:
+    """De-water in place (2 pipelined RPC batches) and return reversible per-item records.
+
+    Each record carries the exact bridge calls that ``restore`` the original state of
+    that single item and ``revert`` it back to the de-watered state, so callers can
+    measure every stripped item's real PoB contribution one at a time
+    (see :func:`attribute_water`). ``keep`` tokens are matched case-insensitively
+    against config var names, flask slot names (``Flask 1``) or ``flasks`` (all),
+    skill gem names, ``customMods`` / ``customMods:<title>``, and ``party``.
+    """
+    keep_set = _normalize_keep(keep)
     stripped: dict[str, list[str]] = {
         "config": [],
         "flasks": [],
         "skills": [],
         "party": [],
+        "kept": [],
+        "keepRejected": [],
     }
+    records: list[dict[str, Any]] = []
+    # Every name a keep token may legitimately refer to (lowercase -> display form).
+    known: dict[str, str] = {k: k for k in _KEEP_KEYWORDS}
 
     # Pipeline all 4 read-only inspections in ONE batch
     cfg_res, items_res, skills_res, party_res = _call_batch(
@@ -268,6 +368,8 @@ def dewater_build_in_place(worker: BridgeWorker) -> dict[str, list[str]]:
         for item in sec.get("items", []):
             var = item.get("var")
             val = item.get("value")
+            if var:
+                known[str(var).lower()] = str(var)
             if not var or var in PERMANENT_CONFIG_VARS:
                 continue
             if var == "enemyIsBoss":
@@ -275,67 +377,172 @@ def dewater_build_in_place(worker: BridgeWorker) -> dict[str, list[str]]:
                 continue
             if val in (None, False, "", 0):
                 continue
+            if item.get("isDefault") is True:
+                continue
+            if "defaultState" in item and _same_state(val, item.get("defaultState")):
+                continue
+            if var == "presetBossSkills" and val == "None":
+                continue
+            if var in _POB_TRUTHY_CONFIG_DEFAULTS and _same_state(val, _POB_TRUTHY_CONFIG_DEFAULTS[var]):
+                continue
 
+            is_inflation = (
+                var == "presetBossSkills"
+                or var.startswith(INFLATION_CONFIG_PREFIXES)
+                or var in INFLATION_CONFIG_EXACT
+            )
+            if not is_inflation:
+                continue
+            if var.lower() in keep_set:
+                stripped["kept"].append(f"{var}={val!r} (kept)")
+                continue
             if var == "presetBossSkills":
                 had_preset_boss_skills = True
-                stripped["config"].append(f"{var}={val!r} -> reset")
-                mutations.append(("reset_config", {"var": var}))
-            elif var.startswith(INFLATION_CONFIG_PREFIXES) or var in INFLATION_CONFIG_EXACT:
-                stripped["config"].append(f"{var}={val!r} -> reset")
-                mutations.append(("reset_config", {"var": var}))
-
-    if current_boss not in ("Pinnacle", "Uber"):
-        stripped["config"].append(f"enemyIsBoss={current_boss!r} -> 'Pinnacle'")
-    mutations.append(("set_config", {"var": "enemyIsBoss", "value": "Pinnacle"}))
-    if had_preset_boss_skills:
-        # Second call ensures ConfigTab BuildModList sees updated enemyIsBoss selIndex
-        mutations.append(("set_config", {"var": "enemyIsBoss", "value": "Pinnacle"}))
-
-    # Check customMods (use '# disabled' comment block so ConfigTab.lua doesn't fall back to legacy input.customMods)
-    custom_mods = cfg_res.get("customMods", [])
-    active_custom_lines: list[str] = []
-    for block in custom_mods:
-        if block.get("enabled", True):
-            text = (block.get("text") or "").strip()
-            for line in text.splitlines():
-                s = line.strip()
-                if s and not s.startswith("#"):
-                    active_custom_lines.append(s)
-    if active_custom_lines:
-        stripped["config"].append(f"customMods ({len(active_custom_lines)} active lines: {'; '.join(active_custom_lines[:3])}) -> disabled")
-        mutations.append(
-            (
-                "set_custom_mods",
-                {"list": [{"title": "Default", "text": "# disabled", "enabled": True}]},
+            stripped["config"].append(f"{var}={val!r} -> reset")
+            mutations.append(("reset_config", {"var": var}))
+            records.append(
+                {
+                    "dimension": "config",
+                    "key": var,
+                    "label": f"{var}={val!r}",
+                    "restore": [("set_config", {"var": var, "value": val})],
+                    "revert": [("reset_config", {"var": var})],
+                    "probe": {"kind": "config", "var": var},
+                    "original": val,
+                }
             )
+
+    if "enemyisboss" in keep_set:
+        stripped["kept"].append(f"enemyIsBoss={current_boss!r} (kept)")
+    else:
+        if current_boss != "Pinnacle":
+            stripped["config"].append(f"enemyIsBoss={current_boss!r} -> 'Pinnacle'")
+        mutations.append(("set_config", {"var": "enemyIsBoss", "value": "Pinnacle"}))
+        if had_preset_boss_skills:
+            # Second call ensures ConfigTab BuildModList sees updated enemyIsBoss selIndex
+            mutations.append(("set_config", {"var": "enemyIsBoss", "value": "Pinnacle"}))
+
+    # Disable each active customMods group in place (title and text preserved) and attribute
+    # each group on its own. A trailing comment-only sentinel keeps an enabled block with text,
+    # so ConfigTab:BuildModList does not fall back to legacy input.customMods.
+    custom_mods = cfg_res.get("customMods", [])
+    blocks = _normalize_custom_mod_blocks(custom_mods)
+    for b in blocks:
+        raw_title = str(b["title"])
+        clean_title = strip_pob_escapes(raw_title).strip()
+        display_title = clean_title or raw_title
+        known[f"custommods:{raw_title.lower()}"] = f"customMods:{display_title}"
+        if clean_title:
+            known[f"custommods:{clean_title.lower()}"] = f"customMods:{display_title}"
+
+    dewatered_blocks = [dict(b) for b in blocks]
+    group_records: list[tuple[int, str, str]] = []
+    for i, b in enumerate(blocks):
+        lines = [
+            s
+            for ln in b["text"].splitlines()
+            if (s := strip_pob_escapes(ln).strip()) and not s.startswith("#")
+        ]
+        if not b["enabled"] or not lines:
+            continue
+        raw_title = str(b["title"])
+        clean_title = strip_pob_escapes(raw_title).strip()
+        display_title = clean_title or raw_title
+        label = f"customMods[{display_title}] ({len(lines)} active lines: {'; '.join(lines[:3])})"
+        keep_keys = {f"custommods:{raw_title.lower()}"}
+        if clean_title:
+            keep_keys.add(f"custommods:{clean_title.lower()}")
+        if "custommods" in keep_set or bool(keep_keys & keep_set):
+            stripped["kept"].append(f"{label} (kept)")
+            continue
+        dewatered_blocks[i]["enabled"] = False
+        stripped["config"].append(f"{label} -> disabled")
+        group_records.append((i, display_title, label))
+
+    if group_records:
+        has_sentinel = any(
+            b["title"] == DEWATER_SENTINEL_TITLE
+            and b["enabled"]
+            and bool(b["text"].strip())
+            and all(
+                not (s := strip_pob_escapes(ln).strip()) or s.startswith("#")
+                for ln in b["text"].splitlines()
+            )
+            for b in dewatered_blocks
         )
+        if not has_sentinel:
+            dewatered_blocks.append({"title": DEWATER_SENTINEL_TITLE, "text": "# disabled", "enabled": True})
+        mutations.append(("set_custom_mods", {"list": dewatered_blocks}))
+        for i, display_title, label in group_records:
+            restored_blocks = [dict(b) for b in dewatered_blocks]
+            restored_blocks[i]["enabled"] = True
+            records.append(
+                {
+                    "dimension": "config",
+                    "key": f"customMods:{display_title}",
+                    "label": label,
+                    "restore": [("set_custom_mods", {"list": restored_blocks})],
+                    "revert": [("set_custom_mods", {"list": dewatered_blocks})],
+                    "probe": {"kind": "customMods"},
+                    "original": restored_blocks,
+                }
+            )
 
     # 2. Flask inflation (active flasks without Mageblood)
     has_mb = _has_mageblood_equipped(items_res)
     items_by_id = {it["id"]: it for it in items_res.get("items", [])}
+    for slot in items_res.get("slots", []):
+        if slot.get("isFlask") and slot.get("name"):
+            known[str(slot["name"]).lower()] = str(slot["name"])
     if not has_mb:
         for slot in items_res.get("slots", []):
             if slot.get("isFlask") and slot.get("active"):
                 slot_name = slot["name"]
                 item = items_by_id.get(slot.get("selItemId") or 0, {})
                 item_title = strip_pob_escapes(item.get("titleZh") or item.get("title") or item.get("name") or slot_name)
+                if "flasks" in keep_set or slot_name.lower() in keep_set:
+                    stripped["kept"].append(f"{slot_name} ({item_title}) (kept)")
+                    continue
                 stripped["flasks"].append(f"{slot_name} ({item_title}) -> active=False")
                 mutations.append(("set_slot_active", {"slotName": slot_name, "active": False}))
+                records.append(
+                    {
+                        "dimension": "flasks",
+                        "key": slot_name,
+                        "label": f"{slot_name} ({item_title})",
+                        "restore": [("set_slot_active", {"slotName": slot_name, "active": True})],
+                        "revert": [("set_slot_active", {"slotName": slot_name, "active": False})],
+                        "probe": {"kind": "flask", "slot": slot_name},
+                        "original": True,
+                    }
+                )
 
     # 3. Temporary guard / burst / Vaal skills
+    # In PoB Data/Gems.lua & CalcSetup.lua:1831, grantedEffectList[1] (enableGlobal1) is the
+    # VAAL burst skill and grantedEffectList[2] (enableGlobal2) is the BASE skill.
+    # For non-hasGlobalEffect Vaal main skills (e.g. Vaal Ice Nova, Vaal Lightning Strike,
+    # Vaal Spark), CalcSetup.lua:1831 ignores enableGlobal1 and CalcSetup.lua:1963 selects
+    # socketGroupSkillList[group.mainActiveSkill], so we also switch mainActiveSkill to the base skill.
+    main_socket_group = skills_res.get("mainSocketGroup")
     for group in skills_res.get("groups", []):
-        if not group.get("enabled", True):
-            continue
         g_idx = group["index"]
+        group_enabled = group.get("enabled", True)
+        is_main_group = bool(group.get("isMain")) or (main_socket_group is not None and g_idx == main_socket_group)
+        skills_list = group.get("skills") or []
+        orig_active = int(group.get("mainActiveSkill") or 1)
         for gem in group.get("gems", []):
-            if not gem.get("enabled", True) or gem.get("support"):
-                continue
-            names = [
+            raw_names = [
                 str(gem.get("nameSpec") or ""),
                 str(gem.get("name") or ""),
                 str(gem.get("nameZh") or ""),
                 str(gem.get("skillId") or ""),
             ]
+            names = [strip_pob_escapes(n).strip() for n in raw_names]
+            for n in names:
+                if n:
+                    known[n.lower()] = n
+            if not group_enabled or not gem.get("enabled", True) or gem.get("support"):
+                continue
             combined_lower = " ".join(names).lower()
             is_vaal = (
                 combined_lower.startswith("vaal ")
@@ -343,210 +550,690 @@ def dewater_build_in_place(worker: BridgeWorker) -> dict[str, list[str]]:
                 or "瓦尔" in combined_lower
             )
             is_temp = any(pat in combined_lower for pat in TEMPORARY_SKILL_PATTERNS)
+            original_vaal_g1 = bool(gem.get("enableGlobal1", False))
+            is_active_vaal = is_vaal and original_vaal_g1
+
+            selected_main_is_vaal = False
+            next_skill: dict[str, Any] = {}
+            if (
+                is_vaal
+                and not is_temp
+                and not gem.get("hasGlobalEffect")
+                and is_main_group
+                and 1 <= orig_active
+                and orig_active + 1 <= len(skills_list)
+            ):
+                cur_skill = skills_list[orig_active - 1]
+                cand_next = skills_list[orig_active]
+                if _is_vaal_skill_entry(cur_skill) and not _is_vaal_skill_entry(cand_next):
+                    cur_names = {
+                        strip_pob_escapes(str(cur_skill.get(k) or "")).strip().lower()
+                        for k in ("name", "nameZh", "skillId")
+                        if cur_skill.get(k)
+                    }
+                    gem_names = {n.lower() for n in names if n}
+                    if not cur_names or bool(cur_names & gem_names) or any(
+                        cn in gn or gn in cn
+                        for cn in cur_names
+                        for gn in gem_names
+                        if len(cn) >= 4 and len(gn) >= 4
+                    ):
+                        selected_main_is_vaal = True
+                        next_skill = cand_next
+
             disp = strip_pob_escapes(gem.get("nameZh") or gem.get("name") or gem.get("nameSpec") or "")
+            if not (is_temp or is_active_vaal or selected_main_is_vaal):
+                continue
+            if any(n.lower() in keep_set for n in names if n):
+                stripped["kept"].append(f"Group #{g_idx} Gem #{gem['index']} ({disp}) (kept)")
+                continue
+            gem_ref = {"group": g_idx, "index": gem["index"]}
             if is_temp:
                 stripped["skills"].append(f"Group #{g_idx} Gem #{gem['index']} ({disp}) -> enabled=False")
-                mutations.append(("set_gem", {"group": g_idx, "index": gem["index"], "enabled": False}))
-            elif is_vaal and gem.get("enableGlobal2", False):
-                stripped["skills"].append(
-                    f"Group #{g_idx} Gem #{gem['index']} ({disp}) -> enableGlobal2=False (base skill kept)"
+                mutations.append(("set_gem", {**gem_ref, "enabled": False}))
+                records.append(
+                    {
+                        "dimension": "skills",
+                        "key": disp,
+                        "label": f"Group #{g_idx} {disp}",
+                        "restore": [("set_gem", {**gem_ref, "enabled": True})],
+                        "revert": [("set_gem", {**gem_ref, "enabled": False})],
+                        "probe": {"kind": "gem", **gem_ref, "fields": ["enabled"]},
+                        "original": {"enabled": True},
+                    }
                 )
-                mutations.append(
+            else:
+                original_base_enabled = bool(gem.get("enableGlobal2", True))
+                dewater_calls: list[tuple[str, dict[str, Any]]] = [
                     (
                         "set_gem",
                         {
-                            "group": g_idx,
-                            "index": gem["index"],
-                            "enableGlobal1": True,
-                            "enableGlobal2": False,
+                            **gem_ref,
+                            "enableGlobal1": False,
+                            "enableGlobal2": original_base_enabled,
                         },
                     )
+                ]
+                restore_calls: list[tuple[str, dict[str, Any]]] = [
+                    (
+                        "set_gem",
+                        {
+                            **gem_ref,
+                            "enableGlobal1": original_vaal_g1,
+                            "enableGlobal2": original_base_enabled,
+                        },
+                    )
+                ]
+                probe_fields = ["enabled", "enableGlobal1", "enableGlobal2"]
+                orig_state: dict[str, Any] = {
+                    "enabled": True,
+                    "enableGlobal1": original_vaal_g1,
+                    "enableGlobal2": original_base_enabled,
+                }
+                if selected_main_is_vaal:
+                    dewater_calls.append(("set_group", {"index": g_idx, "mainActiveSkill": orig_active + 1}))
+                    restore_calls.append(("set_group", {"index": g_idx, "mainActiveSkill": orig_active}))
+                    probe_fields.append("mainActiveSkill")
+                    orig_state["mainActiveSkill"] = orig_active
+                    next_name = strip_pob_escapes(
+                        str(next_skill.get("nameZh") or next_skill.get("name") or f"skill #{orig_active + 1}")
+                    )
+                    stripped["skills"].append(
+                        f"Group #{g_idx} Gem #{gem['index']} ({disp}) -> enableGlobal1=False, "
+                        f"mainActiveSkill={orig_active + 1} ({next_name})"
+                    )
+                else:
+                    stripped["skills"].append(
+                        f"Group #{g_idx} Gem #{gem['index']} ({disp}) -> enableGlobal1=False (base skill kept)"
+                    )
+                mutations.extend(dewater_calls)
+                records.append(
+                    {
+                        "dimension": "skills",
+                        "key": disp,
+                        "label": f"Group #{g_idx} {disp} (Vaal)",
+                        "restore": restore_calls,
+                        "revert": list(dewater_calls),
+                        "probe": {
+                            "kind": "gem",
+                            **gem_ref,
+                            "fields": probe_fields,
+                        },
+                        "original": orig_state,
+                    }
                 )
 
-    # 4. PartyTab buffs
+    # 4. PartyTab buffs (cleared wholesale; not individually reversible, so no attribution record)
     party_fields = party_res.get("fields", {})
     non_empty_party = [k for k, v in party_fields.items() if str(v or "").strip()]
     if non_empty_party or party_res.get("enableExportBuffs"):
-        stripped["party"].append(f"PartyTab fields ({', '.join(non_empty_party or ['enableExportBuffs'])}) -> cleared & disabled")
-        mutations.append(("party_action", {"action": "disable"}))
-        mutations.append(("party_action", {"action": "clear"}))
+        label = f"PartyTab fields ({', '.join(non_empty_party or ['enableExportBuffs'])})"
+        if "party" in keep_set:
+            stripped["kept"].append(f"{label} (kept)")
+        else:
+            stripped["party"].append(f"{label} -> cleared & disabled")
+            mutations.append(("party_action", {"action": "disable"}))
+            mutations.append(("party_action", {"action": "clear"}))
 
     if mutations:
         _call_batch(worker, mutations)
 
-    return stripped
+    stripped["keepRejected"] = _unmatched_keep(keep_set, known)
+    return stripped, records
 
 
-def audit_build(worker: BridgeWorker) -> dict[str, Any]:
-    """Run static build health checks + non-destructive 4-part PoB inflation ('water') audit."""
+def _probe_rpc_method(probe: dict[str, Any]) -> str:
+    kind = probe.get("kind")
+    if kind in ("config", "customMods"):
+        return "list_config"
+    if kind == "flask":
+        return "list_items"
+    if kind == "gem":
+        return "list_skills"
+    raise ValueError(f"unknown probe kind {kind!r}")
+
+
+def _extract_probe_state(probe: dict[str, Any], res: dict[str, Any]) -> Any:
+    kind = probe.get("kind")
+    if kind == "customMods":
+        return _normalize_custom_mod_blocks(res.get("customMods", []))
+    if kind == "config":
+        for sec in res.get("sections", []):
+            for item in sec.get("items", []):
+                if item.get("var") == probe["var"]:
+                    return item.get("value")
+        return None
+    if kind == "flask":
+        for slot in res.get("slots", []):
+            if slot.get("name") == probe["slot"]:
+                return bool(slot.get("active"))
+        return None
+    if kind == "gem":
+        for group in res.get("groups", []):
+            if group.get("index") != probe["group"]:
+                continue
+            for gem in group.get("gems", []):
+                if gem.get("index") == probe["index"]:
+                    state: dict[str, Any] = {}
+                    for f in probe["fields"]:
+                        if f == "mainActiveSkill":
+                            state[f] = int(group.get("mainActiveSkill") or 1)
+                        else:
+                            state[f] = bool(gem.get(f, f == "enabled"))
+                    return state
+        return None
+    raise ValueError(f"unknown probe kind {kind!r}")
+
+
+def _probe_state(worker: BridgeWorker, probe: dict[str, Any]) -> Any:
+    """Read back from PoB the live state a record's restore/revert is meant to set."""
+    method = _probe_rpc_method(probe)
+    return _extract_probe_state(probe, worker.call(method, {}))
+
+
+def _same_state(a: Any, b: Any) -> bool:
+    """Compare a read-back value with the expected one (PoB stores unset checks as nil)."""
+    if isinstance(a, (dict, list)) or isinstance(b, (dict, list)):
+        return a == b
+    if isinstance(a, bool) or isinstance(b, bool) or a is None or b is None:
+        return bool(a) == bool(b)
+    try:
+        fa = float(a)
+        fb = float(b)
+    except (TypeError, ValueError):
+        return a == b
+    if math.isnan(fa) or math.isnan(fb):
+        return math.isnan(fa) and math.isnan(fb)
+    if math.isinf(fa) or math.isinf(fb):
+        return fa == fb
+    return abs(fa - fb) <= 1e-9 * max(1.0, abs(fa))
+
+
+def _metric_val(raw: Any) -> float | str | None:
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return None
+    parsed = _parse_numeric_or_none(raw)
+    if parsed is None or math.isnan(parsed):
+        return None
+    if math.isinf(parsed):
+        return _json_safe_stat(parsed)
+    return parsed
+
+
+def _digest_metrics(digest: dict[str, Any], dps_key: str) -> dict[str, float | str | None]:
+    stats = digest.get("stats", {}) if isinstance(digest, dict) else {}
+    return {
+        "dps": _metric_val(stats.get(dps_key)),
+        "totalEhp": _metric_val(stats.get("TotalEHP")),
+        "physMaxHit": _metric_val(stats.get("PhysicalMaximumHitTaken")),
+        "eleMaxHit": _safe_min_ele_max_hit(stats),
+    }
+
+
+def _parse_stat_for_compare(val: Any) -> float | None:
+    if val is None or isinstance(val, bool):
+        return None
+    if isinstance(val, str) and not val.strip():
+        return None
+    return _parse_numeric_or_none(val)
+
+
+def verify_restored(
+    worker: BridgeWorker,
+    before_code: str,
+    before_digest: dict[str, Any],
+) -> dict[str, Any]:
+    """Check that rolling back to ``before_code`` really reproduced the original build.
+
+    Mirrors pob-mcp's batch_modify rollback check: the restored build must export the
+    same code, or at least recalculate to the same stats. Anything else is reported,
+    because every later command would otherwise run on a silently modified build.
+    """
+    after_code = worker.call("export_code", {}).get("code")
+    if before_code and after_code == before_code:
+        return {"verified": True, "detail": "restored build exports identical code"}
+    after = capture_digest(worker).get("stats") or {}
+    before = (before_digest.get("stats") or {}) if isinstance(before_digest, dict) else {}
+    differing: list[str] = []
+    for k in set(before.keys()) | set(after.keys()):
+        b = _parse_stat_for_compare(before.get(k))
+        a = _parse_stat_for_compare(after.get(k))
+        if b is None and a is None:
+            continue
+        if b is None or a is None:
+            differing.append(k)
+            continue
+        if math.isnan(b) or math.isnan(a):
+            if not (math.isnan(b) and math.isnan(a)):
+                differing.append(k)
+            continue
+        if math.isinf(b) or math.isinf(a):
+            if a != b:
+                differing.append(k)
+            continue
+        if abs(a - b) > 1e-6 * max(1.0, abs(b)):
+            differing.append(k)
+    if differing:
+        differing.sort()
+        return {
+            "verified": False,
+            "detail": f"{len(differing)} stat(s) differ from before the run (e.g. {', '.join(differing[:5])})",
+            "differing": differing,
+        }
+    return {"verified": True, "detail": "export code differs, but every stat recalculates identical"}
+
+
+def _rpc_error_text(res: Any) -> str | None:
+    if not isinstance(res, dict):
+        return None
+    if res.get("ok") is False or res.get("_error"):
+        return str(res.get("error") or res.get("_error") or "RPC failed")
+    return None
+
+
+def attribute_water(
+    worker: BridgeWorker,
+    records: list[dict[str, Any]],
+    dewatered_digest: dict[str, Any],
+    dps_key: str,
+) -> list[dict[str, Any]]:
+    """Measure each stripped item's real PoB contribution, one at a time (pipelined per item).
+
+    Starting from the de-watered state, every record is restored alone, verified by
+    read-back, recalculated by PoB (`get_stats`), and reverted again with read-back
+    verification. Deltas are relative to the de-watered baseline, so they answer
+    "how much does keeping only this item add?". No value is estimated.
+    """
+    if not records:
+        return []
+
+    base = _digest_metrics(dewatered_digest, dps_key)
+
+    # Pre-validate probe kinds and batch unique read RPCs ONCE to capture all `before` states
+    needed_probe_rpcs: list[str] = []
+    rec_probe_rpcs: list[str | None] = []
+    rec_probe_errors: list[str | None] = []
+    for rec in records:
+        probe = rec.get("probe")
+        if not probe:
+            rec_probe_rpcs.append(None)
+            rec_probe_errors.append(None)
+            continue
+        try:
+            rpc_name = _probe_rpc_method(probe)
+        except Exception as exc:  # noqa: BLE001
+            rec_probe_rpcs.append(None)
+            rec_probe_errors.append(f"cannot read state before restore: {exc}")
+            continue
+        rec_probe_rpcs.append(rpc_name)
+        rec_probe_errors.append(None)
+        if rpc_name not in needed_probe_rpcs:
+            needed_probe_rpcs.append(rpc_name)
+
+    pre_probe_results: dict[str, dict[str, Any]] = {}
+    pre_probe_batch_err: str | None = None
+    if needed_probe_rpcs:
+        try:
+            raw_pre = _call_batch(
+                worker,
+                [(m, {}) for m in needed_probe_rpcs],
+                raise_on_error=False,
+            )
+            for m, r in zip(needed_probe_rpcs, raw_pre):
+                pre_probe_results[m] = r
+        except Exception as exc:  # noqa: BLE001
+            pre_probe_batch_err = str(exc)
+
+    rows: list[dict[str, Any]] = []
+    broken_after: str | None = None
+
+    for idx, rec in enumerate(records):
+        row: dict[str, Any] = {
+            "dimension": rec["dimension"],
+            "key": rec["key"],
+            "label": rec["label"],
+        }
+        if broken_after is not None:
+            # The de-watered baseline is no longer trustworthy: never measure on it.
+            row["error"] = f"skipped: baseline not restored after {broken_after}"
+            rows.append(row)
+            continue
+
+        probe = rec.get("probe")
+        probe_rpc = rec_probe_rpcs[idx]
+        if rec_probe_errors[idx] is not None:
+            row["error"] = rec_probe_errors[idx]
+            rows.append(row)
+            continue
+
+        before: Any = None
+        if probe and probe_rpc is not None:
+            if pre_probe_batch_err is not None:
+                row["error"] = f"cannot read state before restore: {pre_probe_batch_err}"
+                rows.append(row)
+                continue
+            pre_res = pre_probe_results.get(probe_rpc)
+            pre_err = _rpc_error_text(pre_res)
+            if pre_err is not None:
+                row["error"] = f"cannot read state before restore: {pre_err}"
+                rows.append(row)
+                continue
+            try:
+                before = _extract_probe_state(probe, pre_res or {})
+            except Exception as exc:  # noqa: BLE001
+                row["error"] = f"cannot read state before restore: {exc}"
+                rows.append(row)
+                continue
+            if probe.get("kind") == "config" and _same_state(before, rec.get("original")):
+                # reset_config left the var at its PoB defaultState (no-op); skip phantom 0-delta row.
+                continue
+
+        restore_calls = list(rec.get("restore") or [])
+        revert_calls = list(rec.get("revert") or [])
+
+        batch_calls: list[tuple[str, dict[str, Any]]] = []
+        restore_start = len(batch_calls)
+        batch_calls.extend(restore_calls)
+        restore_end = len(batch_calls)
+
+        probe_after_idx: int | None = None
+        if probe and probe_rpc is not None:
+            probe_after_idx = len(batch_calls)
+            batch_calls.append((probe_rpc, {}))
+
+        stats_idx = len(batch_calls)
+        batch_calls.append(("get_stats", {}))
+
+        revert_start = len(batch_calls)
+        batch_calls.extend(revert_calls)
+        revert_end = len(batch_calls)
+
+        probe_back_idx: int | None = None
+        if probe and probe_rpc is not None:
+            probe_back_idx = len(batch_calls)
+            batch_calls.append((probe_rpc, {}))
+
+        try:
+            batch_res = _call_batch(worker, batch_calls, raise_on_error=False)
+        except Exception as exc:  # noqa: BLE001
+            row["error"] = str(exc)
+            broken_after = rec["key"]
+            rows.append(row)
+            continue
+
+        if len(batch_res) < len(batch_calls):
+            row["error"] = (
+                f"incomplete batch response ({len(batch_res)}/{len(batch_calls)} RPCs)"
+            )
+            broken_after = rec["key"]
+            rows.append(row)
+            continue
+
+        # 1. Verify restore RPCs + post-restore read-back before trusting get_stats
+        restore_err: str | None = None
+        for r_i in range(restore_start, restore_end):
+            err_txt = _rpc_error_text(batch_res[r_i])
+            if err_txt is not None:
+                restore_err = err_txt
+                break
+
+        if restore_err is None and probe and probe_after_idx is not None:
+            p_err = _rpc_error_text(batch_res[probe_after_idx])
+            if p_err is not None:
+                restore_err = p_err
+            else:
+                try:
+                    got = _extract_probe_state(probe, batch_res[probe_after_idx])
+                    if not _same_state(got, rec.get("original")):
+                        restore_err = (
+                            f"restore not applied: expected {rec.get('original')!r}, PoB reads {got!r}"
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    restore_err = str(exc)
+
+        if restore_err is None:
+            stats_res = batch_res[stats_idx]
+            s_err = _rpc_error_text(stats_res)
+            if s_err is not None:
+                restore_err = s_err
+            else:
+                m = _digest_metrics({"stats": stats_res.get("stats", {})}, dps_key)
+                for k in ("dps", "totalEhp", "physMaxHit", "eleMaxHit"):
+                    mv = m[k]
+                    bv = base[k]
+                    row[k] = mv
+                    if (
+                        isinstance(mv, (int, float))
+                        and isinstance(bv, (int, float))
+                        and math.isfinite(mv)
+                        and math.isfinite(bv)
+                    ):
+                        delta = mv - bv
+                        row[f"{k}Delta"] = delta
+                        row[f"{k}Pct"] = (delta / abs(bv) * 100.0) if abs(bv) > 0.0 else None
+                    else:
+                        row[f"{k}Delta"] = None
+                        row[f"{k}Pct"] = None
+        else:
+            row["error"] = restore_err
+
+        # 2. Always verify revert RPCs + post-revert read-back; halt remaining items if baseline is dirty
+        revert_err: str | None = None
+        for r_i in range(revert_start, revert_end):
+            err_txt = _rpc_error_text(batch_res[r_i])
+            if err_txt is not None:
+                revert_err = err_txt
+                break
+
+        if revert_err is None and probe and probe_back_idx is not None:
+            pb_err = _rpc_error_text(batch_res[probe_back_idx])
+            if pb_err is not None:
+                revert_err = pb_err
+            else:
+                try:
+                    back = _extract_probe_state(probe, batch_res[probe_back_idx])
+                    if not _same_state(back, before):
+                        revert_err = f"revert not applied: expected {before!r}, PoB reads {back!r}"
+                except Exception as exc:  # noqa: BLE001
+                    revert_err = str(exc)
+
+        if revert_err is not None:
+            broken_after = rec["key"]
+            prev = row.get("error")
+            row["error"] = f"{prev}; {revert_err}" if prev else revert_err
+
+        rows.append(row)
+
+    return rows
+
+
+def audit_build(
+    worker: BridgeWorker,
+    keep: Iterable[str] | str | None = None,
+    attribution: bool = True,
+) -> dict[str, Any]:
+    """Run static build health checks + non-destructive 4-part PoB inflation ('water') audit.
+
+    ``keep`` lists inflation items the user asserts are real for this build (e.g. an
+    ascendancy that needs ``conditionStationary``); they are left untouched. With
+    ``attribution`` every stripped item is restored alone and re-measured by PoB.
+    """
     with worker.lock:
         prev_last_good = getattr(worker, "last_good_code", None)
-        export_res, items_res = _call_batch(
-            worker,
-            [("export_code", {}), ("list_items", {})],
-        )
-        snap_code = export_res["code"]
-        digest_before = capture_digest(worker)
-        stats = digest_before["stats"]
-        info = digest_before["buildInfo"]
-
-        # Static health checks
-        health_issues: list[dict[str, str]] = []
-
-        # 1. Elemental & Chaos resistances
-        for elem in ("Fire", "Cold", "Lightning"):
-            val = _finite_float(stats.get(f"{elem}Resist"))
-            over = _finite_float(stats.get(f"{elem}ResistOverCap"))
-            if val < 75:
-                health_issues.append(
-                    {
-                        "category": "Resistance",
-                        "severity": "HIGH",
-                        "message": f"{elem} Resist is uncapped: {val:.0f}% (gap: {75 - val:.0f}%)",
-                    }
-                )
-            elif over < 15:
-                health_issues.append(
-                    {
-                        "category": "Resistance",
-                        "severity": "LOW",
-                        "message": f"{elem} Resist overcap is thin: +{over:.0f}% over cap (vulnerable to curses/exposure)",
-                    }
-                )
-
-        chaos_res = _finite_float(stats.get("ChaosResist"))
-        if chaos_res < 0:
-            health_issues.append(
-                {
-                    "category": "Resistance",
-                    "severity": "MEDIUM",
-                    "message": f"Chaos Resist is negative: {chaos_res:.0f}%",
-                }
-            )
-
-        # 2. Attributes vs Requirements
-        for attr in ("Str", "Dex", "Int"):
-            cur = _finite_float(stats.get(attr))
-            req = _finite_float(stats.get(f"Req{attr}"))
-            if req > cur:
-                health_issues.append(
-                    {
-                        "category": "Attribute",
-                        "severity": "HIGH",
-                        "message": f"{attr} insufficient: have {cur:.0f}, require {req:.0f}",
-                    }
-                )
-
-        # 3. Accuracy / Hit Chance
-        hit_chance = stats.get("HitChance")
-        if hit_chance is not None:
-            hc_val = _finite_float(hit_chance, default=100.0)
-            if hc_val < 100.0:
-                health_issues.append(
-                    {
-                        "category": "Offence",
-                        "severity": "MEDIUM",
-                        "message": f"Hit Chance is {hc_val:.1f}% (< 100%)",
-                    }
-                )
-
-        # 4. Mana Cost vs Unreserved Mana & Regen
-        mana_cost = _finite_float(stats.get("ManaCost"))
-        mana_unres = _finite_float(stats.get("ManaUnreserved"))
-        raw_mana_regen = (
-            stats.get("ManaRegenRecovery")
-            if stats.get("ManaRegenRecovery") is not None
-            else stats.get("ManaRegen")
-        )
-        mana_regen = _finite_float(raw_mana_regen)
-        mana_leech = _finite_float(stats.get("ManaLeechGainRate"))
-        speed = _finite_float(stats.get("Speed"))
-        life_unres = _finite_float(stats.get("LifeUnreserved"))
-        if mana_cost > 0 and mana_cost > mana_unres and life_unres > 0:
-            health_issues.append(
-                {
-                    "category": "Sustain",
-                    "severity": "HIGH",
-                    "message": f"Skill Mana Cost ({mana_cost:.0f}) exceeds Unreserved Mana ({mana_unres:.0f})",
-                }
-            )
-        elif mana_cost > 0 and mana_regen < 0:
-            health_issues.append(
-                {
-                    "category": "Sustain",
-                    "severity": "MEDIUM",
-                    "message": f"Net Mana Regen is negative ({mana_regen:.1f}/s) with Mana Cost {mana_cost:.0f}",
-                }
-            )
-        elif (
-            mana_cost > 0
-            and speed > 0
-            and (mana_cost * speed) > (max(0.0, mana_regen) + mana_leech)
-            and life_unres > 0
-        ):
-            spend_rate = mana_cost * speed
-            rec_rate = max(0.0, mana_regen) + mana_leech
-            health_issues.append(
-                {
-                    "category": "Sustain",
-                    "severity": "LOW",
-                    "message": (
-                        f"Mana spend rate ({spend_rate:.1f}/s = {mana_cost:.0f} * {speed:.2f}/s) "
-                        f"exceeds net Mana recovery + leech ({rec_rate:.1f}/s)"
-                    ),
-                }
-            )
-
-        # 5. Unallocated points
-        pts = info.get("points", {})
-        used, used_max = int(pts.get("used") or 0), int(pts.get("usedMax") or 0)
-        asc_used, asc_max = int(pts.get("ascUsed") or 0), int(pts.get("ascMax") or 0)
-        if used > used_max:
-            health_issues.append(
-                {
-                    "category": "Points",
-                    "severity": "HIGH",
-                    "message": f"Over-allocated passive points: {used}/{used_max}",
-                }
-            )
-        if asc_used < asc_max:
-            health_issues.append(
-                {
-                    "category": "Points",
-                    "severity": "LOW",
-                    "message": f"Unallocated Ascendancy points: {asc_used}/{asc_max}",
-                }
-            )
-
-        # 6. Sidebar warnings
-        for w in digest_before["warnings"]:
-            health_issues.append(
-                {
-                    "category": "EngineWarning",
-                    "severity": "HIGH",
-                    "message": w,
-                }
-            )
-
-        # 7. Empty primary equipment slots
-        primary_slots = {"Weapon 1", "Body Armour", "Helmet", "Gloves", "Boots", "Amulet", "Ring 1", "Ring 2", "Belt"}
-        for slot in items_res.get("slots", []):
-            if slot.get("name") in primary_slots and not slot.get("inactive") and not slot.get("selItemId"):
-                health_issues.append(
-                    {
-                        "category": "Equipment",
-                        "severity": "MEDIUM",
-                        "message": f"Equipment slot '{slot['name']}' is empty",
-                    }
-                )
-
-        # Run non-destructive de-watering snapshot
         try:
-            stripped = dewater_build_in_place(worker)
-            digest_dewatered = capture_digest(worker)
-            dewater_diff = diff_digest(digest_before, digest_dewatered)
+            export_res, items_res = _call_batch(
+                worker,
+                [("export_code", {}), ("list_items", {})],
+            )
+            snap_code = export_res["code"]
+            digest_before = capture_digest(worker)
+            stats = digest_before["stats"]
+            info = digest_before["buildInfo"]
+
+            # Static health checks
+            health_issues: list[dict[str, str]] = []
+
+            # 1. Elemental & Chaos resistances
+            for elem in ("Fire", "Cold", "Lightning"):
+                val = _finite_float(stats.get(f"{elem}Resist"))
+                over = _finite_float(stats.get(f"{elem}ResistOverCap"))
+                if val < 75:
+                    health_issues.append(
+                        {
+                            "category": "Resistance",
+                            "severity": "HIGH",
+                            "message": f"{elem} Resist is uncapped: {val:.0f}% (gap: {75 - val:.0f}%)",
+                        }
+                    )
+                elif over < 15:
+                    health_issues.append(
+                        {
+                            "category": "Resistance",
+                            "severity": "LOW",
+                            "message": f"{elem} Resist overcap is thin: +{over:.0f}% over cap (vulnerable to curses/exposure)",
+                        }
+                    )
+
+            chaos_res = _finite_float(stats.get("ChaosResist"))
+            if chaos_res < 0:
+                health_issues.append(
+                    {
+                        "category": "Resistance",
+                        "severity": "MEDIUM",
+                        "message": f"Chaos Resist is negative: {chaos_res:.0f}%",
+                    }
+                )
+
+            # 2. Attributes vs Requirements
+            for attr in ("Str", "Dex", "Int"):
+                cur = _finite_float(stats.get(attr))
+                req = _finite_float(stats.get(f"Req{attr}"))
+                if req > cur:
+                    health_issues.append(
+                        {
+                            "category": "Attribute",
+                            "severity": "HIGH",
+                            "message": f"{attr} insufficient: have {cur:.0f}, require {req:.0f}",
+                        }
+                    )
+
+            # 3. Accuracy / Hit Chance
+            hit_chance = stats.get("HitChance")
+            if hit_chance is not None:
+                hc_val = _finite_float(hit_chance, default=100.0)
+                if hc_val < 100.0:
+                    health_issues.append(
+                        {
+                            "category": "Offence",
+                            "severity": "MEDIUM",
+                            "message": f"Hit Chance is {hc_val:.1f}% (< 100%)",
+                        }
+                    )
+
+            # 4. Mana Cost vs Unreserved Mana & Regen
+            mana_cost = _finite_float(stats.get("ManaCost"))
+            mana_unres = _finite_float(stats.get("ManaUnreserved"))
+            raw_mana_regen = (
+                stats.get("ManaRegenRecovery")
+                if stats.get("ManaRegenRecovery") is not None
+                else stats.get("ManaRegen")
+            )
+            mana_regen = _finite_float(raw_mana_regen)
+            mana_leech = _finite_float(stats.get("ManaLeechGainRate"))
+            speed = _finite_float(stats.get("Speed"))
+            life_unres = _finite_float(stats.get("LifeUnreserved"))
+            if mana_cost > 0 and mana_cost > mana_unres and life_unres > 0:
+                health_issues.append(
+                    {
+                        "category": "Sustain",
+                        "severity": "HIGH",
+                        "message": f"Skill Mana Cost ({mana_cost:.0f}) exceeds Unreserved Mana ({mana_unres:.0f})",
+                    }
+                )
+            elif mana_cost > 0 and mana_regen < 0:
+                health_issues.append(
+                    {
+                        "category": "Sustain",
+                        "severity": "MEDIUM",
+                        "message": f"Net Mana Regen is negative ({mana_regen:.1f}/s) with Mana Cost {mana_cost:.0f}",
+                    }
+                )
+            elif (
+                mana_cost > 0
+                and speed > 0
+                and (mana_cost * speed) > (max(0.0, mana_regen) + mana_leech)
+                and life_unres > 0
+            ):
+                spend_rate = mana_cost * speed
+                rec_rate = max(0.0, mana_regen) + mana_leech
+                health_issues.append(
+                    {
+                        "category": "Sustain",
+                        "severity": "LOW",
+                        "message": (
+                            f"Mana spend rate ({spend_rate:.1f}/s = {mana_cost:.0f} * {speed:.2f}/s) "
+                            f"exceeds net Mana recovery + leech ({rec_rate:.1f}/s)"
+                        ),
+                    }
+                )
+
+            # 5. Unallocated points
+            pts = info.get("points", {})
+            used, used_max = int(pts.get("used") or 0), int(pts.get("usedMax") or 0)
+            asc_used, asc_max = int(pts.get("ascUsed") or 0), int(pts.get("ascMax") or 0)
+            if used > used_max:
+                health_issues.append(
+                    {
+                        "category": "Points",
+                        "severity": "HIGH",
+                        "message": f"Over-allocated passive points: {used}/{used_max}",
+                    }
+                )
+            if asc_used < asc_max:
+                health_issues.append(
+                    {
+                        "category": "Points",
+                        "severity": "LOW",
+                        "message": f"Unallocated Ascendancy points: {asc_used}/{asc_max}",
+                    }
+                )
+
+            # 6. Sidebar warnings
+            for w in digest_before["warnings"]:
+                health_issues.append(
+                    {
+                        "category": "EngineWarning",
+                        "severity": "HIGH",
+                        "message": w,
+                    }
+                )
+
+            # 7. Empty primary equipment slots
+            primary_slots = {"Weapon 1", "Body Armour", "Helmet", "Gloves", "Boots", "Amulet", "Ring 1", "Ring 2", "Belt"}
+            for slot in items_res.get("slots", []):
+                if slot.get("name") in primary_slots and not slot.get("inactive") and not slot.get("selItemId"):
+                    health_issues.append(
+                        {
+                            "category": "Equipment",
+                            "severity": "MEDIUM",
+                            "message": f"Equipment slot '{slot['name']}' is empty",
+                        }
+                    )
+
+            # Run non-destructive de-watering snapshot
+            try:
+                stripped, records = dewater_build_with_records(worker, keep=keep)
+                digest_dewatered = capture_digest(worker)
+                dewater_diff = diff_digest(digest_before, digest_dewatered)
+                water_attribution = (
+                    attribute_water(worker, records, digest_dewatered, digest_before["primaryDpsKey"])
+                    if attribution
+                    else []
+                )
+            finally:
+                worker.call("import_code", {"code": snap_code, "mode": "replace"})
+            restore_check = verify_restored(worker, snap_code, digest_before)
         finally:
-            worker.call("import_code", {"code": snap_code, "mode": "replace"})
             if hasattr(worker, "last_good_code"):
                 worker.last_good_code = prev_last_good
 
@@ -556,6 +1243,8 @@ def audit_build(worker: BridgeWorker) -> dict[str, Any]:
         return {
             "healthIssues": health_issues,
             "inflationStripped": stripped,
+            "waterAttribution": water_attribution,
+            "restoreCheck": restore_check,
             "original": {
                 "primaryDpsKey": digest_before["primaryDpsKey"],
                 "primaryDps": digest_before["primaryDps"],
@@ -632,6 +1321,7 @@ _KNOWN_CONFIG_DEFAULTS: dict[str, Any] = {
     "pantheonMajorGod": "None",
     "pantheonMinorGod": "None",
     "presetBossSkills": "None",
+    **_POB_TRUTHY_CONFIG_DEFAULTS,
 }
 
 _ALWAYS_SHOW_VISIBLE_CONFIG_VARS = frozenset({
@@ -694,7 +1384,10 @@ def inspect_config(
             visible = bool(item.get("visible", True))
 
             if item.get("type") == "check":
-                is_default = (val in (None, False)) and (default_val is False)
+                if default_val is True:
+                    is_default = val is True
+                else:
+                    is_default = (val in (None, False)) and (default_val is False)
             elif item.get("type") == "list":
                 is_default = (val is None) or (val == default_val)
             else:
@@ -916,8 +1609,15 @@ def resolve_skill_group_index(skills_res: dict[str, Any], group_selector: str | 
     groups = skills_res.get("groups", [])
     if not groups:
         raise ValueError("Build has no skill groups.")
-    if group_selector is None or str(group_selector).strip().lower() == "main":
-        return int(skills_res.get("mainSocketGroup") or 1)
+    if group_selector is None or str(group_selector).strip().lower() in ("", "main"):
+        raw_main = skills_res.get("mainSocketGroup")
+        try:
+            main_idx = int(raw_main) if raw_main is not None else 1
+        except (TypeError, ValueError):
+            main_idx = 1
+        if any(g.get("index") == main_idx for g in groups):
+            return main_idx
+        return int(groups[0]["index"])
     s = str(group_selector).strip()
     if s.isdigit():
         idx = int(s)
@@ -1094,7 +1794,9 @@ def inspect_skills(
         skills_res = worker.call("list_skills", {})
         if group_selector is not None:
             idx = resolve_skill_group_index(skills_res, group_selector)
-            group = next(g for g in skills_res.get("groups", []) if g["index"] == idx)
+            group = next((g for g in skills_res.get("groups", []) if g.get("index") == idx), None)
+            if group is None:
+                raise ValueError(f"Skill group #{idx} not found.")
             gems = group.get("gems", [])
             tip_calls = [("gem_tooltip", {"group": idx, "index": gem["index"]}) for gem in gems]
             tips = _call_batch(worker, tip_calls, raise_on_error=False) if tip_calls else []

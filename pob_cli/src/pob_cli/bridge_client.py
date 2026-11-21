@@ -207,144 +207,153 @@ class BridgeWorker:
             creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
             proc_env = os.environ.copy()
             proc_env.update(extra_env)
-            self._proc = subprocess.Popen(
-                cmd,
-                cwd=str(self.game_dir),
-                env=proc_env,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                bufsize=1,
-                creationflags=creationflags,
-            )
-
-            proc = self._proc
-            threading.Thread(
-                target=self._stdout_reader_loop,
-                args=(proc, out_queue),
-                name=f"pob-{self.slot_name}-stdout",
-                daemon=True,
-            ).start()
-            threading.Thread(
-                target=self._stderr_drain_loop,
-                args=(proc,),
-                name=f"pob-{self.slot_name}-stderr",
-                daemon=True,
-            ).start()
-
-            # Step 3: Consume startup events until gate_result and hello
-            gate_seen = False
-            hello_seen = False
-            deadline = time.monotonic() + 20.0
-            while not (gate_seen and hello_seen):
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    self._kill_unlocked()
-                    raise BridgeTimeoutError(
-                        f"Timed out waiting for headless startup events (stderr: {list(self._stderr_tail)[-5:]})"
-                    )
-                try:
-                    msg = self._stdout_queue.get(timeout=remaining)
-                except queue.Empty as exc:
-                    self._kill_unlocked()
-                    raise BridgeTimeoutError("Timed out waiting for startup events") from exc
-
-                if msg is None or isinstance(msg, Exception):
-                    self._kill_unlocked()
-                    raise BridgeError(f"Subprocess exited during boot: {msg} (stderr: {list(self._stderr_tail)[-5:]})")
-
-                event = msg.get("event")
-                data = msg.get("data") or {}
-                if event == "gate_result":
-                    if not data.get("ok"):
-                        self._kill_unlocked()
-                        raise BridgeError(f"PoB bridge gate_result failed: {data.get('failed')}")
-                    gate_seen = True
-                elif event == "hello":
-                    self.hello_info = dict(data)
-                    self.pob_version = data.get("pobVersion")
-                    self.bridge_version = data.get("bridge")
-                    hello_seen = True
-
-            # Step 4: Call version{} to cache caps and initial translate state
-            ver_info = self._raw_call_unlocked("version", {}, timeout=10.0)
-            self.caps = ver_info.get("caps") or {}
-            self.pob_version = ver_info.get("pobVersion") or self.pob_version
-
-            # Step 5: Enable bilingual display translation (skip redundant RPC if already enabled)
-            if self.caps.get("translateToggle", True) and self.translate_enabled is not True:
-                self._raw_call_unlocked("set_translate", {"enabled": True}, timeout=5.0)
-                if self.translate_enabled is None:
-                    self.translate_enabled = True
-
-            # Step 6 (R4): Restore build directly when possible (skipping redundant new_build{}),
-            # otherwise initialize a clean empty build.
-            if restore_code is not None:
-                target_code = restore_code or None
-                if target_code is None:
-                    self.last_good_code = None
-            else:
-                if not self.last_good_code:
-                    self.load_slot_state()
-                target_code = self.last_good_code
-
-            if target_code:
-                build_loaded = (
-                    ver_info["buildLoaded"]
-                    if "buildLoaded" in ver_info
-                    else self.hello_info.get("buildLoaded")
+            try:
+                self._proc = subprocess.Popen(
+                    cmd,
+                    cwd=str(self.game_dir),
+                    env=proc_env,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    bufsize=1,
+                    creationflags=creationflags,
                 )
-                restored = False
-                if build_loaded is False:
-                    self._raw_call_unlocked("new_build", {}, timeout=10.0)
-                    try:
-                        self._raw_call_unlocked(
-                            "import_code",
-                            {"code": target_code, "mode": "replace"},
-                            timeout=15.0,
+            except OSError as exc:
+                raise BridgeError(f"Failed to launch PoB engine: {exc}") from exc
+
+            try:
+                proc = self._proc
+                threading.Thread(
+                    target=self._stdout_reader_loop,
+                    args=(proc, out_queue),
+                    name=f"pob-{self.slot_name}-stdout",
+                    daemon=True,
+                ).start()
+                threading.Thread(
+                    target=self._stderr_drain_loop,
+                    args=(proc,),
+                    name=f"pob-{self.slot_name}-stderr",
+                    daemon=True,
+                ).start()
+
+                # Step 3: Consume startup events until gate_result and hello
+                gate_seen = False
+                hello_seen = False
+                deadline = time.monotonic() + 20.0
+                while not (gate_seen and hello_seen):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        self._kill_unlocked()
+                        raise BridgeTimeoutError(
+                            f"Timed out waiting for headless startup events (stderr: {list(self._stderr_tail)[-5:]})"
                         )
-                        restored = True
-                    except Exception:
-                        try:
-                            self._raw_call_unlocked("new_build", {}, timeout=10.0)
-                        except Exception:
-                            pass
+                    try:
+                        msg = self._stdout_queue.get(timeout=remaining)
+                    except queue.Empty as exc:
+                        self._kill_unlocked()
+                        raise BridgeTimeoutError("Timed out waiting for startup events") from exc
+
+                    if msg is None or isinstance(msg, Exception):
+                        self._kill_unlocked()
+                        raise BridgeError(
+                            f"Subprocess exited during boot: {msg} (stderr: {list(self._stderr_tail)[-5:]})"
+                        )
+
+                    event = msg.get("event")
+                    data = msg.get("data") or {}
+                    if event == "gate_result":
+                        if not data.get("ok"):
+                            self._kill_unlocked()
+                            raise BridgeError(f"PoB bridge gate_result failed: {data.get('failed')}")
+                        gate_seen = True
+                    elif event == "hello":
+                        self.hello_info = dict(data)
+                        self.pob_version = data.get("pobVersion")
+                        self.bridge_version = data.get("bridge")
+                        hello_seen = True
+
+                # Step 4: Call version{} to cache caps and initial translate state
+                ver_info = self._raw_call_unlocked("version", {}, timeout=10.0)
+                self.caps = ver_info.get("caps") or {}
+                self.pob_version = ver_info.get("pobVersion") or self.pob_version
+
+                # Step 5: Enable bilingual display translation (skip redundant RPC if already enabled)
+                if self.caps.get("translateToggle", True) and self.translate_enabled is not True:
+                    self._raw_call_unlocked("set_translate", {"enabled": True}, timeout=5.0)
+                    if self.translate_enabled is None:
+                        self.translate_enabled = True
+
+                # Step 6 (R4): Restore build directly when possible (skipping redundant new_build{}),
+                # otherwise initialize a clean empty build.
+                if restore_code is not None:
+                    target_code = restore_code or None
+                    if target_code is None:
+                        self.last_good_code = None
                 else:
-                    try:
-                        self._raw_call_unlocked(
-                            "import_code",
-                            {"code": target_code, "mode": "new"},
-                            timeout=15.0,
-                        )
-                        restored = True
-                    except Exception as exc:
-                        if "no build is loaded" in str(exc).lower():
-                            try:
-                                self._raw_call_unlocked("new_build", {}, timeout=10.0)
-                                self._raw_call_unlocked(
-                                    "import_code",
-                                    {"code": target_code, "mode": "replace"},
-                                    timeout=15.0,
-                                )
-                                restored = True
-                            except Exception:
-                                try:
-                                    self._raw_call_unlocked("new_build", {}, timeout=10.0)
-                                except Exception:
-                                    pass
-                        else:
+                    if not self.last_good_code:
+                        self.load_slot_state()
+                    target_code = self.last_good_code
+
+                if target_code:
+                    build_loaded = (
+                        ver_info["buildLoaded"]
+                        if "buildLoaded" in ver_info
+                        else self.hello_info.get("buildLoaded")
+                    )
+                    restored = False
+                    if build_loaded is False:
+                        self._raw_call_unlocked("new_build", {}, timeout=10.0)
+                        try:
+                            self._raw_call_unlocked(
+                                "import_code",
+                                {"code": target_code, "mode": "replace"},
+                                timeout=15.0,
+                            )
+                            restored = True
+                        except Exception:
                             try:
                                 self._raw_call_unlocked("new_build", {}, timeout=10.0)
                             except Exception:
                                 pass
-                self.last_good_code = target_code if restored else None
-            else:
-                self._raw_call_unlocked("new_build", {}, timeout=10.0)
+                    else:
+                        try:
+                            self._raw_call_unlocked(
+                                "import_code",
+                                {"code": target_code, "mode": "new"},
+                                timeout=15.0,
+                            )
+                            restored = True
+                        except Exception as exc:
+                            if "no build is loaded" in str(exc).lower():
+                                try:
+                                    self._raw_call_unlocked("new_build", {}, timeout=10.0)
+                                    self._raw_call_unlocked(
+                                        "import_code",
+                                        {"code": target_code, "mode": "replace"},
+                                        timeout=15.0,
+                                    )
+                                    restored = True
+                                except Exception:
+                                    try:
+                                        self._raw_call_unlocked("new_build", {}, timeout=10.0)
+                                    except Exception:
+                                        pass
+                            else:
+                                try:
+                                    self._raw_call_unlocked("new_build", {}, timeout=10.0)
+                                except Exception:
+                                    pass
+                    self.last_good_code = target_code if restored else None
+                else:
+                    self._raw_call_unlocked("new_build", {}, timeout=10.0)
 
-            self.last_used = time.time()
+                self.last_used = time.time()
+            except BaseException:
+                self._kill_unlocked()
+                raise
 
     @property
     def slot_state_path(self) -> Path:

@@ -100,14 +100,24 @@ if IS_OSX then
 			uint8_t  d_type;
 			char     d_name[1024];
 		} pob_dirent_t;
+		/* Darwin 64-bit inode struct stat (x86_64 stat$INODE64 & arm64 stat):
+		   dev(4)+mode(2)+nlink(2)+ino(8)+uid(4)+gid(4)+rdev(4)+pad(4)+atime(16) = 48 bytes before st_mtimespec. */
+		typedef struct {
+			uint8_t _head[48];
+			int64_t st_mtime;
+			int64_t st_mtime_nsec;
+			uint8_t _tail[256];
+		} pob_stat_t;
 	]]
 	if IS_X64 then
 		ffi.cdef[[
 			pob_dirent_t *pob_readdir(void *dirp) asm("readdir$INODE64");
+			int pob_stat(const char *path, pob_stat_t *buf) asm("stat$INODE64");
 		]]
 	else
 		ffi.cdef[[
 			pob_dirent_t *pob_readdir(void *dirp) asm("readdir");
+			int pob_stat(const char *path, pob_stat_t *buf) asm("stat");
 		]]
 	end
 else
@@ -119,8 +129,59 @@ else
 			uint8_t  d_type;
 			char     d_name[256];
 		} pob_dirent_t;
+		/* Linux x86_64 & aarch64 struct stat both place st_mtim.tv_sec at byte offset 88. */
+		typedef struct {
+			uint8_t _head[88];
+			int64_t st_mtime;
+			int64_t st_mtime_nsec;
+			uint8_t _tail[256];
+		} pob_stat_t;
 		pob_dirent_t *pob_readdir(void *dirp) asm("readdir");
+		int pob_stat(const char *path, pob_stat_t *buf) asm("stat");
+		int pob_xstat(int ver, const char *path, pob_stat_t *buf) asm("__xstat");
 	]]
+end
+
+local _pob_stat_fn = nil
+local _pob_xstat_fn = nil
+local _pob_xstat_ver = IS_X64 and 1 or 0
+
+if IS_OSX then
+	local ok, fn = pcall(function() return ffi.C.pob_stat end)
+	if ok then _pob_stat_fn = fn end
+else
+	local ok, fn = pcall(function() return ffi.C.pob_stat end)
+	if ok then
+		_pob_stat_fn = fn
+	else
+		local ok2, xfn = pcall(function() return ffi.C.pob_xstat end)
+		if ok2 then _pob_xstat_fn = xfn end
+	end
+end
+
+local function posix_file_mtime(path)
+	if type(path) ~= "string" or path == "" then
+		return 0
+	end
+	local st = ffi.new("pob_stat_t")
+	local rc = -1
+	if _pob_stat_fn then
+		rc = _pob_stat_fn(path, st)
+	elseif _pob_xstat_fn then
+		rc = _pob_xstat_fn(_pob_xstat_ver, path, st)
+	end
+	if rc ~= 0 then
+		return 0
+	end
+	local sec = tonumber(st.st_mtime) or 0
+	if sec < 0 then
+		return 0
+	end
+	local nsec = tonumber(st.st_mtime_nsec) or 0
+	if nsec >= 0 and nsec < 1000000000 then
+		return sec + nsec * 1e-9
+	end
+	return sec
 end
 
 local DT_UNKNOWN = 0
@@ -688,7 +749,8 @@ function fileSearchClass:GetFileSize()
 end
 
 function fileSearchClass:GetFileModifiedTime()
-	return 0
+	local it = self._items[self._idx]
+	return it and posix_file_mtime(it.full) or 0
 end
 
 function NewFileSearch(spec, findDirectories)
