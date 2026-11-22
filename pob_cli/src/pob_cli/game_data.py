@@ -3994,25 +3994,40 @@ def ground_text_entities(
 
     traps = scan_text_traps(raw)
 
-    db_path = ensure_gamedata_index(pob_dir=pob_dir, runtime_dir=runtime_dir)
-    conn = sqlite3.connect(_sqlite_ro_uri(db_path), uri=True)
+    resolved_slang: list[dict[str, str]] = []
+    if raw and limit > 0:
+        # 1. Resolve player slang mentions in text (longest-first, engine-independent)
+        for slang in _SLANG_SORTED_KEYS:
+            if slang in raw:
+                canon_en, kind_hint = PLAYER_SLANG_MAP[slang]
+                resolved_slang.append({"slang": slang, "canonical": canon_en, "kind": kind_hint})
+
+    entities: list[dict[str, Any]] = []
+    seen_keys: set[tuple[str, str]] = set()
+    pob_ver = "unbootstrapped"
+    data_ver = "none"
+    gamedata_available = False
+
     try:
-        meta = dict(conn.execute("SELECT key, value FROM meta").fetchall())
-        pob_ver = meta.get("pob_version", "unknown")
-        data_ver = meta.get("data_version", "unknown")
+        db_path: Path | None = ensure_gamedata_index(pob_dir=pob_dir, runtime_dir=runtime_dir)
+    except FileNotFoundError:
+        db_path = None
 
-        resolved_slang: list[dict[str, str]] = []
-        entities: list[dict[str, Any]] = []
-        seen_keys: set[tuple[str, str]] = set()
+    if db_path is not None:
+        gamedata_available = True
+        conn = sqlite3.connect(_sqlite_ro_uri(db_path), uri=True)
+        try:
+            meta = dict(conn.execute("SELECT key, value FROM meta").fetchall())
+            pob_ver = meta.get("pob_version", "unknown")
+            data_ver = meta.get("data_version", "unknown")
 
-        if raw and limit > 0:
-            # 1. Resolve player slang mentions in text (longest-first)
-            for slang in _SLANG_SORTED_KEYS:
-                if slang in raw:
-                    canon_en, kind_hint = PLAYER_SLANG_MAP[slang]
-                    resolved_slang.append({"slang": slang, "canonical": canon_en, "kind": kind_hint})
+            if raw and limit > 0:
+                for slang_item in resolved_slang:
                     if len(entities) >= limit:
-                        continue
+                        break
+                    slang = slang_item["slang"]
+                    canon_en = slang_item["canonical"]
+                    kind_hint = slang_item["kind"]
                     c_low = _fold_search_text(canon_en)
                     if kind_hint == "unique":
                         row = conn.execute(
@@ -4036,54 +4051,54 @@ def ground_text_entities(
                                 seen_keys.add(ekey)
                                 entities.append(_format_gem_fact_card(obj, matched_by=f"slang:{slang}"))
 
-            # 2. Scan live SQLite gem & unique names (ZH & EN word-bounded)
-            if len(entities) < limit:
-                idx = _get_ground_entity_index(conn, f"{db_path}:{pob_ver}:{data_ver}")
-                has_cjk = bool(_CJK_RE.search(raw))
-                text_zh_compact = normalize_zh_compact(raw) if has_cjk else ""
-                text_en_norm = normalize_guardrail_text(raw)
-                has_ascii = bool(re.search(r"[a-z]{3,}", text_en_norm))
+                # 2. Scan live SQLite gem & unique names (ZH & EN word-bounded)
+                if len(entities) < limit:
+                    idx = _get_ground_entity_index(conn, f"{db_path}:{pob_ver}:{data_ver}")
+                    has_cjk = bool(_CJK_RE.search(raw))
+                    text_zh_compact = normalize_zh_compact(raw) if has_cjk else ""
+                    text_en_norm = normalize_guardrail_text(raw)
+                    has_ascii = bool(re.search(r"[a-z]{3,}", text_en_norm))
 
-                matched_refs: list[tuple[str, int, str]] = []  # (kind, rowid, matched_by)
-                if has_cjk and text_zh_compact:
-                    covered_zh: list[str] = []
-                    for zh_c, kind, rid, name in idx["zh"]:
-                        if len(entities) + len(matched_refs) >= limit:
-                            break
-                        if zh_c in text_zh_compact:
-                            if any(zh_c in prev for prev in covered_zh):
+                    matched_refs: list[tuple[str, int, str]] = []  # (kind, rowid, matched_by)
+                    if has_cjk and text_zh_compact:
+                        covered_zh: list[str] = []
+                        for zh_c, kind, rid, name in idx["zh"]:
+                            if len(entities) + len(matched_refs) >= limit:
+                                break
+                            if zh_c in text_zh_compact:
+                                if any(zh_c in prev for prev in covered_zh):
+                                    continue
+                                ekey = (kind, name)
+                                if ekey not in seen_keys:
+                                    seen_keys.add(ekey)
+                                    covered_zh.append(zh_c)
+                                    matched_refs.append((kind, rid, f"zh:{zh_c}"))
+
+                    if has_ascii and len(entities) + len(matched_refs) < limit:
+                        for name_l, kind, rid, name in idx["en"]:
+                            if len(entities) + len(matched_refs) >= limit:
+                                break
+                            if name_l not in text_en_norm:
+                                continue
+                            if not re.search(rf"(?<![a-z0-9_'-]){re.escape(name_l)}(?![a-z0-9_'-])", text_en_norm):
                                 continue
                             ekey = (kind, name)
                             if ekey not in seen_keys:
                                 seen_keys.add(ekey)
-                                covered_zh.append(zh_c)
-                                matched_refs.append((kind, rid, f"zh:{zh_c}"))
+                                matched_refs.append((kind, rid, f"en:{name_l}"))
 
-                if has_ascii and len(entities) + len(matched_refs) < limit:
-                    for name_l, kind, rid, name in idx["en"]:
-                        if len(entities) + len(matched_refs) >= limit:
-                            break
-                        if name_l not in text_en_norm:
+                    for kind, rid, mby in matched_refs:
+                        tbl = "gems" if kind == "gem" else "uniques"
+                        row = conn.execute(f"SELECT data_json FROM {tbl} WHERE rowid = ?", (rid,)).fetchone()
+                        if not row:
                             continue
-                        if not re.search(rf"(?<![a-z0-9_'-]){re.escape(name_l)}(?![a-z0-9_'-])", text_en_norm):
-                            continue
-                        ekey = (kind, name)
-                        if ekey not in seen_keys:
-                            seen_keys.add(ekey)
-                            matched_refs.append((kind, rid, f"en:{name_l}"))
-
-                for kind, rid, mby in matched_refs:
-                    tbl = "gems" if kind == "gem" else "uniques"
-                    row = conn.execute(f"SELECT data_json FROM {tbl} WHERE rowid = ?", (rid,)).fetchone()
-                    if not row:
-                        continue
-                    obj = json.loads(row[0])
-                    if kind == "gem":
-                        entities.append(_format_gem_fact_card(obj, matched_by=mby))
-                    else:
-                        entities.append(_format_unique_fact_card(obj, matched_by=mby))
-    finally:
-        conn.close()
+                        obj = json.loads(row[0])
+                        if kind == "gem":
+                            entities.append(_format_gem_fact_card(obj, matched_by=mby))
+                        else:
+                            entities.append(_format_unique_fact_card(obj, matched_by=mby))
+        finally:
+            conn.close()
 
     elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
     env = {
@@ -4095,6 +4110,10 @@ def ground_text_entities(
 
     # Build concise, high-signal Markdown block for direct pre-turn prompt injection
     ctx_lines = [f"[Env: PoE1 3.30 | PoB {pob_ver} | Data {data_ver}]"]
+    if not gamedata_available:
+        ctx_lines.append(
+            "- [INFO] Local PoE1 game data not bootstrapped yet; run `pob bootstrap` to attach live gem/unique fact cards."
+        )
     for w in traps["warnings"]:
         ctx_lines.append(f"- {w['tag']} `{w['trigger']}`: {w['message']}")
     if resolved_slang:
@@ -4123,6 +4142,7 @@ def ground_text_entities(
     return {
         "env": env,
         "query": raw,
+        "gamedataAvailable": gamedata_available,
         "entities": entities,
         "resolvedSlang": resolved_slang,
         "poe2Traps": traps["poe2Traps"],

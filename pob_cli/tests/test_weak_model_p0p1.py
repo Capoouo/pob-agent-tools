@@ -407,7 +407,40 @@ def test_ground_text_entities_speed_and_accuracy() -> None:
     assert r_json.exit_code == 0
     parsed = _extract_json(r_json.output)
     assert parsed["hasAlerts"] is True
+    assert parsed["gamedataAvailable"] is True
     assert format_ground_markdown(parsed).startswith("[Env: PoE1")
+
+
+def test_ground_text_entities_without_engine(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`pob ground` must degrade cleanly before `pob bootstrap` (no PoE1/Data on disk)."""
+    empty_engine = tmp_path / "missing-engine"
+    monkeypatch.setenv("POB_ROOT", str(empty_engine))
+    monkeypatch.setenv("POB_RUNTIME_DIR", str(tmp_path / "rt"))
+    monkeypatch.setenv("POB_LEGACY_DIR", "")
+
+    res = game_data.ground_text_entities(
+        "我玩正火想用 Divine Blessing 开 Hatred 再带法血",
+        pob_dir=empty_engine,
+        runtime_dir=tmp_path / "rt",
+    )
+    assert res["gamedataAvailable"] is False
+    assert res["env"]["pobVersion"] == "unbootstrapped"
+    assert res["env"]["dataVersion"] == "none"
+    assert res["entities"] == []
+    assert res["hasAlerts"] is True
+    patch_ids = {p["ruleId"] for p in res["patchTraps"]}
+    assert {"PATCH_325_DIVINE_BLESSING_REMOVED", "PATCH_325_HATRED_REWORK"}.issubset(patch_ids)
+    slang_canon = {s["canonical"] for s in res["resolvedSlang"]}
+    assert {"Righteous Fire", "Mageblood"}.issubset(slang_canon)
+    assert "pob bootstrap" in res["contextBlock"]
+
+    runner = CliRunner()
+    cli_res = runner.invoke(cli.main, ["ground", "Divine Blessing with Hatred", "--json"])
+    assert cli_res.exit_code == 0, cli_res.output
+    parsed = _extract_json(cli_res.output)
+    assert parsed["gamedataAvailable"] is False
+    assert parsed["hasAlerts"] is True
+    assert any(p["ruleId"] == "PATCH_325_DIVINE_BLESSING_REMOVED" for p in parsed["patchTraps"])
 
 
 # ---------------------------------------------------------------------------
