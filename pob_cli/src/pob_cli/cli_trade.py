@@ -279,8 +279,10 @@ def _fetch_fresh(
             break
         chunk = client.fetch(ids[start : start + MAX_FETCH_IDS], query_id)
         fetched += len(chunk)
-        # Listings with no readable time are kept: the server already bounded them.
-        fresh.extend(row for row in chunk if (listing_age_hours(row) or 0.0) <= max_age)
+        # No readable time is not proof of freshness: the server window is wider than max_age.
+        fresh.extend(
+            row for row in chunk if (age := listing_age_hours(row)) is not None and age <= max_age
+        )
     return fresh, fetched
 
 
@@ -813,6 +815,7 @@ def cmd_trade_search(
             _trade_error(ctx, exc)
             return
         dropped_old = fetched - len(rows)
+        rows = rows[:want]  # the last page fetched can overshoot --fetch-limit
 
         search_url = client.search_url(league_name, query_id) if query_id else ""
         # Looked up only when it changes the result, so a plain search needs no extra service.
@@ -893,7 +896,7 @@ def cmd_trade_search(
             candidate.url = seller_url(league_name, query["query"], candidate.seller)
         if market and candidate.price_chaos is not None and bargain is not None:
             candidate.vs_market_pct = (candidate.price_chaos / market - 1) * 100
-            candidate.bargain = candidate.vs_market_pct <= -bargain
+            candidate.bargain = candidate.vs_market_pct <= -bargain + 1e-9  # float slack at the threshold
         candidates.append(candidate)
 
     pre_sort = "sum" if (sort_by == "sum" or (search_sort == "sum" and sort_by != "price")) else "score"
@@ -1019,7 +1022,7 @@ def cmd_trade_search(
             if max_age is None
             else f"NOTHING within {max_age:g}h - showing older listings instead"
             if stale_fallback
-            else f"within {max_age:g}h ({dropped_old} older dropped)"
+            else f"within {max_age:g}h ({dropped_old} older or undated dropped)"
         ),
         budget=budget,
         currency=currency,

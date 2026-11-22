@@ -1282,8 +1282,11 @@ def test_trade_search_max_age_bargain_and_seller_link(monkeypatch: pytest.Monkey
     # Cheapest page is all 20h old (inside the server's 1-day window, outside --max-age 15);
     # its median price, 100 chaos, is the going price.
     rows = {f"old{i}": _row(f"old{i}", 20, 95 + i if i < 5 else 96 + i, "chaos", f"Old#{i}") for i in range(10)}
+    rows["undated"] = _row("undated", 1, 1, "chaos", "Nobody#0")
+    del rows["undated"]["listing"]["indexed"]  # no readable time: not proof of freshness
     rows["divine"] = _row("divine", 2, 1, "divine", "Rich#1")
     rows["cheap"] = _row("cheap", 3, 50, "chaos", "Seller#2")
+    rows["edge"] = _row("edge", 4, 80, "chaos", "Edge#3")
     searches: list[dict[str, Any]] = []
 
     class _FakeClient(TradeClient):
@@ -1296,14 +1299,12 @@ def test_trade_search_max_age_bargain_and_seller_link(monkeypatch: pytest.Monkey
 
     monkeypatch.setattr(cli_trade, "TradeClient", _FakeClient)
 
-    res = CliRunner().invoke(
-        main,
-        [
-            "trade", "search", "--slot", "gloves", "--stat", "to Cold Resistance=30",
-            "--status", "securable", "--max-age", "15", "--bargain", "30",
-            "--sort", "price", "--pob", "off", "--no-compare", "--json",
-        ],
-    )
+    args = [
+        "trade", "search", "--slot", "gloves", "--stat", "to Cold Resistance=30",
+        "--status", "securable", "--max-age", "15",
+        "--sort", "price", "--pob", "off", "--no-compare", "--json",
+    ]
+    res = CliRunner().invoke(main, [*args, "--bargain", "30"])
     assert res.exit_code == 0, res.output
     data = json.loads(res.output)
 
@@ -1312,8 +1313,9 @@ def test_trade_search_max_age_bargain_and_seller_link(monkeypatch: pytest.Monkey
     assert "trade_filters" not in searches[1]["query"].get("filters", {})
 
     # It kept fetching past the stale first page, and 1 divine does not sort before 50 chaos.
-    assert (data["fetched"], data["droppedOld"], data["marketChaos"]) == (12, 10, 100)
-    cheap, divine = data["candidates"]
+    assert (data["fetched"], data["droppedOld"], data["marketChaos"]) == (14, 11, 100)
+    cheap, edge, divine = data["candidates"]
+    assert (edge["name"], edge["bargain"]) == ("edge (Slink Gloves)", False)
     assert (cheap["name"], cheap["bargain"], round(cheap["vs_market_pct"])) == ("cheap (Slink Gloves)", True, -50)
     assert (divine["price"]["chaos"], divine["bargain"], round(divine["vs_market_pct"])) == (200, False, 100)
 
@@ -1323,6 +1325,14 @@ def test_trade_search_max_age_bargain_and_seller_link(monkeypatch: pytest.Monkey
     assert linked["filters"]["trade_filters"]["filters"]["account"] == {"input": "Seller#2"}
     assert linked["status"] == {"option": "securable"}
     assert data["staleFallback"] is False
+
+    # Exactly at the threshold counts as a bargain: 80 is 20% below 100.
+    at_threshold = json.loads(CliRunner().invoke(main, [*args, "--bargain", "20"]).output)
+    assert [c["bargain"] for c in at_threshold["candidates"]] == [True, True, False]
+
+    # --fetch-limit caps the rows even though listings are fetched a page at a time.
+    capped = json.loads(CliRunner().invoke(main, [*args, "--fetch-limit", "1"]).output)
+    assert (len(capped["candidates"]), capped["droppedOld"]) == (1, 11)
 
 
 def test_trade_search_plain_run_needs_no_currency_rates(monkeypatch: pytest.MonkeyPatch) -> None:
