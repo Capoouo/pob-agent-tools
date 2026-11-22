@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# Install or upgrade pob-agent-tools (`pob`) on macOS or Linux.
+# Install or upgrade pob4agents (`pob`) on macOS or Linux.
 #
 # Examples:
-#   curl -fsSL https://raw.githubusercontent.com/exilemoulei/pob-agent-tools/feat/macos-support/install.sh | bash
-#   POB_BRANCH=feat/macos-support ./install.sh
+#   curl -fsSL https://raw.githubusercontent.com/exilemoulei/pob4agents/main/install.sh | bash
+#   POB_BRANCH=main ./install.sh
 #   POB_PROXY=http://127.0.0.1:7890 ./install.sh
 
 set -euo pipefail
 
-REPO="${POB_REPO:-exilemoulei/pob-agent-tools}"
-BRANCH="${POB_BRANCH:-feat/macos-support}"
+REPO="${POB_REPO:-exilemoulei/pob4agents}"
+BRANCH="${POB_BRANCH:-main}"
 INSTALL_URL="git+https://github.com/${REPO}.git@${BRANCH}#subdirectory=pob_cli"
 
 echo "[pob-install] Target: ${REPO}@${BRANCH}"

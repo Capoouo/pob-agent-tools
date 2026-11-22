@@ -1,8 +1,8 @@
-# pob-agent-tools (`pob`)
+# pob4agents (`pob`)
 
 **简体中文** | [English](README_EN.md)
 
-`pob-agent-tools` 是给 AI Agent 和《流放之路》1 玩家用的 Path of Building（PoB）命令行工具集，命令名为 `pob`。它能在后台运行 PoB，导入构筑、试配装备、比较天赋与技能，并查询游戏数据和交易价格。
+`pob4agents` 是给 AI Agent 和《流放之路》1 玩家用的 Path of Building（PoB）命令行工具集，命令名为 `pob`。它能在后台运行 PoB，导入构筑、试配装备、比较天赋与技能，并查询游戏数据和交易价格。
 
 伤害（DPS）、有效生命池（TotalEHP）、最大承伤（MaxHit），以及换装、改点、换宝石和永恒珠宝种子的收益，都交给实际运行的 PoB 引擎计算；工具不会只凭构筑 XML 里的词缀自行估算。
 
@@ -67,14 +67,14 @@ Windows 独立打包版内置运行环境，**无需安装 Python**。
 #### 方式一：PowerShell 一键安装 / 升级（推荐）
 
 ```powershell
-irm https://raw.githubusercontent.com/exilemoulei/pob-agent-tools/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/exilemoulei/pob4agents/main/install.ps1 | iex
 ```
 
 若访问 GitHub 需要代理：
 
 ```powershell
 $env:POB_PROXY = "http://127.0.0.1:7890"
-irm https://raw.githubusercontent.com/exilemoulei/pob-agent-tools/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/exilemoulei/pob4agents/main/install.ps1 | iex
 ```
 
 以后要升级，重新运行这条命令即可。安装脚本会校验 SHA256，并停止旧版后台进程。
@@ -84,7 +84,7 @@ irm https://raw.githubusercontent.com/exilemoulei/pob-agent-tools/main/install.p
 仓库提供 Scoop 清单（`bucket/pob.json`），发布新版本时会自动更新：
 
 ```powershell
-scoop bucket add pob https://github.com/exilemoulei/pob-agent-tools
+scoop bucket add pob https://github.com/exilemoulei/pob4agents
 scoop install pob
 
 # 后续升级：
@@ -93,16 +93,16 @@ scoop update pob
 
 #### 方式三：GitHub Releases 便携压缩包
 
-前往 [GitHub Releases](https://github.com/exilemoulei/pob-agent-tools/releases/latest) 下载 `pob-v0.5.0-windows-x64.zip`，解压后将包含 `pob.exe` 的目录加入系统 `PATH`。
+前往 [GitHub Releases](https://github.com/exilemoulei/pob4agents/releases/latest) 下载 `pob-v0.5.0-windows-x64.zip`，解压后将包含 `pob.exe` 的目录加入系统 `PATH`。
 
 #### 方式四：Python 包安装（Python 3.11+，`uv` / `pipx` / `pip`）
 
 ```powershell
 # 使用 uv（推荐）
-uv tool install "git+https://github.com/exilemoulei/pob-agent-tools.git@v0.5.0#subdirectory=pob_cli"
+uv tool install "git+https://github.com/exilemoulei/pob4agents.git@v0.5.0#subdirectory=pob_cli"
 
 # 或直接安装 Release Wheel
-pip install "https://github.com/exilemoulei/pob-agent-tools/releases/download/v0.5.0/pob_cli-0.5.0-py3-none-any.whl"
+pip install "https://github.com/exilemoulei/pob4agents/releases/download/v0.5.0/pob_cli-0.5.0-py3-none-any.whl"
 ```
 
 > **为 AI Agent 挂载通用 Skill（可选，推荐）**：将仓库内的 [`skills/pob`](skills/pob) 目录复制到你的 Agent 技能目录（如 `~/.agents/skills/pob`、`~/.claude/skills/pob` 或 DeepSeek Harness 的 `skills` 目录），即可让快速模型（如 DeepSeek Flash / Hydrogen / Haiku）按精简路由调用 `pob` 并规避跨版本幻觉。
@@ -114,15 +114,15 @@ pip install "https://github.com/exilemoulei/pob-agent-tools/releases/download/v0
 在 macOS（Apple Silicon `arm64` / Intel `x86_64`）或 Linux（`x86_64` / `aarch64`）上，先安装 Python 3.11+、`cc`、`make`、`git` 和系统 `zlib` 头文件，再编译一次 `LuaJIT 2.1 + lua-utf8`：
 
 ```bash
-git clone https://github.com/exilemoulei/pob-agent-tools.git
-cd pob-agent-tools
+git clone https://github.com/exilemoulei/pob4agents.git
+cd pob4agents
 
 # 1. 安装 pob CLI
 pip install "./pob_cli"
 
 # 2. 编译原生 LuaJIT 2.1 + lua-utf8 运行时并放入托管引擎目录
-# macOS 默认运行态目录为 ~/.local/share/pob-agent-tools（或自定义 POB_RUNTIME_DIR）
-export POB_RUNTIME_DIR="$HOME/.local/share/pob-agent-tools"
+# macOS 默认运行态目录为 ~/.local/share/pob4agents（或自定义 POB_RUNTIME_DIR）
+export POB_RUNTIME_DIR="$HOME/.local/share/pob4agents"
 chmod +x pob_cli/packaging/build_posix_runtime.sh
 ./pob_cli/packaging/build_posix_runtime.sh ./runtime-dist
 mkdir -p "$POB_RUNTIME_DIR/engine"
@@ -153,7 +153,7 @@ pob update --proxy http://127.0.0.1:7890        # 更新引擎，并刷新已加
 | 环境变量 | 说明 |
 |---|---|
 | `POB_ROOT` | 显式指定无头引擎根目录（默认自动查找 `<POB_RUNTIME_DIR>/engine`） |
-| `POB_RUNTIME_DIR` | 守护进程状态、引擎与缓存根目录（安装版默认 `%LOCALAPPDATA%\pob-agent-tools`，源码检出默认 `<repo>/.runtime`） |
+| `POB_RUNTIME_DIR` | 守护进程状态、引擎与缓存根目录（安装版默认 `%LOCALAPPDATA%\pob4agents`，自动兼容复用旧版 `pob-agent-tools` 数据；源码检出默认 `<repo>/.runtime`） |
 | `POB_CACHE_DIR` | 指定本地游戏数据库及联网查询的缓存目录 |
 | `POB_SLOT` | 默认目标构筑槽位名（未传 `--target` 时生效，默认为 `main`） |
 | `POB_PROXY` | 网络请求代理（支持 `http://`、`https://`、`socks5://`；亦兼容 `HTTPS_PROXY` / `ALL_PROXY`） |
@@ -538,7 +538,7 @@ pyinstaller --noconfirm --clean pob_cli/packaging/pob.spec
 **按版本标签发布**（`.github/workflows/release.yml`）：
 
 1. 修改 `pob_cli/src/pob_cli/__init__.py` 中的 `__version__`，并合入 `main`。
-2. 创建并推送版本标签：`git tag -s v0.5.0 -m "pob-agent-tools v0.5.0" && git push origin main v0.5.0`。
+2. 创建并推送版本标签：`git tag -s v0.5.0 -m "pob4agents v0.5.0" && git push origin main v0.5.0`。
 3. GitHub Actions 检查版本号、运行测试、构建并冒烟测试 `pob-vX.Y.Z-windows-x64.zip`、Wheel / sdist 和 `SHA256SUMS.txt`，随后发布 GitHub Release，并更新 Scoop 清单 `bucket/pob.json`。
 
 Agent 命令速查见 [AGENTS.md](AGENTS.md)。
@@ -554,9 +554,9 @@ Agent 命令速查见 [AGENTS.md](AGENTS.md)。
 
 ### 社区贡献致谢
 
-- **[@ChangMenQAQ](https://github.com/ChangMenQAQ)**（[PR #1](https://github.com/exilemoulei/pob-agent-tools/pull/1)）：官方交易搜索、丰收同阶转抗与工艺台词缀方案。
-- **[@restartgr](https://github.com/restartgr)**（[PR #2](https://github.com/exilemoulei/pob-agent-tools/pull/2)、[PR #4](https://github.com/exilemoulei/pob-agent-tools/pull/4)、[PR #6](https://github.com/exilemoulei/pob-agent-tools/pull/6)）：面板“去水”分析、`--keep` 条件保留、构筑恢复校验、错误退出码与中英文文档润色。
-- **[@Capoouo](https://github.com/Capoouo)**（[PR #3](https://github.com/exilemoulei/pob-agent-tools/pull/3)）：永恒珠宝种子搜索与候选种子筛选。
+- **[@ChangMenQAQ](https://github.com/ChangMenQAQ)**（[PR #1](https://github.com/exilemoulei/pob4agents/pull/1)）：官方交易搜索、丰收同阶转抗与工艺台词缀方案。
+- **[@restartgr](https://github.com/restartgr)**（[PR #2](https://github.com/exilemoulei/pob4agents/pull/2)、[PR #4](https://github.com/exilemoulei/pob4agents/pull/4)、[PR #6](https://github.com/exilemoulei/pob4agents/pull/6)）：面板“去水”分析、`--keep` 条件保留、构筑恢复校验、错误退出码与中英文文档润色。
+- **[@Capoouo](https://github.com/Capoouo)**（[PR #3](https://github.com/exilemoulei/pob4agents/pull/3)）：永恒珠宝种子搜索与候选种子筛选。
 
 ### 开源协议
 

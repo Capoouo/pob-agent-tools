@@ -1,4 +1,4 @@
-# AGENTS.md — `pob` Headless PoB CLI & Agent Tools (v0.5)
+# AGENTS.md — `pob4agents` (`pob`) Headless PoB CLI (v0.5)
 
 ## 1. Quick Commands (`pob [--offline] [--compact] [--out <file>]`)
 
@@ -76,7 +76,7 @@ pob timeless search --jewel "<name|中文>" --socket <nodeId> [--conqueror C] [-
 
 ## 2. Architecture, Env & Paths
 
-- Engine lookup (`updater.resolve_engine_root`): `POB_ROOT` -> `<POB_RUNTIME_DIR>/engine` (source checkout default `F:/poe/.runtime/engine`; installed/frozen default `%LOCALAPPDATA%/pob-agent-tools/engine`) -> read-only legacy seed `F:/poe/PobTools[20261102]` (never mutate legacy dir; PowerShell always `-LiteralPath` for `[20261102]`; `cwd` must be `PoE1`).
+- Engine lookup (`updater.resolve_engine_root`): `POB_ROOT` -> `<POB_RUNTIME_DIR>/engine` (source checkout default `F:/poe/.runtime/engine`; installed/frozen default `%LOCALAPPDATA%/pob4agents/engine`, auto-falling back to legacy `%LOCALAPPDATA%/pob-agent-tools` if it already has runtime data) -> read-only legacy seed `F:/poe/PobTools[20261102]` (never mutate legacy dir; PowerShell always `-LiteralPath` for `[20261102]`; `cwd` must be `PoE1`).
 - Packaging & release: `pob_cli/__init__.py` (`__version__`) is single source of truth; frozen `pob.exe` spawns background daemon via hidden `pob _daemon`; `.github/workflows/{ci,release}.yml` build Windows x64 `--onedir` zip + wheel/sdist + `SHA256SUMS.txt`, publish GitHub Release on `v*` tags, and auto-update in-repo Scoop bucket `bucket/pob.json`; `install.ps1` provides 1-line Windows install/upgrade.
 - Env vars: `POB_ROOT`, `POB_RUNTIME_DIR`, `POB_CACHE_DIR`, `POB_SLOT` (default build slot slug), `POB_PROXY` / `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY`, `POB_GITHUB_MIRROR`, `POB_OFFLINE=1`, `POB_LEGACY_DIR`, `POESESSID` / `POE_COOKIE` (trade env-only).
 - Modules (`pob_cli/src/pob_cli/`): `errors.py`, `guardrails.py`, `updater.py`, `bridge_client.py`, `daemon.py`, `importers.py`, `snapshot.py`, `analyzer.py`, `mutators.py`, `comparator.py`, `game_data.py`, `external_data.py`, `poedb_client.py`, `item_inspect.py`, `trade_item.py`, `trade_client.py`, `trade_query.py`, `trade_eval.py`, `trade_craft.py`, `bench.py`, `cli_trade.py`, `timeless.py`, `cli_timeless.py`, `formatters.py`, `cli.py`; bundled data `data/bench_costs.json` (ModMaster.lua authoritative primary + clean offline fallback); cross-harness PoE1 skill `skills/pob/SKILL.md` (`references/`).

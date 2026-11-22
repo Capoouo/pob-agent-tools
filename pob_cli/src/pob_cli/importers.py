@@ -22,7 +22,7 @@ from .bridge_client import BridgeError, BridgeWorker
 from .errors import DaemonRequestError
 from .updater import get_runtime_dir
 
-USER_AGENT = f"pob-cli/{__version__} (+https://github.com/exilemoulei/pob-agent-tools)"
+USER_AGENT = f"pob-cli/{__version__} (+https://github.com/exilemoulei/pob4agents)"
 DEFAULT_HTTP_TIMEOUT = httpx.Timeout(connect=4.0, read=15.0, write=15.0, pool=4.0)
 
 POE_NINJA_CHAR_RE = re.compile(
@@ -96,7 +96,7 @@ def _shared_cache_dir(runtime_dir: Path | None = None) -> Path:
                         same_rt = False
                     if not same_rt and (
                         (eng_parent / "cache").is_dir()
-                        or eng_parent.name in (".runtime", "pob-agent-tools")
+                        or eng_parent.name.lower() in (".runtime", "pob4agents", "pob-agent-tools")
                     ):
                         shared_candidate = eng_parent / "cache"
                 cache_dir = shared_candidate or (rt / "cache")

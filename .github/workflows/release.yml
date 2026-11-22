@@ -129,7 +129,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.meta.outputs.tag }}
-          name: "pob-agent-tools ${{ steps.meta.outputs.tag }}"
+          name: "pob4agents ${{ steps.meta.outputs.tag }}"
           prerelease: ${{ steps.meta.outputs.is_prerelease == 'true' }}
           generate_release_notes: true
           files: release-assets/*
@@ -138,12 +138,12 @@ jobs:
 
             **PowerShell One-Liner (Install / Update):**
             ```powershell
-            irm https://raw.githubusercontent.com/exilemoulei/pob-agent-tools/main/install.ps1 | iex
+            irm https://raw.githubusercontent.com/exilemoulei/pob4agents/main/install.ps1 | iex
             ```
 
             **Scoop (Windows Package Manager):**
             ```powershell
-            scoop bucket add pob https://github.com/exilemoulei/pob-agent-tools
+            scoop bucket add pob https://github.com/exilemoulei/pob4agents
             scoop install pob
             # Update later:
             scoop update pob
@@ -151,7 +151,7 @@ jobs:
 
             **Python (`uv` / `pipx` / `pip`):**
             ```powershell
-            uv tool install "https://github.com/exilemoulei/pob-agent-tools/releases/download/${{ steps.meta.outputs.tag }}/pob_cli-${{ steps.meta.outputs.version }}-py3-none-any.whl"
+            uv tool install "https://github.com/exilemoulei/pob4agents/releases/download/${{ steps.meta.outputs.tag }}/pob_cli-${{ steps.meta.outputs.version }}-py3-none-any.whl"
             ```
 
             After installing, run `pob bootstrap` (or `pob bootstrap --proxy http://127.0.0.1:7890`) once to fetch the headless PoB engine.

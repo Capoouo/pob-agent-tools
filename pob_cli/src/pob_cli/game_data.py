@@ -158,7 +158,7 @@ def _shared_cache_dir(
             same_rt = False
         if not same_rt and (
             (eng_parent / "cache").is_dir()
-            or eng_parent.name in (".runtime", "pob-agent-tools")
+            or eng_parent.name.lower() in (".runtime", "pob4agents", "pob-agent-tools")
         ):
             shared_candidate = eng_parent / "cache"
 

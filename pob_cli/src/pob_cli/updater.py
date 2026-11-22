@@ -27,13 +27,13 @@ if TYPE_CHECKING:
 
 from . import __version__
 
-USER_AGENT = f"pob-cli/{__version__} (+https://github.com/exilemoulei/pob-agent-tools)"
+USER_AGENT = f"pob-cli/{__version__} (+https://github.com/exilemoulei/pob4agents)"
 
 POBTOOLS_LATEST_URL = "https://github.com/Hsiung-Shao/PobTools-zh/releases/latest"
 POBTOOLS_DOWNLOAD_BASE = "https://github.com/Hsiung-Shao/PobTools-zh/releases/download"
 POB_MANIFEST_URL = "https://raw.githubusercontent.com/PathOfBuildingCommunity/PathOfBuilding/master/manifest.xml"
-POB_AGENT_RELEASES_LATEST_URL = "https://github.com/exilemoulei/pob-agent-tools/releases/latest"
-POB_AGENT_DOWNLOAD_BASE = "https://github.com/exilemoulei/pob-agent-tools/releases/download"
+POB_AGENT_RELEASES_LATEST_URL = "https://github.com/exilemoulei/pob4agents/releases/latest"
+POB_AGENT_DOWNLOAD_BASE = "https://github.com/exilemoulei/pob4agents/releases/download"
 
 # Exact upstream LuaJIT & luautf8 revisions matching PoB 2.68+ SimpleGraphic
 POSIX_LUAJIT_COMMIT = "2460b3ff93a1c955de3d62cfc825de7d68dc272e"
@@ -137,6 +137,19 @@ def detect_source_checkout_root() -> Path | None:
     return None
 
 
+def _has_runtime_data(path: Path) -> bool:
+    """Return True if ``path`` contains initialized pob runtime state (ignoring binary-only ``bin/``)."""
+    try:
+        if not path.is_dir():
+            return False
+        for marker in ("engine", "daemon.json", "update_state.json", "cache"):
+            if (path / marker).exists():
+                return True
+        return any(path.glob("slot_*.json"))
+    except OSError:
+        return False
+
+
 def get_default_runtime_dir() -> Path:
     """Return the default persistent runtime directory for source checkouts or installed/frozen runs.
 
@@ -144,8 +157,10 @@ def get_default_runtime_dir() -> Path:
       1. `POB_RUNTIME_DIR` environment variable.
       2. `POB_HOME` environment variable (`<POB_HOME>/.runtime`).
       3. Source checkout `<repo>/.runtime` (when running directly from git checkout).
-      4. OS user app data directory (`%LOCALAPPDATA%/pob-agent-tools` on Windows,
-         `$XDG_DATA_HOME/pob-agent-tools` or `~/.local/share/pob-agent-tools` on POSIX).
+      4. OS user app data directory (`%LOCALAPPDATA%/pob4agents` on Windows,
+         `$XDG_DATA_HOME/pob4agents` or `~/.local/share/pob4agents` on POSIX).
+         If the new directory has no runtime data yet while a legacy `pob-agent-tools`
+         directory already holds runtime state, seamlessly reuse the legacy directory.
     """
     env_rt = os.environ.get("POB_RUNTIME_DIR", "").strip()
     if env_rt:
@@ -162,13 +177,23 @@ def get_default_runtime_dir() -> Path:
     if sys.platform == "win32":
         local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
         if local_app_data:
-            return Path(local_app_data) / "pob-agent-tools"
-        return Path.home() / ".pob-agent-tools"
+            primary = Path(local_app_data) / "pob4agents"
+            legacy = Path(local_app_data) / "pob-agent-tools"
+        else:
+            primary = Path.home() / ".pob4agents"
+            legacy = Path.home() / ".pob-agent-tools"
+    else:
+        xdg_data = os.environ.get("XDG_DATA_HOME", "").strip()
+        if xdg_data:
+            primary = Path(xdg_data) / "pob4agents"
+            legacy = Path(xdg_data) / "pob-agent-tools"
+        else:
+            primary = Path.home() / ".local" / "share" / "pob4agents"
+            legacy = Path.home() / ".local" / "share" / "pob-agent-tools"
 
-    xdg_data = os.environ.get("XDG_DATA_HOME", "").strip()
-    if xdg_data:
-        return Path(xdg_data) / "pob-agent-tools"
-    return Path.home() / ".local" / "share" / "pob-agent-tools"
+    if not _has_runtime_data(primary) and _has_runtime_data(legacy):
+        return legacy
+    return primary
 
 
 def get_runtime_dir(runtime_dir: Path | None = None) -> Path:
@@ -398,7 +423,7 @@ def get_shared_cache_dir(
       1. `POB_CACHE_DIR` environment variable if set.
       2. If the effective engine dir (`pob_root` if explicitly given, else `resolve_engine_root(runtime_dir)`)
          lives outside `runtime_dir` and its parent already contains `cache/` or is named
-         `.runtime` / `pob-agent-tools`, share `<engine_dir.parent>/cache` (falling back to
+         `.runtime` / `pob4agents` / `pob-agent-tools`, share `<engine_dir.parent>/cache` (falling back to
          `<runtime_dir>/cache` on read-only/permission errors).
       3. Fallback `<runtime_dir>/cache`.
     """
@@ -430,7 +455,7 @@ def get_shared_cache_dir(
     if not inside_rt:
         eng_parent = eng_res.parent
         parent_cache = eng_parent / "cache"
-        if parent_cache.is_dir() or eng_parent.name.lower() in (".runtime", "pob-agent-tools"):
+        if parent_cache.is_dir() or eng_parent.name.lower() in (".runtime", "pob4agents", "pob-agent-tools"):
             try:
                 parent_cache.mkdir(parents=True, exist_ok=True)
                 return parent_cache
@@ -442,7 +467,7 @@ def get_shared_cache_dir(
         fallback.mkdir(parents=True, exist_ok=True)
         return fallback
     except OSError:
-        tmp_fallback = Path(tempfile.gettempdir()) / "pob-agent-tools-cache"
+        tmp_fallback = Path(tempfile.gettempdir()) / "pob4agents-cache"
         try:
             tmp_fallback.mkdir(parents=True, exist_ok=True)
         except OSError:
@@ -1524,7 +1549,7 @@ def _try_download_prebuilt_posix_runtime(
     proxy: str | None = None,
     mirror: str | None = None,
 ) -> dict[Path, Path] | None:
-    """Attempt to download a prebuilt pob-runtime-<os>-<arch>.tar.gz from pob-agent-tools releases."""
+    """Attempt to download a prebuilt pob-runtime-<os>-<arch>.tar.gz from pob4agents releases."""
     plat_tag = get_posix_platform_tag()
     asset_name = f"pob-runtime-{plat_tag}.tar.gz"
     latest_url = rewrite_github_url(POB_AGENT_RELEASES_LATEST_URL, mirror=mirror)

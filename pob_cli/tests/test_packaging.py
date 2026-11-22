@@ -62,12 +62,20 @@ def test_runtime_dir_resolution_installed_and_frozen(
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     if sys.platform == "win32":
         monkeypatch.setenv("LOCALAPPDATA", str(fake_appdata))
-        assert updater.detect_source_checkout_root() is None
-        assert updater.get_runtime_dir() == fake_appdata / "pob-agent-tools"
     else:
         monkeypatch.setenv("XDG_DATA_HOME", str(fake_appdata))
-        assert updater.detect_source_checkout_root() is None
-        assert updater.get_runtime_dir() == fake_appdata / "pob-agent-tools"
+    assert updater.detect_source_checkout_root() is None
+    assert updater.get_runtime_dir() == fake_appdata / "pob4agents"
+
+    # 5. Seamless legacy fallback: when new dir has no runtime data (even if `bin/` exists from install.ps1)
+    #    and legacy `pob-agent-tools` already holds runtime state, reuse the legacy dir.
+    (fake_appdata / "pob4agents" / "bin").mkdir(parents=True)
+    (fake_appdata / "pob-agent-tools" / "engine").mkdir(parents=True)
+    assert updater.get_runtime_dir() == fake_appdata / "pob-agent-tools"
+
+    # 6. Once the new `pob4agents` dir itself has runtime data, prefer `pob4agents` over legacy.
+    (fake_appdata / "pob4agents" / "engine").mkdir(parents=True)
+    assert updater.get_runtime_dir() == fake_appdata / "pob4agents"
 
 
 def test_build_daemon_spawn_cmd_frozen_vs_python(
@@ -128,7 +136,9 @@ def test_release_tools_pack_and_scoop_manifest_update(tmp_path: Path) -> None:
     updated = json.loads(copied.read_text(encoding="utf-8"))
     assert updated["version"] == "0.2.0"
     assert updated["architecture"]["64bit"]["hash"] == zip_sha
-    assert updated["architecture"]["64bit"]["url"].endswith("/v0.2.0/pob-v0.2.0-windows-x64.zip")
+    assert updated["architecture"]["64bit"]["url"] == (
+        "https://github.com/exilemoulei/pob4agents/releases/download/v0.2.0/pob-v0.2.0-windows-x64.zip"
+    )
 
 
 def test_lazy_subcommands_listed_in_pyinstaller_hiddenimports() -> None:

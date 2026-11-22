@@ -832,7 +832,14 @@ def test_get_shared_cache_dir_priority_and_isolation(
     monkeypatch.setenv("POB_ROOT", str(shared_eng))
     assert get_shared_cache_dir(swarm_rt) == shared_root / "cache"
 
-    # 3. External engine whose parent is NOT `.runtime`/`pob-agent-tools` and has no `cache/` -> stays isolated in rt/cache
+    # 2b. Engine under `pob4agents/engine` or legacy `pob-agent-tools/engine` also shares parent cache
+    for app_dir_name in ("pob4agents", "pob-agent-tools"):
+        app_root = tmp_path / app_dir_name
+        app_eng = _make_fake_engine(app_root / "engine")
+        monkeypatch.setenv("POB_ROOT", str(app_eng))
+        assert get_shared_cache_dir(swarm_rt) == app_root / "cache"
+
+    # 3. External engine whose parent is NOT `.runtime`/`pob4agents`/`pob-agent-tools` and has no `cache/` -> stays isolated in rt/cache
     other_eng = _make_fake_engine(tmp_path / "custom_parent" / "my_eng")
     monkeypatch.setenv("POB_ROOT", str(other_eng))
     assert get_shared_cache_dir(swarm_rt) == swarm_rt / "cache"

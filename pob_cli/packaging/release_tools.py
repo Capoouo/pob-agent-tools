@@ -8,7 +8,7 @@ import json
 import zipfile
 from pathlib import Path
 
-REPO_SLUG = "exilemoulei/pob-agent-tools"
+REPO_SLUG = "exilemoulei/pob4agents"
 
 
 def pack_windows_release(dist_dir: Path, out_dir: Path, tag: str) -> tuple[Path, str]:
@@ -54,7 +54,7 @@ def update_scoop_manifest(manifest_path: Path, version: str, tag: str, sha256: s
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Release packaging helpers for pob-agent-tools")
+    parser = argparse.ArgumentParser(description="Release packaging helpers for pob4agents")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_pack = sub.add_parser("pack")

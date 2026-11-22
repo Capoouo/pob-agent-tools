@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build minimal native POSIX headless runtime for pob-agent-tools:
+# Build minimal native POSIX headless runtime for pob4agents:
 #   - LuaJIT 2.1 (exact commit used by PathOfBuilding-SimpleGraphic, supporting += / ..=)
 #   - lua-utf8.so (starwing/luautf8 single-file C module)
 #

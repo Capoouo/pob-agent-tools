@@ -1,8 +1,8 @@
-# pob-agent-tools (`pob`)
+# pob4agents (`pob`)
 
 [简体中文](README.md) | **English**
 
-`pob-agent-tools` is a Path of Building (PoB) CLI toolkit for AI agents and Path of Exile 1 players. Its command is `pob`. It runs PoB in the background so you can import builds, try gear, compare passives and gems, and look up game data and trade prices.
+`pob4agents` is a Path of Building (PoB) CLI toolkit for AI agents and Path of Exile 1 players. Its command is `pob`. It runs PoB in the background so you can import builds, try gear, compare passives and gems, and look up game data and trade prices.
 
 DPS, effective hit pool (TotalEHP), maximum hit taken (MaxHit), and the effects of gear, passive, gem, or Timeless Jewel changes are calculated by a running PoB engine. The tool does not estimate them from modifiers in a build XML file.
 
@@ -67,14 +67,14 @@ The standalone Windows package includes its runtime; Python is not required.
 #### Option 1: PowerShell installer (recommended)
 
 ```powershell
-irm https://raw.githubusercontent.com/exilemoulei/pob-agent-tools/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/exilemoulei/pob4agents/main/install.ps1 | iex
 ```
 
 If your network needs a proxy to reach GitHub:
 
 ```powershell
 $env:POB_PROXY = "http://127.0.0.1:7890"
-irm https://raw.githubusercontent.com/exilemoulei/pob-agent-tools/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/exilemoulei/pob4agents/main/install.ps1 | iex
 ```
 
 Run the same command again to upgrade. The installer checks SHA256 and stops the old background process.
@@ -84,7 +84,7 @@ Run the same command again to upgrade. The installer checks SHA256 and stops the
 The repository includes a Scoop manifest (`bucket/pob.json`) that is updated with each release:
 
 ```powershell
-scoop bucket add pob https://github.com/exilemoulei/pob-agent-tools
+scoop bucket add pob https://github.com/exilemoulei/pob4agents
 scoop install pob
 
 # Update later:
@@ -93,16 +93,16 @@ scoop update pob
 
 #### Option 3: Portable GitHub release
 
-Download `pob-v0.5.0-windows-x64.zip` from [GitHub Releases](https://github.com/exilemoulei/pob-agent-tools/releases/latest), extract it, and add the folder containing `pob.exe` to your `PATH`.
+Download `pob-v0.5.0-windows-x64.zip` from [GitHub Releases](https://github.com/exilemoulei/pob4agents/releases/latest), extract it, and add the folder containing `pob.exe` to your `PATH`.
 
 #### Option 4: Python package (Python 3.11+, `uv` / `pipx` / `pip`)
 
 ```powershell
 # Use uv (recommended)
-uv tool install "git+https://github.com/exilemoulei/pob-agent-tools.git@v0.5.0#subdirectory=pob_cli"
+uv tool install "git+https://github.com/exilemoulei/pob4agents.git@v0.5.0#subdirectory=pob_cli"
 
 # Or install the release wheel
-pip install "https://github.com/exilemoulei/pob-agent-tools/releases/download/v0.5.0/pob_cli-0.5.0-py3-none-any.whl"
+pip install "https://github.com/exilemoulei/pob4agents/releases/download/v0.5.0/pob_cli-0.5.0-py3-none-any.whl"
 ```
 
 > **Load the bundled AI Agent Skill (optional, recommended)**: Copy [`skills/pob`](skills/pob) into your agent's skill folder (such as `~/.agents/skills/pob`, `~/.claude/skills/pob`, or DeepSeek Harness's `skills` directory) so fast models follow concise `pob` workflows and avoid cross-patch hallucinations.
@@ -114,15 +114,15 @@ pip install "https://github.com/exilemoulei/pob-agent-tools/releases/download/v0
 On macOS (Apple Silicon `arm64` / Intel `x86_64`) or Linux (`x86_64` / `aarch64`), install Python 3.11+, `cc`, `make`, `git`, and the system `zlib` headers. Then compile `LuaJIT 2.1 + lua-utf8` once:
 
 ```bash
-git clone https://github.com/exilemoulei/pob-agent-tools.git
-cd pob-agent-tools
+git clone https://github.com/exilemoulei/pob4agents.git
+cd pob4agents
 
 # 1. Install the pob CLI
 pip install "./pob_cli"
 
 # 2. Build LuaJIT 2.1 + lua-utf8 and place it in the managed engine directory
-# On macOS the default runtime directory is ~/.local/share/pob-agent-tools; override it with POB_RUNTIME_DIR
-export POB_RUNTIME_DIR="$HOME/.local/share/pob-agent-tools"
+# On macOS the default runtime directory is ~/.local/share/pob4agents; override it with POB_RUNTIME_DIR
+export POB_RUNTIME_DIR="$HOME/.local/share/pob4agents"
 chmod +x pob_cli/packaging/build_posix_runtime.sh
 ./pob_cli/packaging/build_posix_runtime.sh ./runtime-dist
 mkdir -p "$POB_RUNTIME_DIR/engine"
@@ -153,7 +153,7 @@ Common environment variables:
 | Variable | Purpose |
 |---|---|
 | `POB_ROOT` | Explicit engine root; otherwise `<POB_RUNTIME_DIR>/engine` is discovered automatically |
-| `POB_RUNTIME_DIR` | Engine, daemon state, and cache root; installed Windows default: `%LOCALAPPDATA%\pob-agent-tools`, source checkout default: `<repo>/.runtime` |
+| `POB_RUNTIME_DIR` | Engine, daemon state, and cache root; installed Windows default: `%LOCALAPPDATA%\pob4agents` (auto-reuses existing legacy `pob-agent-tools` data), source checkout default: `<repo>/.runtime` |
 | `POB_CACHE_DIR` | Override the local game database and online query cache directory |
 | `POB_SLOT` | Default build slot if `--target` is omitted; defaults to `main` |
 | `POB_PROXY` | HTTP, HTTPS, or SOCKS5 proxy; `HTTPS_PROXY` and `ALL_PROXY` are also supported |
@@ -540,7 +540,7 @@ pyinstaller --noconfirm --clean pob_cli/packaging/pob.spec
 **Tag-driven releases** (`.github/workflows/release.yml`):
 
 1. Update `__version__` in `pob_cli/src/pob_cli/__init__.py` and merge it into `main`.
-2. Create and push a version tag: `git tag -s v0.5.0 -m "pob-agent-tools v0.5.0" && git push origin main v0.5.0`.
+2. Create and push a version tag: `git tag -s v0.5.0 -m "pob4agents v0.5.0" && git push origin main v0.5.0`.
 3. GitHub Actions checks the version, runs tests, builds and smoke-tests `pob-vX.Y.Z-windows-x64.zip`, the wheel / sdist, and `SHA256SUMS.txt`, publishes the GitHub Release, and updates the Scoop manifest at `bucket/pob.json`.
 
 For a compact command reference for agents, see [AGENTS.md](AGENTS.md).
@@ -556,9 +556,9 @@ For a compact command reference for agents, see [AGENTS.md](AGENTS.md).
 
 ### Community contributors
 
-- **[@ChangMenQAQ](https://github.com/ChangMenQAQ)** ([PR #1](https://github.com/exilemoulei/pob-agent-tools/pull/1)): official trade search, same-tier Harvest resistance conversion, and crafting bench suggestions.
-- **[@restartgr](https://github.com/restartgr)** ([PR #2](https://github.com/exilemoulei/pob-agent-tools/pull/2), [PR #4](https://github.com/exilemoulei/pob-agent-tools/pull/4), [PR #6](https://github.com/exilemoulei/pob-agent-tools/pull/6)): inflated-panel audit, `--keep`, build restoration checks, CLI exit codes, and bilingual README polish.
-- **[@Capoouo](https://github.com/Capoouo)** ([PR #3](https://github.com/exilemoulei/pob-agent-tools/pull/3)): PoB-calculated Timeless Jewel seed search and candidate filtering.
+- **[@ChangMenQAQ](https://github.com/ChangMenQAQ)** ([PR #1](https://github.com/exilemoulei/pob4agents/pull/1)): official trade search, same-tier Harvest resistance conversion, and crafting bench suggestions.
+- **[@restartgr](https://github.com/restartgr)** ([PR #2](https://github.com/exilemoulei/pob4agents/pull/2), [PR #4](https://github.com/exilemoulei/pob4agents/pull/4), [PR #6](https://github.com/exilemoulei/pob4agents/pull/6)): inflated-panel audit, `--keep`, build restoration checks, CLI exit codes, and bilingual README polish.
+- **[@Capoouo](https://github.com/Capoouo)** ([PR #3](https://github.com/exilemoulei/pob4agents/pull/3)): PoB-calculated Timeless Jewel seed search and candidate filtering.
 
 ### License
 

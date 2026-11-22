@@ -1,13 +1,13 @@
 <#
 .SYNOPSIS
-    One-click installer and updater for pob-agent-tools (standalone Windows x64 `pob.exe`).
+    One-click installer and updater for pob4agents (standalone Windows x64 `pob.exe`).
 
 .EXAMPLE
-    irm https://raw.githubusercontent.com/exilemoulei/pob-agent-tools/main/install.ps1 | iex
+    irm https://raw.githubusercontent.com/exilemoulei/pob4agents/main/install.ps1 | iex
 
 .EXAMPLE
     $env:POB_PROXY = "http://127.0.0.1:7890"
-    irm https://raw.githubusercontent.com/exilemoulei/pob-agent-tools/main/install.ps1 | iex
+    irm https://raw.githubusercontent.com/exilemoulei/pob4agents/main/install.ps1 | iex
 #>
 [CmdletBinding()]
 param(
@@ -21,10 +21,16 @@ param(
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$Repo = "exilemoulei/pob-agent-tools"
+$Repo = "exilemoulei/pob4agents"
+$LegacyInstallDir = $null
 if (-not $InstallDir) {
-    $baseLocal = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { Join-Path $HOME ".pob-agent-tools" }
-    $InstallDir = Join-Path $baseLocal "pob-agent-tools\bin"
+    if ($env:LOCALAPPDATA) {
+        $InstallDir = Join-Path $env:LOCALAPPDATA "pob4agents\bin"
+        $LegacyInstallDir = Join-Path $env:LOCALAPPDATA "pob-agent-tools\bin"
+    } else {
+        $InstallDir = Join-Path (Join-Path $HOME ".pob4agents") "bin"
+        $LegacyInstallDir = Join-Path (Join-Path $HOME ".pob-agent-tools") "bin"
+    }
 }
 
 function Apply-Mirror([string]$Url) {
@@ -76,7 +82,7 @@ function Download-File([string]$Url, [string]$OutFile, [string]$ProxyUrl) {
 }
 
 if ([Environment]::Is64BitOperatingSystem -eq $false) {
-    throw "pob-agent-tools standalone binary requires 64-bit Windows (x64)."
+    throw "pob4agents standalone binary requires 64-bit Windows (x64)."
 }
 
 if ($Version) {
@@ -126,12 +132,17 @@ try {
         throw "Invalid archive layout: pob.exe not found in $AssetName."
     }
 
-    # Stop any running daemon before replacing binaries
-    $ExistingExe = Join-Path $InstallDir "pob.exe"
-    if (Test-Path -LiteralPath $ExistingExe) {
-        Write-Host "Stopping existing pob daemon before upgrading ..."
-        try { & $ExistingExe stop 2>$null | Out-Null } catch {}
-        Start-Sleep -Milliseconds 300
+    # Stop any running daemon before replacing binaries (check both new and legacy install dirs)
+    $ExistingExes = @((Join-Path $InstallDir "pob.exe"))
+    if ($LegacyInstallDir -and -not $LegacyInstallDir.TrimEnd("\").Equals($InstallDir.TrimEnd("\"), [System.StringComparison]::OrdinalIgnoreCase)) {
+        $ExistingExes += (Join-Path $LegacyInstallDir "pob.exe")
+    }
+    foreach ($exePath in $ExistingExes) {
+        if (Test-Path -LiteralPath $exePath) {
+            Write-Host "Stopping existing pob daemon ($exePath) before upgrading ..."
+            try { & $exePath stop 2>$null | Out-Null } catch {}
+            Start-Sleep -Milliseconds 300
+        }
     }
 
     $ParentDir = Split-Path -Parent $InstallDir
@@ -165,20 +176,39 @@ try {
             $entries = $userPath.Split(";") | Where-Object { $_ -and $_.Trim() -ne "" }
         }
         $normalizedTarget = $InstallDir.TrimEnd("\")
+        $normalizedLegacy = if ($LegacyInstallDir) { $LegacyInstallDir.TrimEnd("\") } else { $null }
+        $filteredEntries = @()
+        $removedLegacy = $false
         $alreadyInPath = $false
         foreach ($e in $entries) {
-            if ($e.TrimEnd("\").Equals($normalizedTarget, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $norm = $e.TrimEnd("\")
+            if ($normalizedLegacy -and $norm.Equals($normalizedLegacy, [System.StringComparison]::OrdinalIgnoreCase) -and -not $norm.Equals($normalizedTarget, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $removedLegacy = $true
+                continue
+            }
+            if ($norm.Equals($normalizedTarget, [System.StringComparison]::OrdinalIgnoreCase)) {
                 $alreadyInPath = $true
-                break
+            }
+            $filteredEntries += $e
+        }
+        if (-not $alreadyInPath -or $removedLegacy) {
+            $finalEntries = if ($alreadyInPath) { $filteredEntries } else { $filteredEntries + $InstallDir }
+            $newUserPath = $finalEntries -join ";"
+            [Environment]::SetEnvironmentVariable("Path", $newUserPath, "User")
+            if ($removedLegacy) {
+                Write-Host "Replaced legacy $LegacyInstallDir with $InstallDir in your User PATH."
+            } else {
+                Write-Host "Added $InstallDir to your User PATH."
             }
         }
-        if (-not $alreadyInPath) {
-            $newUserPath = if ($entries.Count -gt 0) { ($entries + $InstallDir) -join ";" } else { $InstallDir }
-            [Environment]::SetEnvironmentVariable("Path", $newUserPath, "User")
-            Write-Host "Added $InstallDir to your User PATH."
+        $sessionEntries = $env:Path.Split(";") | Where-Object {
+            $norm = $_.TrimEnd("\")
+            -not ($normalizedLegacy -and $norm.Equals($normalizedLegacy, [System.StringComparison]::OrdinalIgnoreCase) -and -not $norm.Equals($normalizedTarget, [System.StringComparison]::OrdinalIgnoreCase))
         }
-        if (-not ($env:Path.Split(";") | Where-Object { $_.TrimEnd("\").Equals($normalizedTarget, [System.StringComparison]::OrdinalIgnoreCase) })) {
-            $env:Path = "$InstallDir;$env:Path"
+        if (-not ($sessionEntries | Where-Object { $_.TrimEnd("\").Equals($normalizedTarget, [System.StringComparison]::OrdinalIgnoreCase) })) {
+            $env:Path = "$InstallDir;" + ($sessionEntries -join ";")
+        } else {
+            $env:Path = $sessionEntries -join ";"
         }
     }
 

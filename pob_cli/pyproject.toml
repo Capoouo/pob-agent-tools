@@ -35,9 +35,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/exilemoulei/pob-agent-tools"
-Repository = "https://github.com/exilemoulei/pob-agent-tools"
-Issues = "https://github.com/exilemoulei/pob-agent-tools/issues"
+Homepage = "https://github.com/exilemoulei/pob4agents"
+Repository = "https://github.com/exilemoulei/pob4agents"
+Issues = "https://github.com/exilemoulei/pob4agents/issues"
 
 [project.scripts]
 pob = "pob_cli.cli:main"
