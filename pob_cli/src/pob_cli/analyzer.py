@@ -240,6 +240,296 @@ def _has_mageblood_equipped(items_res: dict[str, Any]) -> bool:
     return False
 
 
+def _has_doryanis_prototype_equipped(items_res: dict[str, Any] | None) -> bool:
+    """Return True if Body Armour slot has Doryani's Prototype equipped."""
+    if not isinstance(items_res, dict):
+        return False
+    items_by_id = {it["id"]: it for it in items_res.get("items", []) if isinstance(it, dict) and "id" in it}
+    for slot in items_res.get("slots", []):
+        if not isinstance(slot, dict) or slot.get("inactive"):
+            continue
+        if slot.get("name") == "Body Armour" and slot.get("selItemId"):
+            item = items_by_id.get(slot["selItemId"], {})
+            text = " ".join(
+                strip_pob_escapes(str(item.get(k) or ""))
+                for k in ("name", "nameZh", "title", "titleZh", "baseName", "baseNameZh")
+            ).lower()
+            if any(tok in text for tok in ("doryani's prototype", "doryanis prototype", "多里亚尼", "多里亞尼")):
+                return True
+    return False
+
+
+_RESERVATION_AURA_EXACT = frozenset(
+    {
+        "haste",
+        "zealotry",
+        "wrath",
+        "hatred",
+        "anger",
+        "grace",
+        "determination",
+        "discipline",
+        "malevolence",
+        "vitality",
+        "clarity",
+        "precision",
+        "pride",
+        "petrified blood",
+        "tempest shield",
+        "arctic armour",
+        "flesh and stone",
+        "blood and sand",
+        "defiance banner",
+        "dread banner",
+        "war banner",
+        "summon skitterbots",
+        "skitterbots",
+    }
+)
+_RESERVATION_AURA_PREFIXES = (
+    "purity of ",
+    "aspect of ",
+    "herald of ",
+)
+_RESERVATION_AURA_ZH = (
+    "迅捷",
+    "狂热",
+    "狂熱",
+    "雷霆",
+    "憎恨",
+    "愤怒",
+    "憤怒",
+    "优雅",
+    "優雅",
+    "坚定",
+    "堅定",
+    "纪律",
+    "紀律",
+    "怨毒",
+    "活力",
+    "清晰",
+    "精准",
+    "精準",
+    "骄傲",
+    "驕傲",
+    "纯净",
+    "純淨",
+    "石化之血",
+    "暴风之盾",
+    "暴風之盾",
+    "极地装甲",
+    "極地裝甲",
+    "血肉与岩石",
+    "血肉與岩石",
+    "血与沙",
+    "血與沙",
+    "之捷",
+    "之势",
+    "之勢",
+    "召唤飞掠者",
+    "召喚飛掠者",
+)
+
+
+def _is_reservation_aura_gem(gm: dict[str, Any]) -> bool:
+    """Return True if an enabled active gem dict represents a mana/life reservation aura."""
+    if not isinstance(gm, dict) or gm.get("support") or not gm.get("enabled", True):
+        return False
+    for key in ("name", "nameSpec", "nameZh"):
+        raw = strip_pob_escapes(str(gm.get(key) or "")).strip().lower()
+        if not raw:
+            continue
+        base = raw[5:].strip() if raw.startswith("vaal ") else raw
+        if base in _RESERVATION_AURA_EXACT:
+            return True
+        if any(base.startswith(pref) for pref in _RESERVATION_AURA_PREFIXES):
+            return True
+        if any(tok in raw for tok in _RESERVATION_AURA_ZH):
+            return True
+    return False
+
+
+def _detect_repeat_multiplier(skills_res: dict[str, Any] | None) -> tuple[int, list[str]]:
+    """Return (repeat_multiplier, labels) for main skill group's enabled repeat supports.
+
+    Repeat supports pay mana ONLY on the initial cast/attack, NOT on free repeats:
+    - Greater Spell Echo -> 3x (1 + 2 repeats)
+    - Spell Echo / Awakened Spell Echo -> 2x (1 + 1 repeat)
+    - Awakened Multistrike -> 4x (1 + 3 repeats)
+    - Multistrike -> 3x (1 + 2 repeats)
+    """
+    groups = (skills_res or {}).get("groups") or []
+    main_idx = (skills_res or {}).get("mainSocketGroup")
+    main_group = next(
+        (g for g in groups if isinstance(g, dict) and (g.get("isMain") or (main_idx is not None and g.get("index") == main_idx))),
+        None,
+    )
+    if not main_group or not main_group.get("enabled", True):
+        return 1, []
+
+    has_gse = False
+    has_se = False
+    has_awk_ms = False
+    has_ms = False
+    labels: list[str] = []
+
+    for gm in main_group.get("gems") or []:
+        if not isinstance(gm, dict) or not gm.get("enabled", True) or not gm.get("support"):
+            continue
+        gsid = str(gm.get("skillId") or "")
+        combined = " ".join(
+            strip_pob_escapes(str(gm.get(k) or ""))
+            for k in ("name", "nameSpec", "nameZh")
+        ).lower()
+        if (
+            gsid == "SupportGreaterSpellEcho"
+            or "greater spell echo" in combined
+            or "高阶施法回响" in combined
+            or "高階施放迴響" in combined
+        ):
+            if not has_gse:
+                has_gse = True
+                labels.append("Greater Spell Echo (3x)")
+        elif (
+            gsid in ("SupportSpellEcho", "SupportMulticast", "SupportAwakenedSpellEcho")
+            or "spell echo" in combined
+            or "法术回响" in combined
+            or "施放迴響" in combined
+        ):
+            if not has_se:
+                has_se = True
+                labels.append("Spell Echo (2x)")
+        elif (
+            gsid == "SupportAwakenedMultistrike"
+            or "awakened multistrike" in combined
+            or "觉醒多重打击" in combined
+            or "覺醒多重打擊" in combined
+        ):
+            if not has_awk_ms:
+                has_awk_ms = True
+                labels.append("Awakened Multistrike (4x)")
+        elif (
+            gsid == "SupportMultistrike"
+            or "multistrike" in combined
+            or "多重打击" in combined
+            or "多重打擊" in combined
+        ):
+            if not has_ms:
+                has_ms = True
+                labels.append("Multistrike (3x)")
+
+    spell_repeats = 1 + (2 if has_gse else 0) + (1 if has_se else 0)
+    attack_repeats = 4 if has_awk_ms else (3 if has_ms else 1)
+    return max(spell_repeats, attack_repeats), labels
+
+
+_KNOWN_SKILL_BASE_COOLDOWNS: dict[str, float] = {
+    "hexblast of contradiction": 1.0,
+}
+
+
+def _resolve_main_skill_cooldown(
+    stats: dict[str, Any],
+    skills_res: dict[str, Any] | None,
+) -> float | None:
+    """Resolve effective cooldown (seconds) for the main skill from PoB stats or local game_data."""
+    for stat_key in ("SkillCooldown", "Cooldown", "EffectiveCooldown", "CooldownTime"):
+        raw = stats.get(stat_key)
+        if raw is not None:
+            val = _finite_float(raw, default=0.0)
+            if val > 0.0:
+                return val
+
+    groups = (skills_res or {}).get("groups") or []
+    main_idx = (skills_res or {}).get("mainSocketGroup")
+    main_group = next(
+        (g for g in groups if isinstance(g, dict) and (g.get("isMain") or (main_idx is not None and g.get("index") == main_idx))),
+        None,
+    )
+    if not main_group or not main_group.get("enabled", True):
+        return None
+
+    active_names = [
+        strip_pob_escapes(str(gm.get("name") or gm.get("nameSpec") or "")).strip()
+        for gm in (main_group.get("gems") or [])
+        if isinstance(gm, dict) and gm.get("enabled", True) and not gm.get("support")
+    ]
+    active_names = [n for n in active_names if n]
+    if not active_names:
+        return None
+
+    primary_name = active_names[0]
+    primary_low = primary_name.lower()
+    base_cd = 0.0
+    try:
+        from .game_data import query_local_data
+
+        res = query_local_data("gem", primary_name, limit=5)
+        hits = res.get("results") or []
+        gem_rec = None
+        for hit in hits:
+            if not isinstance(hit, dict):
+                continue
+            cand_names = {
+                strip_pob_escapes(str(hit.get(k) or "")).strip().lower()
+                for k in ("name", "display_name", "zh_name")
+                if hit.get(k)
+            }
+            if primary_low in cand_names:
+                gem_rec = hit
+                break
+        if gem_rec is not None:
+            base_cd = _finite_float(gem_rec.get("cooldown"), default=0.0)
+            if base_cd <= 0.0:
+                lvls = gem_rec.get("levels") or {}
+                if isinstance(lvls, dict):
+                    lvl20 = lvls.get("20") or lvls.get(20) or (next(iter(lvls.values())) if lvls else {})
+                    if isinstance(lvl20, dict):
+                        base_cd = _finite_float(lvl20.get("cooldown"), default=0.0)
+    except Exception:
+        base_cd = 0.0
+
+    if base_cd <= 0.0:
+        base_cd = _KNOWN_SKILL_BASE_COOLDOWNS.get(primary_low, 0.0)
+
+    if base_cd > 0.0:
+        cdr_raw = _finite_float(stats.get("CooldownRecovery"), default=0.0)
+        if cdr_raw > 10.0:
+            return base_cd / (1.0 + cdr_raw / 100.0)
+        if cdr_raw > 0.0:
+            return base_cd / cdr_raw
+        return base_cd
+    return None
+
+
+def _compute_effective_mana_spend(
+    stats: dict[str, Any],
+    skills_res: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Compute effective mana spend rate accounting for repeat supports and active skill cooldown."""
+    mana_cost = _finite_float(stats.get("ManaCost"))
+    speed = _finite_float(stats.get("Speed"))
+    repeats, repeat_labels = _detect_repeat_multiplier(skills_res)
+    eff_casts = (speed / repeats) if (speed > 0.0 and repeats > 0) else 0.0
+    eff_cd = _resolve_main_skill_cooldown(stats, skills_res)
+    cooldown_capped = False
+    if eff_cd is not None and eff_cd > 0.0 and eff_casts > 0.0:
+        cd_cap = 1.0 / eff_cd
+        if cd_cap < eff_casts:
+            eff_casts = cd_cap
+            cooldown_capped = True
+    return {
+        "manaCost": mana_cost,
+        "rawSpeed": speed,
+        "repeats": repeats,
+        "repeatLabels": repeat_labels,
+        "effectiveCooldown": eff_cd,
+        "cooldownCapped": cooldown_capped,
+        "effectiveCastsPerSec": eff_casts,
+        "spendRate": mana_cost * eff_casts,
+    }
+
+
 def _is_tincture_item(item: dict[str, Any] | None) -> bool:
     """Return True if a PoB item entry represents a PoE1 Tincture (NOT a Flask)."""
     if not isinstance(item, dict):
@@ -698,21 +988,30 @@ def _detect_build_mechanics_and_pitfalls(
     equipped_slots_raw: list[dict[str, Any]] | None = None,
     alloc_node_stats: list[tuple[str, list[str]]] | None = None,
     trigger_attack_aps: float | None = None,
+    warnings: list[str] | None = None,
+    build_info: dict[str, Any] | None = None,
+    stripped_flasks: list[str] | None = None,
 ) -> tuple[list[dict[str, str]], dict[str, Any]]:
     """Detect high-impact PoE1 3.30 build mechanics, dead/anti-synergy links, triggers, & defensive bricks."""
     gaps: list[dict[str, str]] = []
     mechanics: dict[str, Any] = {}
+    core_synergies: list[str] = []
+    amulet_7th_link: list[str] = []
 
     groups = (skills_res or {}).get("groups") or []
     main_idx = (skills_res or {}).get("mainSocketGroup")
-    items_by_id = {it["id"]: it for it in (items_res or {}).get("items", [])}
+    items_by_id = {it["id"]: it for it in (items_res or {}).get("items", []) if isinstance(it, dict) and "id" in it}
     slots_list = (items_res or {}).get("slots") or []
 
-    # Check active equipped items by slot name (excluding weapon swap)
+    # Check active equipped items by slot name (excluding weapon swap; include jewel sockets even if unnamed)
     active_items_by_slot: dict[str, dict[str, Any]] = {}
     for s in slots_list:
+        if not isinstance(s, dict):
+            continue
         iid = s.get("selItemId")
         sname = str(s.get("name") or "")
+        if not sname and s.get("nodeId") is not None:
+            sname = f"Jewel {s.get('nodeId')}"
         if iid and not s.get("inactive") and "Swap" not in sname:
             active_items_by_slot[sname] = items_by_id.get(iid, {})
 
@@ -734,16 +1033,49 @@ def _detect_build_mechanics_and_pitfalls(
     w1_item = active_items_by_slot.get("Weapon 1") or {}
     has_sword_of_ages = "the sword of ages" in _item_names_low(w1_item)
 
-    # Check allocated keystones & ascendancy names
+    # Check allocated keystones & ascendancy names/ids
     ks_lower: set[str] = set()
+    ks_ids: set[int] = set()
     asc_names_lower: set[str] = set()
+    asc_ids: set[int] = set()
+    asc_classes_lower: set[str] = set()
     if isinstance(tree_summary, dict):
         for ks in tree_summary.get("keystones") or []:
             if isinstance(ks, dict):
-                ks_lower.add(strip_pob_escapes(str(ks.get("name") or "")).lower())
+                nm = strip_pob_escapes(str(ks.get("name") or "")).strip().lower()
+                if nm:
+                    ks_lower.add(nm)
+                nm_zh = strip_pob_escapes(str(ks.get("nameZh") or "")).strip().lower()
+                if nm_zh:
+                    ks_lower.add(nm_zh)
+                if ks.get("id") is not None:
+                    try:
+                        ks_ids.add(int(ks["id"]))
+                    except (TypeError, ValueError):
+                        pass
+            elif isinstance(ks, str) and ks.strip():
+                ks_lower.add(strip_pob_escapes(ks).strip().lower())
         for an in tree_summary.get("ascendancyNodes") or []:
             if isinstance(an, dict):
-                asc_names_lower.add(strip_pob_escapes(str(an.get("name") or "")).lower())
+                nm = strip_pob_escapes(str(an.get("name") or "")).strip().lower()
+                if nm:
+                    asc_names_lower.add(nm)
+                nm_zh = strip_pob_escapes(str(an.get("nameZh") or "")).strip().lower()
+                if nm_zh:
+                    asc_names_lower.add(nm_zh)
+                if an.get("id") is not None:
+                    try:
+                        asc_ids.add(int(an["id"]))
+                    except (TypeError, ValueError):
+                        pass
+                asc_tag = strip_pob_escapes(str(an.get("asc") or an.get("ascendancyName") or "")).strip().lower()
+                if asc_tag:
+                    asc_classes_lower.add(asc_tag)
+    for n_lbl, _ in alloc_node_stats or []:
+        lbl_low = strip_pob_escapes(str(n_lbl or "")).strip().lower()
+        if lbl_low:
+            asc_names_lower.add(lbl_low)
+            ks_lower.add(lbl_low)
 
     has_perfect_crime = "perfect crime" in asc_names_lower
     has_bloodsoaked_blade = "bloodsoaked blade" in ks_lower
@@ -768,16 +1100,17 @@ def _detect_build_mechanics_and_pitfalls(
     )
     global_cdr_pct = float(cdr_data["totalGlobalCdrPct"])
 
-    # Collect all enabled non-swap active skill names across the build (for aura/burning cross-checks)
+    # Collect all enabled non-swap active skill names across the build (for aura/burning/synergy cross-checks)
     all_active_non_swap_low: set[str] = set()
     for g in groups:
         if not g.get("enabled", True) or "Swap" in str(g.get("slot") or ""):
             continue
         for gm in g.get("gems") or []:
             if gm.get("enabled", True) and not gm.get("support"):
-                all_active_non_swap_low.add(
-                    strip_pob_escapes(str(gm.get("name") or gm.get("nameSpec") or "")).strip().lower()
-                )
+                for k in ("name", "nameSpec", "nameZh"):
+                    val = strip_pob_escapes(str(gm.get(k) or "")).strip().lower()
+                    if val:
+                        all_active_non_swap_low.add(val)
 
     # 1. Main group dead/anti-synergy supports + Firestorm/Cascade cap + Lv1 + empty sockets
     main_mana_cost = _finite_float(stats.get("ManaCost"), default=-1.0)
@@ -816,10 +1149,21 @@ def _detect_build_mechanics_and_pitfalls(
                 }
             )
 
-        # Inspiration Support in a 0-mana group generates 0 Inspiration Charges in live play
-        if is_zero_mana_group and (
-            "SupportInspiration" in mg_skill_ids or "inspiration" in mg_sup_norms
-        ):
+        # Inspiration Support: 0-mana dead link OR high-mana (>=400) charge-reset trap
+        has_inspiration_in_main = (
+            "SupportInspiration" in mg_skill_ids
+            or "inspiration" in mg_sup_norms
+            or any(
+                gm.get("support")
+                and any(
+                    tok in strip_pob_escapes(str(gm.get(k) or "")).lower()
+                    for k in ("name", "nameSpec", "nameZh")
+                    for tok in ("inspiration", "启迪", "啟發")
+                )
+                for gm in mg_gems
+            )
+        )
+        if is_zero_mana_group and has_inspiration_in_main:
             gaps.append(
                 {
                     "category": "Mechanic",
@@ -828,6 +1172,18 @@ def _detect_build_mechanics_and_pitfalls(
                         f"Dead Inspiration Support in 0-mana Group #{mg_idx} ({mg_slot or 'main'}): "
                         "Inspiration Support in a 0-mana group generates 0 Inspiration Charges in live play — "
                         "PoB max-charge assumption is fake water! Spend mana on a linked/supported skill or swap support."
+                    ),
+                }
+            )
+        elif has_inspiration_in_main and main_mana_cost >= 400.0:
+            gaps.append(
+                {
+                    "category": "Sustain",
+                    "severity": "HIGH" if main_mana_cost >= 700.0 else "MEDIUM",
+                    "message": (
+                        f"Inspiration Support mana-reset trap: single cast costs {int(round(main_mana_cost))} Mana "
+                        "vs Lv20 800-Mana charge reset threshold (Lv21: 922) — charges reset every 1-2 casts, "
+                        "so live DPS is far lower than PoB's assumed 5 Inspiration Charges!"
                     ),
                 }
             )
@@ -1538,6 +1894,350 @@ def _detect_build_mechanics_and_pitfalls(
                     ),
                 }
             )
+
+    # 8. Core Build Synergies, Do-Not-Brick Advisories & Architecture Guards
+    all_enabled_non_swap_gems: list[dict[str, Any]] = [
+        gm
+        for g in groups
+        if isinstance(g, dict) and g.get("enabled", True) and "Swap" not in str(g.get("slot") or "")
+        for gm in (g.get("gems") or [])
+        if isinstance(gm, dict) and gm.get("enabled", True)
+    ]
+
+    def _gem_matches(gm: dict[str, Any], *, skill_ids: tuple[str, ...] = (), tokens: tuple[str, ...] = ()) -> bool:
+        gsid = str(gm.get("skillId") or "")
+        if gsid and gsid in skill_ids:
+            return True
+        combined = " ".join(
+            strip_pob_escapes(str(gm.get(k) or ""))
+            for k in ("name", "nameSpec", "nameZh")
+        ).lower()
+        return any(tok in combined for tok in tokens)
+
+    # 8a. Doryani's Prototype Negative Lightning Resistance Exemption
+    if _has_doryanis_prototype_equipped(items_res):
+        doryani_msg = (
+            "[Doryani's Prototype] Negative Lightning Res (-200% cap) is INTENTIONAL: "
+            "enemies within 6m share your Lightning Res (huge DPS multiplier) and Armour applies "
+            "to Lightning Hits (stay within 6m; note Lightning DoT still bypasses Armour and is deadly!)."
+        )
+        core_synergies.append(doryani_msg)
+        gaps.append({"category": "Mechanic", "severity": "INFO", "message": doryani_msg})
+
+    # 8b. CWS Zero-ES (The Agnostic + Valyrium / Bloodnotch / Cast when Stunned) & Defiance of Destiny
+    has_the_agnostic = (
+        19732 in ks_ids
+        or "the agnostic" in ks_lower
+        or "不可知论" in ks_lower
+        or "不可知論" in ks_lower
+    )
+    has_valyrium = any(
+        any(tok in nl for tok in ("valyrium", "女武神", "战日", "戰日"))
+        for nl in equipped_names_all.values()
+    )
+    has_bloodnotch = any(
+        any(tok in nl for tok in ("bloodnotch", "血痕", "缺血症"))
+        for nl in equipped_names_all.values()
+    )
+    has_cws_anywhere = any(
+        _gem_matches(
+            gm,
+            skill_ids=("SupportCastWhenStunned",),
+            tokens=("cast when stunned", "晕眩时施放", "暈眩時施放"),
+        )
+        for gm in all_enabled_non_swap_gems
+    )
+    if has_the_agnostic and (has_valyrium or has_bloodnotch or has_cws_anywhere):
+        core_synergies.append(
+            "[DO NOT UNSPEC] The Agnostic + Valyrium/Bloodnotch/CWS: The Agnostic removes all ES (ES=0) "
+            "so Valyrium's ES-based Stun Threshold = 0 AND removes inherent 50% ES Stun Avoidance! "
+            "Unspeccing it (even with Blood Magic) BRICKS the build."
+        )
+
+    has_defiance_of_destiny = any(
+        any(tok in nl for tok in ("defiance of destiny", "命运之抗争", "命運之抗爭", "拒絕命運", "拒绝命运"))
+        for nl in equipped_names_all.values()
+    )
+    if has_defiance_of_destiny and (has_bloodnotch or has_cws_anywhere):
+        core_synergies.append(
+            "[CORE DEFENSE] Defiance of Destiny + Bloodnotch + Immutable Force forms an immortal "
+            "hit-recovery loop; do NOT replace Defiance of Destiny with a damage amulet."
+        )
+
+    # 8c. Unequipped (slot: -) Simulated Aura Reservation Split
+    raw_mana_unres = stats.get("ManaUnreserved")
+    has_neg_mana_unres = (
+        raw_mana_unres is not None
+        and _finite_float(raw_mana_unres, default=0.0) < 0.0
+    )
+    has_res_engine_warn = any(
+        (
+            "reserv" in w.lower()
+            or "保留" in w
+            or ("mana" in w.lower() and ("negative" in w.lower() or "exceed" in w.lower()))
+        )
+        for w in (warnings or [])
+    )
+    if has_neg_mana_unres or has_res_engine_warn:
+        unequipped_aura_groups: list[str] = []
+        for g in groups:
+            if not isinstance(g, dict) or not g.get("enabled", True):
+                continue
+            g_slot = str(g.get("slot") or "").strip()
+            if g_slot not in ("", "-"):
+                continue
+            aura_names = [
+                strip_pob_escapes(str(gm.get("name") or gm.get("nameSpec") or gm.get("nameZh") or "")).strip()
+                for gm in (g.get("gems") or [])
+                if _is_reservation_aura_gem(gm)
+            ]
+            if aura_names:
+                unequipped_aura_groups.append(f"Group #{g.get('index')} ({', '.join(aura_names)})")
+        if unequipped_aura_groups:
+            sim_msg = (
+                f"[SIMULATED AURA RESERVATION] Unequipped (`slot: -`) reservation aura group(s) detected while "
+                f"Mana is over-reserved: {', '.join(unequipped_aura_groups)}. These are likely "
+                "Spectre/Party/Mercenary simulated auras whose reservation is erroneously charged to the player's "
+                "mana pool in PoB — check disabling them before blaming or cutting player defensive auras "
+                "(e.g. Petrified Blood)!"
+            )
+            core_synergies.append(sim_msg)
+            gaps.append({"category": "Sustain", "severity": "MEDIUM", "message": sim_msg})
+
+    # 8d. Uul-Netol's Vow Amulet 7th Link + Returning Projectiles + Pierce Synergy
+    amulet_item = active_items_by_slot.get("Amulet") or {}
+    amulet_names_low = _item_names_low(amulet_item)
+    has_uul_netols_vow = any(
+        tok in amulet_names_low for tok in ("uul-netol's vow", "uul-netols vow", "乌尔尼多之誓", "烏爾尼多之誓")
+    )
+    amulet_7th_link_gems: list[dict[str, Any]] = []
+    main_slot_low = str((main_group or {}).get("slot") or "").strip().lower()
+    if has_uul_netols_vow and main_group and main_group.get("enabled", True) and main_slot_low == "body armour":
+        for g in groups:
+            if not isinstance(g, dict) or not g.get("enabled", True):
+                continue
+            if str(g.get("slot") or "").strip().lower() != "amulet":
+                continue
+            for gm in g.get("gems") or []:
+                if not isinstance(gm, dict) or not gm.get("enabled", True) or not gm.get("support"):
+                    continue
+                amulet_7th_link_gems.append(gm)
+                nm = strip_pob_escapes(str(gm.get("name") or gm.get("nameSpec") or "")).strip()
+                nm_zh = strip_pob_escapes(str(gm.get("nameZh") or "")).strip()
+                lv = gm.get("level")
+                ql = gm.get("quality")
+                meta = f" ({lv}/{ql}%)" if (lv is not None and ql is not None) else (f" (Lv.{lv})" if lv is not None else "")
+                if nm_zh and nm and nm_zh != nm:
+                    disp = f"{nm_zh} ({nm}){meta}"
+                else:
+                    disp = f"{nm or nm_zh}{meta}"
+                if disp:
+                    amulet_7th_link.append(disp)
+
+    if main_group and main_group.get("enabled", True):
+        mg_enabled_gems = [gm for gm in (main_group.get("gems") or []) if isinstance(gm, dict) and gm.get("enabled", True)]
+        effective_main_supports = [gm for gm in mg_enabled_gems if gm.get("support")] + amulet_7th_link_gems
+        has_returning_proj = any(
+            _gem_matches(
+                gm,
+                skill_ids=("SupportReturningProjectiles",),
+                tokens=("returning projectiles", "投射物归返", "投射物返回"),
+            )
+            for gm in effective_main_supports
+        )
+
+        def _is_pierce_support(gm: dict[str, Any]) -> bool:
+            gsid = str(gm.get("skillId") or "")
+            if gsid in ("SupportPierce", "SupportAwakenedPierce", "SupportGreaterPierce"):
+                return True
+            en_nm = strip_pob_escapes(str(gm.get("name") or gm.get("nameSpec") or "")).strip()
+            if _normalize_support_base_name(en_nm) in ("pierce", "greater pierce", "awakened pierce"):
+                return True
+            zh_nm = strip_pob_escapes(str(gm.get("nameZh") or "")).strip().lower()
+            if "投射物穿透" in zh_nm or zh_nm in ("穿透", "穿透(辅)", "穿透（辅）", "穿透辅助", "穿透輔助"):
+                return True
+            return False
+
+        has_pierce = any(_is_pierce_support(gm) for gm in effective_main_supports)
+        if has_returning_proj and has_pierce:
+            core_synergies.append(
+                "[7L SYNERGY] Returning Projectiles + Pierce: Pierce is required so projectiles pass through "
+                "targets and hit again on return — do NOT drop Pierce based purely on raw 1-hit PoB tooltip DPS!"
+            )
+
+        # 8e. Multi-Active Trigger / CWS / Hinekora + DD + Penance Mark Architecture Guard
+        mg_active_gems = [gm for gm in mg_enabled_gems if not gm.get("support")]
+        mg_trigger_supports = [
+            gm
+            for gm in mg_enabled_gems
+            if gm.get("support")
+            and _gem_matches(
+                gm,
+                skill_ids=(
+                    "SupportCastWhenStunned",
+                    "SupportCastOnCriticalStrike",
+                    "SupportAwakenedCastOnCriticalStrike",
+                    "SupportCastWhileChannelling",
+                    "SupportAwakenedCastWhileChannelling",
+                ),
+                tokens=(
+                    "cast when stunned",
+                    "晕眩时施放",
+                    "暈眩時施放",
+                    "cast on critical strike",
+                    "暴击时施放",
+                    "暴擊時施放",
+                    "cast while channelling",
+                    "吟唱时施放",
+                    "引導時施放",
+                ),
+            )
+        ]
+        has_multi_active_trigger = len(mg_active_gems) >= 2 and bool(mg_trigger_supports)
+    else:
+        has_multi_active_trigger = False
+
+    has_hinekora = (
+        1731 in asc_ids
+        or any(
+            any(tok in nm for tok in ("hinekora", "欣嫩", "海妮可拉", "死神之怒"))
+            for nm in asc_names_lower
+        )
+    )
+    has_penance_mark = any(
+        any(tok in nm for tok in ("penance mark", "忏悔印记", "懺悔印記"))
+        for nm in all_active_non_swap_low
+    ) or any(
+        "penance mark" in ln.lower()
+        for raw_txt in raw_by_slot.values()
+        for ln in _active_item_lines(raw_txt)
+    )
+    has_hateful_accuser = any(
+        any(tok in nl for tok in ("the hateful accuser", "憎恨控诉", "憎恨控訴", "憎惡控告者"))
+        for nl in equipped_names_all.values()
+    )
+    has_detonate_dead = any(
+        any(tok in nm for tok in ("detonate dead", "爆灵术", "爆靈術", "尸体爆破", "屍體爆破"))
+        for nm in all_active_non_swap_low
+    )
+    if has_multi_active_trigger or (has_hinekora and (has_penance_mark or has_hateful_accuser or has_detonate_dead)):
+        core_synergies.append(
+            "[MULTI-ACTIVE / TRIGGER ARCHITECTURE] PoB's single-skill CombinedDPS only evaluates ONE active skill "
+            "at a time — secondary active skills showing 0 isolated DPS delta are often essential "
+            "multi-hit/phantasm-kill/corpse-explosion/burning-ground enablers (NOT dead links!)."
+        )
+
+    # 8f. Pathfinder Permanent Flasks Dewater Context & Master Surgeon + Petrified Blood + Progenesis
+    asc_cls_en = strip_pob_escapes(str((build_info or {}).get("ascendClassName") or "")).strip().lower()
+    asc_cls_zh = strip_pob_escapes(str((build_info or {}).get("ascendClassNameZh") or "")).strip().lower()
+    is_pathfinder = (
+        "pathfinder" in asc_cls_en
+        or "追猎者" in asc_cls_zh
+        or "追獵者" in asc_cls_zh
+        or "pathfinder" in asc_classes_lower
+    )
+    if is_pathfinder:
+        has_natures_adrenaline = any(
+            tok in nm for nm in asc_names_lower for tok in ("nature's adrenaline", "自然肾上腺素", "自然腎上腺素")
+        )
+        has_master_surgeon = any(
+            tok in nm for nm in asc_names_lower for tok in ("master surgeon", "外科大师", "外科大師")
+        )
+        has_tides_of_time = any(
+            any(tok in nl for tok in ("the tides of time", "时光之潮", "時間之潮", "時光浪潮"))
+            for nl in equipped_names_all.values()
+        )
+        has_petrified_blood = any(
+            any(tok in nm for tok in ("petrified blood", "石化之血"))
+            for nm in all_active_non_swap_low
+        )
+        has_progenesis = any(
+            any(tok in nl for tok in ("progenesis", "创生", "創生", "先祖之源"))
+            for nl in equipped_names_all.values()
+        )
+        pf_tags: list[str] = []
+        if has_natures_adrenaline:
+            pf_tags.append("Nature's Adrenaline")
+        if has_tides_of_time:
+            pf_tags.append("The Tides of Time")
+        if has_master_surgeon:
+            pf_tags.append("Master Surgeon")
+        if has_petrified_blood:
+            pf_tags.append("Petrified Blood")
+        if has_progenesis:
+            pf_tags.append("Progenesis")
+        pf_detail = f" ({', '.join(pf_tags)})" if pf_tags else ""
+        if stripped_flasks:
+            core_synergies.append(
+                f"[PATHFINDER PERMANENT FLASKS] Dewater stripped {len(stripped_flasks)} active flask(s), "
+                f"but Pathfinder sustains permanent flasks in boss fights{pf_detail} — re-run with `--keep flasks` "
+                "for realistic boss EHP. Note Master Surgeon + Petrified Blood + Progenesis synergy: "
+                "do NOT cut Petrified Blood solely because of its 50% non-flask life cap!"
+            )
+        elif has_master_surgeon and (has_petrified_blood or has_progenesis):
+            core_synergies.append(
+                "[PATHFINDER FLASK SYNERGY] Master Surgeon + Petrified Blood + Progenesis forms a core Pathfinder "
+                "defensive loop (Life Flask recovers above 50% life) — do NOT cut Petrified Blood solely because "
+                "of its 50% non-flask life cap!"
+            )
+
+    # 8g. Chieftain Ramako, Sun's Light fixed -20% Fire Res vs DoT while stationary
+    has_ramako = (61355 in asc_ids) or any(
+        tok in nm for nm in asc_names_lower for tok in ("ramako", "雷默科", "烈阳之光", "烈陽之光", "太阳之光", "太陽之光")
+    )
+    if has_ramako:
+        core_synergies.append(
+            "[RAMAKO FIXED -20% DOT RES] Chieftain 'Ramako, Sun's Light' sets nearby enemies' Fire Resistance "
+            "against DoT to a FIXED -20% while stationary — Flammability, Fire Exposure, and Scorch have ZERO effect "
+            "on Fire DoT while standing still (this is why Punishment is preferred over Flammability!)."
+        )
+
+    # 8h. Frost Bomb utility (-75% Enemy Life Regeneration, NOT a curse) in non-Cold builds
+    mg_active_low = " ".join(
+        strip_pob_escapes(str(gm.get(k) or ""))
+        for gm in ((main_group.get("gems") or []) if isinstance(main_group, dict) else [])
+        if isinstance(gm, dict) and gm.get("enabled", True) and not gm.get("support")
+        for k in ("name", "nameSpec", "nameZh")
+    ).lower()
+    has_frost_bomb = any(
+        tok in nm for nm in all_active_non_swap_low for tok in ("frost bomb", "寒霜爆")
+    )
+    main_is_cold = any(
+        tok in mg_active_low for tok in ("ice ", "frost", "cold", "vortex", "creeping", "winter", "glacial", "冰", "寒", "冻")
+    )
+    if has_frost_bomb and not main_is_cold:
+        core_synergies.append(
+            "[UTILITY SKILL: FROST BOMB] Frost Bomb is NOT a curse (does not compete with curse limit) — "
+            "in non-Cold builds it provides -75% Enemy Life Regeneration against Maven/Essence/Harvest/regen rares."
+        )
+
+    # 8i. Raise Spectre hideout-cast Mana Cost vs Lifetap combat skills
+    main_is_spectre = any(tok in mg_active_low for tok in ("raise spectre", "召唤灵体", "喚醒幽魂"))
+    mana_unres_val = _finite_float(stats.get("ManaUnreserved"), default=0.0)
+    lifetap_group_count = 0
+    for grp in groups:
+        if not isinstance(grp, dict) or not grp.get("enabled", True):
+            continue
+        if any(
+            any(
+                tok in " ".join(strip_pob_escapes(str(gm.get(k) or "")) for k in ("name", "nameSpec", "nameZh")).lower()
+                for tok in ("lifetap", "赤炼", "赤煉", "活栓")
+            )
+            for gm in (grp.get("gems") or [])
+            if isinstance(gm, dict) and gm.get("enabled", True)
+        ):
+            lifetap_group_count += 1
+    if main_is_spectre and main_mana_cost > 0 and mana_unres_val < main_mana_cost and lifetap_group_count >= 2:
+        core_synergies.append(
+            f"[SPECTRE HIDEOUT CAST] Raise Spectre ({int(round(main_mana_cost))} Mana) is only cast once in hideout "
+            f"(temporarily toggling off an aura) — {lifetap_group_count} utility groups use Lifetap (Life cost), "
+            "so do NOT require Raise Spectre's cast cost to fit inside active in-combat unreserved Mana."
+        )
+
+    if core_synergies:
+        mechanics["coreSynergies"] = list(dict.fromkeys(core_synergies))
+    if amulet_7th_link:
+        mechanics["amulet7thLink"] = amulet_7th_link
 
     return gaps, mechanics
 
@@ -2389,12 +3089,22 @@ def audit_build(
             digest_before = capture_digest(worker)
             stats = digest_before["stats"]
             info = digest_before["buildInfo"]
+            try:
+                skills_res_audit, cfg_res_audit = _call_batch(
+                    worker,
+                    [("list_skills", {}), ("list_config", {})],
+                )
+            except Exception:
+                skills_res_audit, cfg_res_audit = None, None
 
             # Static health checks
             health_issues: list[dict[str, str]] = []
+            has_doryani = _has_doryanis_prototype_equipped(items_res)
 
             # 1. Elemental & Chaos resistances
             for elem in ("Fire", "Cold", "Lightning"):
+                if elem == "Lightning" and has_doryani:
+                    continue
                 val = _finite_float(stats.get(f"{elem}Resist"))
                 over = _finite_float(stats.get(f"{elem}ResistOverCap"))
                 if val < 75:
@@ -2453,7 +3163,7 @@ def audit_build(
                         }
                     )
 
-            # 4. Mana Cost vs Unreserved Mana & Regen
+            # 4. Mana Cost vs Unreserved Mana & Regen (accounting for repeat supports & skill cooldown)
             mana_cost = _finite_float(stats.get("ManaCost"))
             mana_unres = _finite_float(stats.get("ManaUnreserved"))
             raw_mana_regen = (
@@ -2465,6 +3175,12 @@ def audit_build(
             mana_leech = _finite_float(stats.get("ManaLeechGainRate"))
             speed = _finite_float(stats.get("Speed"))
             life_unres = _finite_float(stats.get("LifeUnreserved"))
+            spend_info = _compute_effective_mana_spend(stats, skills_res_audit)
+            spend_rate = float(spend_info["spendRate"])
+            eff_casts = float(spend_info["effectiveCastsPerSec"])
+            repeats = int(spend_info["repeats"])
+            rec_rate = max(0.0, mana_regen) + mana_leech
+            exceeds_recovery = (spend_rate > rec_rate * 1.10) if rec_rate > 0.0 else (spend_rate > 0.0)
             if mana_cost > 0 and mana_cost > mana_unres and life_unres > 0:
                 health_issues.append(
                     {
@@ -2481,20 +3197,19 @@ def audit_build(
                         "message": f"Net Mana Regen is negative ({mana_regen:.1f}/s) with Mana Cost {mana_cost:.0f}",
                     }
                 )
-            elif (
-                mana_cost > 0
-                and speed > 0
-                and (mana_cost * speed) > (max(0.0, mana_regen) + mana_leech)
-                and life_unres > 0
-            ):
-                spend_rate = mana_cost * speed
-                rec_rate = max(0.0, mana_regen) + mana_leech
+            elif mana_cost > 0 and eff_casts > 0 and exceeds_recovery and life_unres > 0:
+                detail_bits: list[str] = []
+                if repeats > 1:
+                    detail_bits.append(f"raw {speed:.2f}/s / {repeats}x repeats")
+                if spend_info.get("cooldownCapped") and spend_info.get("effectiveCooldown"):
+                    detail_bits.append(f"capped by {float(spend_info['effectiveCooldown']):.2f}s CD")
+                detail_suffix = f"; {', '.join(detail_bits)}" if detail_bits else ""
                 health_issues.append(
                     {
                         "category": "Sustain",
                         "severity": "LOW",
                         "message": (
-                            f"Mana spend rate ({spend_rate:.1f}/s = {mana_cost:.0f} * {speed:.2f}/s) "
+                            f"Mana spend rate ({spend_rate:.1f}/s = {mana_cost:.0f} * {eff_casts:.2f}/s{detail_suffix}) "
                             f"exceeds net Mana recovery + leech ({rec_rate:.1f}/s)"
                         ),
                     }
@@ -2543,22 +3258,6 @@ def audit_build(
                         }
                     )
 
-            # 8. Build mechanic & PoB-modeling pitfall checks (uses already-supported RPCs cleanly)
-            try:
-                skills_res_audit, cfg_res_audit = _call_batch(
-                    worker,
-                    [("list_skills", {}), ("list_config", {})],
-                )
-            except Exception:
-                skills_res_audit, cfg_res_audit = None, None
-            mech_gaps, _ = _detect_build_mechanics_and_pitfalls(
-                stats=stats,
-                skills_res=skills_res_audit,
-                items_res=items_res,
-                cfg_res=cfg_res_audit,
-            )
-            health_issues.extend(mech_gaps)
-
             # Run non-destructive de-watering snapshot
             try:
                 stripped, records = dewater_build_with_records(worker, keep=keep)
@@ -2572,6 +3271,19 @@ def audit_build(
             finally:
                 worker.call("import_code", {"code": snap_code, "mode": "replace"})
             restore_check = verify_restored(worker, snap_code, digest_before)
+
+            # 8. Build mechanic & PoB-modeling pitfall checks (uses already-fetched pre-dewater state + stripped flasks)
+            mech_gaps, mech_audit = _detect_build_mechanics_and_pitfalls(
+                stats=stats,
+                skills_res=skills_res_audit,
+                items_res=items_res,
+                cfg_res=cfg_res_audit,
+                warnings=digest_before["warnings"],
+                build_info=info,
+                stripped_flasks=list((stripped or {}).get("flasks") or []),
+            )
+            health_issues.extend(mech_gaps)
+            audit_core_synergies = list(mech_audit.get("coreSynergies") or [])
         finally:
             if hasattr(worker, "last_good_code"):
                 worker.last_good_code = prev_last_good
@@ -2581,6 +3293,7 @@ def audit_build(
         dew_ele = _safe_min_ele_max_hit(dew_stats)
         return {
             "healthIssues": health_issues,
+            "core_synergies": audit_core_synergies,
             "inflationStripped": stripped,
             "waterAttribution": water_attribution,
             "restoreCheck": restore_check,
@@ -4457,6 +5170,7 @@ def diagnose_build(
         pass
 
     trig_aps = _extract_trigger_attack_aps(worker, all_skills_res, items_raw_res, stats_full)
+    stripped_flasks = list(((audit.get("inflationStripped") or {}).get("flasks")) or [])
     diag_mech_gaps, build_mechanics = _detect_build_mechanics_and_pitfalls(
         stats=stats_full,
         skills_res=all_skills_res,
@@ -4466,10 +5180,30 @@ def diagnose_build(
         equipped_slots_raw=items_info.get("equippedSlots") or [],
         alloc_node_stats=alloc_node_stats,
         trigger_attack_aps=trig_aps,
+        warnings=list(summary.get("warnings") or []),
+        build_info=info,
+        stripped_flasks=stripped_flasks,
     )
     dead_sup_gaps, dead_sup_records = _detect_dead_main_supports(worker, mg, stats_full)
     if dead_sup_records:
         build_mechanics["deadSupports"] = dead_sup_records
+
+    core_synergies: list[str] = []
+    _seen_syn_keys: set[str] = set()
+    for _syn in (
+        *(build_mechanics.get("coreSynergies") or []),
+        *(audit.get("core_synergies") or []),
+    ):
+        _s = str(_syn or "").strip()
+        if not _s:
+            continue
+        _m_tag = re.match(r"^(\[[^\]]+\])", _s)
+        _key = _m_tag.group(1) if _m_tag else _s
+        if _key in _seen_syn_keys:
+            continue
+        _seen_syn_keys.add(_key)
+        core_synergies.append(_s)
+    amulet_7th_link = list(build_mechanics.get("amulet7thLink") or [])
 
     existing_gap_msgs = {str(g.get("message") or "") for g in gaps}
     for mgap in (*diag_mech_gaps, *dead_sup_gaps):
@@ -4561,8 +5295,12 @@ def diagnose_build(
         gem_field = "FullDPS" if primary_key == "FullDPS" else "CombinedDPS"
         try:
             top_nodes = rank_nodes(worker, stat=node_stat, max_dist=5, top=top)
+            if isinstance(top_nodes, dict) and top_nodes.get("error"):
+                rank_errors.append(f"rank_nodes: {top_nodes['error']}")
+                top_nodes = None
         except Exception as exc:  # noqa: BLE001
             rank_errors.append(f"rank_nodes: {exc}")
+            top_nodes = None
         try:
             if mg and (mg.get("gems") or []):
                 top_gems = rank_gems(
@@ -4576,6 +5314,7 @@ def diagnose_build(
                 )
         except Exception as exc:  # noqa: BLE001
             rank_errors.append(f"rank_gems: {exc}")
+            top_gems = None
 
     hello = getattr(worker, "hello_info", None) or {}
     pob_ver = fact_cards.get("pobVersion")
@@ -4596,15 +5335,52 @@ def diagnose_build(
     if isinstance(worker_rev, int) and not isinstance(worker_rev, bool):
         env["rev"] = worker_rev
 
+    # Extract active Pantheon gods (so Freeze Immune / DoT DR etc. are visible at a glance in diagnose)
+    _PANTHEON_HINTS: dict[str, str] = {
+        "TheBrineKing": "Freeze Immune + Stun Lock Protection",
+        "Arakaali": "Reduced DoT Taken + Chaos DoT Res",
+        "Lunaris": "Phys DR / Move Speed / Avoid Projectiles",
+        "Solaris": "Boss Phys DR + Reduced Crit Damage",
+        "Tukohama": "Stationary Phys DR & Life Regen",
+        "Gruthkul": "Phys DR on Hit + Maim Attackers",
+        "Abberath": "Unaffected by Burning Ground + Faster Ignite Expire",
+        "Shakari": "Immune to Poison + Reduced Chaos Taken",
+        "Ralakesh": "25% Reduced Phys DoT + Bleed/CB Mitigation",
+        "Garukhan": "Reduced Shock Effect + Blind Immunity",
+        "Ryslatha": "Life Flask Charges Over Time",
+        "Yugul": "50% Reduced Reflected Damage + 20% Reduced Curse Effect",
+    }
+    pantheon_info: dict[str, str] = {}
+    _cfg_var_entries: list[dict[str, Any]] = []
+    if isinstance(cfg_res_diag, dict):
+        for _sec in cfg_res_diag.get("sections") or []:
+            if isinstance(_sec, dict):
+                _cfg_var_entries.extend(v for v in (_sec.get("items") or _sec.get("vars") or []) if isinstance(v, dict))
+        _cfg_var_entries.extend(v for v in (cfg_res_diag.get("config") or []) if isinstance(v, dict))
+    for _ci in _cfg_var_entries:
+        _vr = str(_ci.get("var") or "")
+        _vl = str(_ci.get("value") or "").strip()
+        if _vr == "pantheonMajorGod" and _vl and _vl.lower() != "none":
+            pantheon_info["major"] = _vl
+            if _vl in _PANTHEON_HINTS:
+                pantheon_info["majorHint"] = _PANTHEON_HINTS[_vl]
+        elif _vr == "pantheonMinorGod" and _vl and _vl.lower() != "none":
+            pantheon_info["minor"] = _vl
+            if _vl in _PANTHEON_HINTS:
+                pantheon_info["minorHint"] = _PANTHEON_HINTS[_vl]
+
     out_diag: dict[str, Any] = {
         "env": env,
         "buildInfo": info,
         "mainGroup": mg,
+        "amulet_7th_link": amulet_7th_link,
         "keystones": keystone_names,
+        "pantheon": pantheon_info or None,
         "ascendancyNodes": ascendancy_nodes_compact,
         "skillGroups": skill_groups_compact,
         "equippedItems": equipped_items_compact,
         "buildMechanics": build_mechanics,
+        "core_synergies": core_synergies,
         "offence": summary.get("offence"),
         "minionOffence": summary.get("minionOffence"),
         "defence": summary.get("defence"),

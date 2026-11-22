@@ -1182,6 +1182,7 @@ class DaemonManager:
                 add_link=bool(params.get("add_link", False)),
                 field=str(params.get("field") or "CombinedDPS"),
                 top=int(params["top"]) if params.get("top") is not None else 15,
+                include_legacy=bool(params.get("include_legacy", False)),
             )
 
         # Mutator actions
@@ -1310,7 +1311,7 @@ class DaemonManager:
                 w,
                 group_selector=str(params.get("group") or "main"),
                 gem_name=str(params.get("gem") or ""),
-                level=int(params["level"]) if params.get("level") is not None else 20,
+                level=int(params["level"]) if params.get("level") is not None else None,
                 quality=int(params["quality"]) if params.get("quality") is not None else 20,
                 enabled=bool(params.get("enabled", True)),
                 apply=bool(params.get("apply", False)),

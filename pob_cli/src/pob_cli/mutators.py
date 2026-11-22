@@ -8,6 +8,7 @@ import re
 import unicodedata
 from typing import Any, Iterable
 
+from . import game_data as _game_data
 from .analyzer import resolve_skill_group_index, resolve_slot_name
 from .bridge_client import BridgeWorker
 from .errors import CrossGameHallucinationError, DaemonRequestError
@@ -21,6 +22,270 @@ from .guardrails import (
     validate_url,
 )
 from .snapshot import capture_digest, diff_digest, run_mutation
+
+# ---------------------------------------------------------------------------
+# Exceptional / Legacy 3.28+ Gem Level Bounds & CWS Agnostic Guard
+# ---------------------------------------------------------------------------
+
+_EXCEPTIONAL_AWAKENED_KEEP: frozenset[str] = frozenset(
+    {
+        "awakened empower",
+        "awakened enhance",
+        "awakened enlighten",
+    }
+)
+
+_EXCEPTIONAL_GEM_BOUNDS_FALLBACK: dict[str, tuple[int, int]] = {
+    "greater spell echo": (3, 4),
+    "cooldown recovery": (3, 4),
+    "eldritch blasphemy": (3, 4),
+    "hexpass": (3, 4),
+    "hextoad": (3, 4),
+    "congregation": (3, 4),
+    "empower": (3, 4),
+    "enhance": (3, 4),
+    "enlighten": (3, 4),
+    "eclipse": (3, 4),
+    "pyre": (3, 4),
+    "fissure": (3, 4),
+    "gluttony": (3, 4),
+    "hiveborn": (3, 4),
+    "overheat": (3, 4),
+    "pacifism": (3, 4),
+    "bonespire": (3, 4),
+    "communion": (3, 4),
+    "awakened empower": (4, 5),
+    "awakened enhance": (4, 5),
+    "awakened enlighten": (4, 5),
+}
+
+_LOCAL_TW_GEM_ALIASES: dict[str, str] = {
+    "高階施放迴響輔助": "Greater Spell Echo",
+    "高階施放迴響": "Greater Spell Echo",
+    "高阶施放回响辅助": "Greater Spell Echo",
+    "高阶施放回响": "Greater Spell Echo",
+    "冷卻恢復輔助": "Cooldown Recovery",
+    "冷卻恢復": "Cooldown Recovery",
+    "冷却回复辅助": "Cooldown Recovery",
+    "異界詛咒光環輔助": "Eldritch Blasphemy",
+    "異界詛咒光環": "Eldritch Blasphemy",
+    "咒閃輔助": "Hexpass",
+    "咒閃": "Hexpass",
+    "聚眾輔助": "Congregation",
+    "聚眾": "Congregation",
+    "覺醒．賦予輔助": "Awakened Empower",
+    "覺醒·賦予輔助": "Awakened Empower",
+    "覺醒．元素集中輔助": "Awakened Elemental Focus",
+    "覺醒·元素集中": "Awakened Elemental Focus",
+    "覺醒．施放迴響輔助": "Awakened Spell Echo",
+    "覺醒·施放迴響": "Awakened Spell Echo",
+}
+
+_THE_AGNOSTIC_NODE_ID = 19732
+_AGNOSTIC_CWS_ITEM_TOKENS: tuple[str, ...] = (
+    "valyrium",
+    "女武神",
+    "战日",
+    "戰日",
+    "bloodnotch",
+    "血痕",
+    "缺血症",
+    "immutable force",
+    "不变之力",
+    "不變之力",
+    "永恒之力",
+)
+_AGNOSTIC_CWS_SKILL_TOKENS: tuple[str, ...] = (
+    "cast when stunned",
+    "晕眩时施放",
+    "暈眩時施放",
+)
+
+
+def _normalize_gem_key(name: str) -> str:
+    cleaned = strip_pob_escapes(str(name or "")).strip()
+    norm_tw = getattr(_game_data, "normalize_tw_query", None)
+    if callable(norm_tw):
+        try:
+            mapped = norm_tw(cleaned)
+            if isinstance(mapped, str) and mapped.strip():
+                cleaned = mapped.strip()
+        except Exception:
+            pass
+    if cleaned in _LOCAL_TW_GEM_ALIASES:
+        cleaned = _LOCAL_TW_GEM_ALIASES[cleaned]
+    low = cleaned.lower()
+    if low.endswith(" support"):
+        low = low[: -len(" support")].strip()
+    return low
+
+
+def _is_legacy_awakened_gem_safe(name: str) -> bool:
+    fn = getattr(_game_data, "is_legacy_awakened_gem", None)
+    if callable(fn):
+        try:
+            return bool(fn(name))
+        except Exception:
+            pass
+    low = _normalize_gem_key(name)
+    return low.startswith("awakened ") and low not in _EXCEPTIONAL_AWAKENED_KEEP
+
+
+def _get_gem_level_bounds_safe(gem_name: str) -> dict[str, Any]:
+    fn = getattr(_game_data, "get_gem_level_bounds", None)
+    if callable(fn):
+        try:
+            bounds = fn(gem_name)
+            if isinstance(bounds, dict):
+                return bounds
+        except Exception:
+            pass
+    low = _normalize_gem_key(gem_name)
+    if low in _EXCEPTIONAL_GEM_BOUNDS_FALLBACK:
+        nat_max, cor_max = _EXCEPTIONAL_GEM_BOUNDS_FALLBACK[low]
+        return {
+            "name": gem_name,
+            "natural_max_level": nat_max,
+            "corrupted_max_level": cor_max,
+            "is_exceptional": True,
+            "legacy_removed_328": False,
+        }
+    if _is_legacy_awakened_gem_safe(gem_name):
+        return {
+            "name": gem_name,
+            "natural_max_level": 5,
+            "corrupted_max_level": 6,
+            "is_exceptional": False,
+            "legacy_removed_328": True,
+        }
+    return {
+        "name": gem_name,
+        "natural_max_level": 20,
+        "corrupted_max_level": 21,
+        "is_exceptional": False,
+        "legacy_removed_328": False,
+    }
+
+
+def _validate_gem_level(gem_name: str, level: int | None) -> tuple[int | None, list[str]]:
+    """Validate requested gem level against PoE1 3.28+ Exceptional / Legacy bounds.
+
+    Returns `(effective_level, cautions)`. Raises `ValueError` if an Exceptional Support
+    is assigned a level above its corrupted maximum (e.g. Lv.20 on Greater Spell Echo).
+    """
+    bounds = _get_gem_level_bounds_safe(gem_name)
+    nat_max = int(bounds.get("natural_max_level") or 20)
+    corrupt_max = int(bounds.get("corrupted_max_level") or (nat_max + 1))
+    is_exceptional = bool(bounds.get("is_exceptional"))
+    legacy_removed = bool(bounds.get("legacy_removed_328"))
+
+    if is_exceptional and level is not None and int(level) > corrupt_max:
+        raise ValueError(
+            f"Invalid level {level} for Exceptional Support '{gem_name}': "
+            f"max natural level is Lv.{nat_max} (corrupted max Lv.{corrupt_max}). "
+            "PoE1 3.28+ Exceptional supports cannot reach Lv.20."
+        )
+
+    cautions: list[str] = []
+    if legacy_removed:
+        cautions.append(
+            f"[LEGACY 3.28+ REMOVED] '{gem_name}' was drop-disabled in PoE1 3.28 (Mirage); "
+            "unavailable in current leagues."
+        )
+
+    eff_level = nat_max if level is None else int(level)
+    return eff_level, cautions
+
+
+def _merge_cautions(*lists: list[str] | None) -> list[str]:
+    merged: list[str] = []
+    for lst in lists:
+        for item in lst or []:
+            if item and item not in merged:
+                merged.append(item)
+    return merged
+
+
+def _check_agnostic_dealloc_caution(
+    w: BridgeWorker,
+    dealloc_ids: set[int],
+    *,
+    cache: _BatchCache | None = None,
+) -> list[str]:
+    """Warn if deallocating `The Agnostic` (19732) risks bricking a CWS / Valyrium / Bloodnotch loop."""
+    if _THE_AGNOSTIC_NODE_ID not in dealloc_ids:
+        return []
+
+    items_res: dict[str, Any] = {}
+    skills_res: dict[str, Any] = {}
+    try:
+        if cache is not None:
+            items_res = cache.get_items() or {}
+            skills_res = cache.get_skills() or {}
+        else:
+            res_pair = _call_batch(
+                w,
+                [("list_items", {}), ("list_skills", {})],
+                raise_on_error=False,
+            )
+            if len(res_pair) >= 1 and not _is_batch_error(res_pair[0]):
+                items_res = res_pair[0]
+            if len(res_pair) >= 2 and not _is_batch_error(res_pair[1]):
+                skills_res = res_pair[1]
+    except Exception:
+        return []
+
+    has_cws_loop = False
+    slots = items_res.get("slots") or []
+    all_items = items_res.get("items") or []
+    if slots:
+        equipped_ids = {s.get("selItemId") for s in slots if s.get("selItemId")}
+        items_to_scan = [it for it in all_items if it.get("id") in equipped_ids]
+        # Also inspect slot-inline item names if a minimal mock puts item names on slots directly
+        slot_blobs = [
+            strip_pob_escapes(
+                " ".join(str(s.get(k) or "") for k in ("itemName", "title", "titleZh", "name", "nameZh"))
+            ).lower()
+            for s in slots
+        ]
+        if any(tok in blob for blob in slot_blobs for tok in _AGNOSTIC_CWS_ITEM_TOKENS):
+            has_cws_loop = True
+    else:
+        items_to_scan = list(all_items)
+
+    if not has_cws_loop:
+        for it in items_to_scan:
+            blob = strip_pob_escapes(
+                " ".join(str(it.get(k) or "") for k in ("title", "titleZh", "name", "nameZh", "raw"))
+            ).lower()
+            if any(tok in blob for tok in _AGNOSTIC_CWS_ITEM_TOKENS):
+                has_cws_loop = True
+                break
+
+    if not has_cws_loop:
+        for grp in skills_res.get("groups") or []:
+            if not grp.get("enabled", True):
+                continue
+            for gm in grp.get("gems") or []:
+                if not gm.get("enabled", True):
+                    continue
+                blob = strip_pob_escapes(
+                    " ".join(str(gm.get(k) or "") for k in ("name", "nameSpec", "nameZh", "skillId"))
+                ).lower()
+                if any(tok in blob for tok in _AGNOSTIC_CWS_SKILL_TOKENS):
+                    has_cws_loop = True
+                    break
+            if has_cws_loop:
+                break
+
+    if not has_cws_loop:
+        return []
+    return [
+        "[BUILD-BRICK RISK] Deallocating 'The Agnostic' (19732) restores Energy Shield > 0, "
+        "granting inherent 50% Stun Avoidance and raising Valyrium's ES-based Stun Threshold "
+        "— breaking Cast when Stunned / Bloodnotch recovery loops! "
+        "Do NOT unspec The Agnostic even with Blood Magic."
+    ]
 
 # ---------------------------------------------------------------------------
 # Internal batching, text-folding, and per-batch tab-caching helpers
@@ -665,50 +930,79 @@ def _resolve_gem_candidate(w: BridgeWorker, g_idx: int, gem_name: str) -> dict[s
     return None
 
 
+def _extract_explicit_gem_level(entry: str | dict[str, Any]) -> int | None:
+    """Return the explicitly requested gem level from a spec, or None if omitted."""
+    if isinstance(entry, str):
+        raw = entry.strip()
+        parts = raw.rsplit(":", 2)
+        if len(parts) == 3 and parts[1].strip().isdigit() and parts[2].strip().isdigit():
+            return int(parts[1].strip())
+        parts2 = raw.rsplit(":", 1)
+        if len(parts2) == 2 and parts2[1].strip().isdigit():
+            return int(parts2[1].strip())
+        return None
+    if isinstance(entry, dict) and entry.get("level") is not None:
+        return int(entry["level"])
+    return None
+
+
 def _normalize_gem_spec(entry: str | dict[str, Any]) -> dict[str, Any]:
     """Normalize a gem spec (`dict` or `'Name[:level[:quality]]'` string) into a canonical dict."""
     if isinstance(entry, str):
         raw = entry.strip()
         if not raw:
             raise ValueError("Gem specification string cannot be empty.")
-        level = 20
+        explicit_level: int | None = None
         quality = 20
         parts = raw.rsplit(":", 2)
         if len(parts) == 3 and parts[1].strip().isdigit() and parts[2].strip().isdigit():
             name = parts[0].strip()
-            level = int(parts[1].strip())
+            explicit_level = int(parts[1].strip())
             quality = int(parts[2].strip())
         else:
             parts2 = raw.rsplit(":", 1)
             if len(parts2) == 2 and parts2[1].strip().isdigit():
                 name = parts2[0].strip()
-                level = int(parts2[1].strip())
+                explicit_level = int(parts2[1].strip())
             else:
                 name = raw
         if not name:
             raise ValueError(f"Invalid gem specification '{entry}'.")
-        return {
+        eff_level, cautions = _validate_gem_level(name, explicit_level)
+        out: dict[str, Any] = {
             "name": name,
             "gemId": None,
-            "level": level,
+            "level": eff_level if eff_level is not None else 20,
             "quality": quality,
             "enabled": True,
             "count": 1,
         }
+        if cautions:
+            out["cautions"] = cautions
+        return out
 
     if isinstance(entry, dict):
         name = str(entry.get("name") or entry.get("nameSpec") or entry.get("gem") or "").strip()
         gem_id = entry.get("gemId")
         if not name and not gem_id:
             raise ValueError("Gem spec dict must include 'name', 'nameSpec', 'gem', or 'gemId'.")
-        return {
+        explicit_level = int(entry["level"]) if entry.get("level") is not None else None
+        if name:
+            eff_level, cautions = _validate_gem_level(name, explicit_level)
+        else:
+            eff_level = explicit_level if explicit_level is not None else 20
+            cautions = []
+        out = {
             "name": name,
             "gemId": str(gem_id) if gem_id else None,
-            "level": int(entry["level"]) if entry.get("level") is not None else 20,
+            "level": eff_level if eff_level is not None else 20,
             "quality": int(entry["quality"]) if entry.get("quality") is not None else 20,
             "enabled": bool(entry.get("enabled", True)),
             "count": int(entry["count"]) if entry.get("count") is not None else 1,
         }
+        if cautions:
+            out["cautions"] = cautions
+        return out
 
     raise ValueError(f"Unsupported gem spec type: {type(entry).__name__}")
 
@@ -939,9 +1233,20 @@ def _apply_add_group_in_place(
         w.call("set_group", group_updates)
 
     added_gems: list[dict[str, Any]] = []
+    cautions: list[str] = []
     if gems:
+        explicit_levels = [_extract_explicit_gem_level(g) for g in gems]
         norm_specs = [_normalize_gem_spec(g) for g in gems]
+        for sp in norm_specs:
+            cautions = _merge_cautions(cautions, sp.get("cautions"))
         resolved_specs = _resolve_gem_specs_batch(w, g_idx, norm_specs)
+        for sp, exp_lv in zip(resolved_specs, explicit_levels):
+            r_name = str(sp.get("name") or "").strip()
+            if r_name:
+                eff_lv, lv_cautions = _validate_gem_level(r_name, exp_lv)
+                if eff_lv is not None:
+                    sp["level"] = eff_lv
+                cautions = _merge_cautions(cautions, lv_cautions)
         add_calls = [("add_gem", _build_add_gem_params(g_idx, sp)) for sp in resolved_specs]
         gem_results = _call_batch(w, add_calls)
         added_gems = _apply_vaal_defaults_batch(w, g_idx, resolved_specs, gem_results)
@@ -952,7 +1257,7 @@ def _apply_add_group_in_place(
     if cache is not None:
         cache.invalidate("skills")
 
-    return {
+    detail: dict[str, Any] = {
         "groupIndex": g_idx,
         "label": str(label) if label is not None else "",
         "slot": resolved_slot,
@@ -961,6 +1266,9 @@ def _apply_add_group_in_place(
         "makeMain": bool(make_main),
         "gemsAdded": added_gems,
     }
+    if cautions:
+        detail["cautions"] = cautions
+    return detail
 
 
 def add_skill_group(
@@ -975,6 +1283,10 @@ def add_skill_group(
     apply: bool = False,
 ) -> dict[str, Any]:
     """Create a new skill socket group with optional gems, slot, label, enabled, and FullDPS flag."""
+    if gems:
+        for g in gems:
+            _normalize_gem_spec(g)
+
     def _do_add_group(w: BridgeWorker) -> dict[str, Any]:
         return _apply_add_group_in_place(
             w,
@@ -986,7 +1298,11 @@ def add_skill_group(
             make_main=make_main,
         )
 
-    return run_mutation(worker, _do_add_group, apply=apply)
+    res = run_mutation(worker, _do_add_group, apply=apply)
+    cautions = (res.get("detail") or {}).get("cautions")
+    if cautions:
+        res["cautions"] = list(cautions)
+    return res
 
 
 def _guard_source_skill_group(grp: dict[str, Any], *, action: str) -> None:
@@ -1023,11 +1339,22 @@ def _apply_replace_group_in_place(
 
     if slot is not None and str(slot).strip():
         check_input(str(slot), scope=GuardrailScope.SLOT, expected_game="poe1")
-    norm_specs = [_normalize_gem_spec(g) for g in (gems or [])]
+    raw_gems = list(gems or [])
+    explicit_levels = [_extract_explicit_gem_level(g) for g in raw_gems]
+    norm_specs = [_normalize_gem_spec(g) for g in raw_gems]
+    cautions: list[str] = []
     for sp in norm_specs:
+        cautions = _merge_cautions(cautions, sp.get("cautions"))
         if sp.get("name"):
             check_input(str(sp["name"]), scope=GuardrailScope.GEM_NAME, expected_game="poe1", block_legacy_gems=True)
     resolved_specs = _resolve_gem_specs_batch(w, g_idx, norm_specs)
+    for sp, exp_lv in zip(resolved_specs, explicit_levels):
+        r_name = str(sp.get("name") or "").strip()
+        if r_name:
+            eff_lv, lv_cautions = _validate_gem_level(r_name, exp_lv)
+            if eff_lv is not None:
+                sp["level"] = eff_lv
+            cautions = _merge_cautions(cautions, lv_cautions)
 
     old_gems = list(grp.get("gems", []))
     if old_gems:
@@ -1064,12 +1391,15 @@ def _apply_replace_group_in_place(
     if cache is not None:
         cache.invalidate("skills")
 
-    return {
+    detail: dict[str, Any] = {
         "groupIndex": g_idx,
         "removedCount": len(old_gems),
         "groupUpdates": group_updates,
         "gemsAdded": added_gems,
     }
+    if cautions:
+        detail["cautions"] = cautions
+    return detail
 
 
 def replace_skill_group(
@@ -1085,6 +1415,8 @@ def replace_skill_group(
 ) -> dict[str, Any]:
     """Atomically clear all existing gems in `group` and replace them with `gems` in one call."""
     gem_list = list(gems or [])
+    for g in gem_list:
+        _normalize_gem_spec(g)
 
     def _do_replace(w: BridgeWorker) -> dict[str, Any]:
         return _apply_replace_group_in_place(
@@ -1097,7 +1429,11 @@ def replace_skill_group(
             include_in_full_dps=include_in_full_dps,
         )
 
-    return run_mutation(worker, _do_replace, apply=apply)
+    res = run_mutation(worker, _do_replace, apply=apply)
+    cautions = (res.get("detail") or {}).get("cautions")
+    if cautions:
+        res["cautions"] = list(cautions)
+    return res
 
 
 def modify_skill(
@@ -1115,8 +1451,10 @@ def modify_skill(
     apply: bool = False,
 ) -> dict[str, Any]:
     """Modify a skill group or a specific gem within a skill group."""
+    pre_cautions: list[str] = []
     if new_gem:
         check_input(new_gem, scope=GuardrailScope.GEM_NAME, expected_game="poe1", block_legacy_gems=True)
+        _, pre_cautions = _validate_gem_level(new_gem.strip(), level)
 
     def _do_skill_set(w: BridgeWorker) -> dict[str, Any]:
         skills_res = w.call("list_skills", {})
@@ -1137,18 +1475,31 @@ def modify_skill(
             w.call("set_group", group_updates)
 
         gem_result = None
+        cautions: list[str] = list(pre_cautions)
         if gem_selector is not None:
             target_gem = _resolve_gem_in_group(group, gem_selector)
             gem_params: dict[str, Any] = {"group": g_idx, "index": target_gem["index"]}
             if new_gem:
                 cand = _resolve_gem_candidate(w, g_idx, new_gem)
+                resolved_name = (cand.get("name") if cand else None) or new_gem.strip()
+                eff_level, res_cautions = _validate_gem_level(resolved_name, level)
+                cautions = _merge_cautions(cautions, res_cautions)
                 if cand and cand.get("gemId"):
                     gem_params["gemId"] = cand["gemId"]
-                    gem_params["nameSpec"] = cand.get("name") or new_gem.strip()
+                    gem_params["nameSpec"] = resolved_name
                 else:
                     gem_params["nameSpec"] = new_gem.strip()
-            if level is not None:
-                gem_params["level"] = level
+                if level is not None:
+                    gem_params["level"] = eff_level
+                elif eff_level is not None and eff_level < 20:
+                    # Auto-clamp to Exceptional/Legacy natural max when swapping onto a higher-level gem slot
+                    gem_params["level"] = eff_level
+            else:
+                existing_name = str(target_gem.get("name") or target_gem.get("nameSpec") or "").strip()
+                if level is not None:
+                    eff_level, res_cautions = _validate_gem_level(existing_name, level)
+                    cautions = _merge_cautions(cautions, res_cautions)
+                    gem_params["level"] = eff_level
             if quality is not None:
                 gem_params["quality"] = quality
             if enabled is not None:
@@ -1157,9 +1508,20 @@ def modify_skill(
                 gem_params["count"] = count
             gem_result = w.call("set_gem", gem_params)
 
-        return {"groupIndex": g_idx, "groupUpdates": group_updates, "gemResult": gem_result}
+        detail: dict[str, Any] = {
+            "groupIndex": g_idx,
+            "groupUpdates": group_updates,
+            "gemResult": gem_result,
+        }
+        if cautions:
+            detail["cautions"] = cautions
+        return detail
 
-    return run_mutation(worker, _do_skill_set, apply=apply)
+    res = run_mutation(worker, _do_skill_set, apply=apply)
+    cautions = (res.get("detail") or {}).get("cautions")
+    if cautions:
+        res["cautions"] = list(cautions)
+    return res
 
 
 def add_skill_gem(
@@ -1167,35 +1529,52 @@ def add_skill_gem(
     *,
     group_selector: str,
     gem_name: str,
-    level: int = 20,
+    level: int | None = None,
     quality: int = 20,
     enabled: bool = True,
     apply: bool = False,
 ) -> dict[str, Any]:
     """Add a gem (resolved via `gem_search` if needed) to a skill group."""
     check_input(gem_name, scope=GuardrailScope.GEM_NAME, expected_game="poe1", block_legacy_gems=True)
+    _, pre_cautions = _validate_gem_level(gem_name.strip(), level)
 
     def _do_add(w: BridgeWorker) -> dict[str, Any]:
         skills_res = w.call("list_skills", {})
         g_idx = resolve_skill_group_index(skills_res, group_selector)
         chosen = _resolve_gem_candidate(w, g_idx, gem_name)
+        resolved_name = (chosen.get("name") if chosen else None) or gem_name.strip()
+        eff_level, res_cautions = _validate_gem_level(resolved_name, level)
+        cautions = _merge_cautions(pre_cautions, res_cautions)
+        final_level = eff_level if eff_level is not None else 20
 
         add_params: dict[str, Any] = {
             "group": g_idx,
-            "level": level,
+            "level": final_level,
             "quality": quality,
             "enabled": enabled,
         }
         if chosen and chosen.get("gemId"):
             add_params["gemId"] = chosen["gemId"]
-            add_params["nameSpec"] = chosen.get("name") or gem_name.strip()
+            add_params["nameSpec"] = resolved_name
         else:
             add_params["nameSpec"] = gem_name.strip()
 
-        res = _add_gem_with_default_skill_flags(w, add_params)
-        return {"groupIndex": g_idx, "addedGem": res, "resolvedCandidate": chosen}
+        res_add = _add_gem_with_default_skill_flags(w, add_params)
+        detail: dict[str, Any] = {
+            "groupIndex": g_idx,
+            "addedGem": res_add,
+            "resolvedCandidate": chosen,
+            "effectiveLevel": final_level,
+        }
+        if cautions:
+            detail["cautions"] = cautions
+        return detail
 
-    return run_mutation(worker, _do_add, apply=apply)
+    res = run_mutation(worker, _do_add, apply=apply)
+    cautions = (res.get("detail") or {}).get("cautions")
+    if cautions:
+        res["cautions"] = list(cautions)
+    return res
 
 
 def remove_skill_gem(
@@ -1421,6 +1800,8 @@ def change_tree(
 
         resolved_alloc = [_resolve_node_token(worker, str(tok), nodes_db, dynamic_map) for tok in alloc_tokens]
         resolved_dealloc = [_resolve_node_token(worker, str(tok), nodes_db, dynamic_map) for tok in dealloc_tokens]
+        dealloc_ids = {nid for nid, _ in resolved_dealloc}
+        cautions = _check_agnostic_dealloc_caution(worker, dealloc_ids)
 
         # Capture fast node_info + node_hover preview when operating on a single node (pipelined!)
         single_preview = None
@@ -1455,6 +1836,8 @@ def change_tree(
             }
             if cascade_warning:
                 detail["cascadeWarning"] = cascade_warning
+            if cautions:
+                detail["cautions"] = list(cautions)
             return detail
 
         res = run_mutation(worker, _do_tree_changes, apply=apply)
@@ -1463,7 +1846,13 @@ def change_tree(
         res["pointsDelta"] = detail.get("pointsDelta", 0)
         if detail.get("cascadeWarning"):
             res["cascadeWarning"] = detail["cascadeWarning"]
+        if detail.get("cautions"):
+            res["cautions"] = list(detail["cautions"])
         return res
+
+
+# Alias for callers referencing `modify_tree`
+modify_tree = change_tree
 
 
 # ---------------------------------------------------------------------------
@@ -2798,6 +3187,11 @@ def _execute_batch_ops(
                 if "allowCascade" in op
                 else op.get("allow_cascade", True)
             )
+            tree_cautions = _check_agnostic_dealloc_caution(
+                w,
+                {nid for nid, _ in resolved_dealloc},
+                cache=cache,
+            )
             actions_taken, final_state, orphaned_nodes, points_delta, cascade_warning = _apply_tree_changes_in_place(
                 w,
                 resolved_alloc,
@@ -2816,6 +3210,8 @@ def _execute_batch_ops(
             }
             if cascade_warning:
                 step_entry["cascadeWarning"] = cascade_warning
+            if tree_cautions:
+                step_entry["cautions"] = tree_cautions
             step_results.append(step_entry)
 
         elif kind in ("tree_reset", "reset_tree"):
@@ -2940,14 +3336,15 @@ def _execute_batch_ops(
                 make_main=bool(op.get("makeMain", op.get("make_main", False))),
                 cache=cache,
             )
-            step_results.append(
-                {
-                    "step": idx,
-                    "op": "add_group",
-                    "groupIndex": ag_res["groupIndex"],
-                    "gemsCount": len(ag_res["gemsAdded"]),
-                }
-            )
+            ag_step: dict[str, Any] = {
+                "step": idx,
+                "op": "add_group",
+                "groupIndex": ag_res["groupIndex"],
+                "gemsCount": len(ag_res["gemsAdded"]),
+            }
+            if ag_res.get("cautions"):
+                ag_step["cautions"] = ag_res["cautions"]
+            step_results.append(ag_step)
 
         elif kind in ("delete_group", "rm_group", "remove_group"):
             g_sel = op.get("group") if op.get("group") is not None else op.get("index")
@@ -3005,15 +3402,16 @@ def _execute_batch_ops(
                 include_in_full_dps=bool(full_dps_val) if full_dps_val is not None else None,
                 cache=cache,
             )
-            step_results.append(
-                {
-                    "step": idx,
-                    "op": "replace_group",
-                    "groupIndex": rg_res["groupIndex"],
-                    "removedCount": rg_res["removedCount"],
-                    "gemsCount": len(rg_res["gemsAdded"]),
-                }
-            )
+            rg_step: dict[str, Any] = {
+                "step": idx,
+                "op": "replace_group",
+                "groupIndex": rg_res["groupIndex"],
+                "removedCount": rg_res["removedCount"],
+                "gemsCount": len(rg_res["gemsAdded"]),
+            }
+            if rg_res.get("cautions"):
+                rg_step["cautions"] = rg_res["cautions"]
+            step_results.append(rg_step)
 
         elif kind == "skill":
             skills_res = cache.get_skills()
@@ -3036,26 +3434,32 @@ def _execute_batch_ops(
             if len(grp_updates) > 1:
                 w.call("set_group", grp_updates)
 
+            skill_cautions: list[str] = []
             add_gem_name = op.get("addGem") or op.get("add_gem")
             remove_gem_sel = op.get("removeGem") if "removeGem" in op else op.get("remove_gem")
             if add_gem_name:
                 gem_name = str(add_gem_name).strip()
                 check_input(gem_name, scope=GuardrailScope.GEM_NAME, expected_game="poe1")
-                cand = _resolve_gem_candidate(w, g_idx, gem_name)
                 raw_level = op.get("level")
+                req_level = int(raw_level) if raw_level is not None else None
+                _, pre_c = _validate_gem_level(gem_name, req_level)
+                cand = _resolve_gem_candidate(w, g_idx, gem_name)
+                resolved_name = (cand.get("name") if cand else None) or gem_name
+                eff_lv, res_c = _validate_gem_level(resolved_name, req_level)
+                skill_cautions = _merge_cautions(pre_c, res_c)
                 raw_quality = op.get("quality")
                 raw_enabled = op.get("enabled")
                 raw_count = op.get("count")
                 add_params = {
                     "group": g_idx,
-                    "level": int(raw_level) if raw_level is not None else 20,
+                    "level": eff_lv if eff_lv is not None else 20,
                     "quality": int(raw_quality) if raw_quality is not None else 20,
                     "enabled": bool(raw_enabled) if raw_enabled is not None else True,
                     "count": int(raw_count) if raw_count is not None else 1,
                 }
                 if cand and cand.get("gemId"):
                     add_params["gemId"] = cand["gemId"]
-                    add_params["nameSpec"] = cand.get("name") or gem_name
+                    add_params["nameSpec"] = resolved_name
                 else:
                     add_params["nameSpec"] = gem_name
                 _add_gem_with_default_skill_flags(w, add_params)
@@ -3068,20 +3472,37 @@ def _execute_batch_ops(
                 t_gem = _resolve_gem_in_group(group, op["gem"])
                 gem_params: dict[str, Any] = {"group": g_idx, "index": t_gem["index"]}
                 new_gem_name = op.get("newGem") or op.get("new_gem")
+                req_level = int(op["level"]) if ("level" in op and op["level"] is not None) else None
                 if new_gem_name:
                     check_input(str(new_gem_name), scope=GuardrailScope.GEM_NAME, expected_game="poe1")
+                    _, pre_c = _validate_gem_level(str(new_gem_name).strip(), req_level)
                     cand = _resolve_gem_candidate(w, g_idx, str(new_gem_name))
+                    resolved_name = (cand.get("name") if cand else None) or str(new_gem_name).strip()
+                    eff_lv, res_c = _validate_gem_level(resolved_name, req_level)
+                    skill_cautions = _merge_cautions(pre_c, res_c)
                     if cand and cand.get("gemId"):
                         gem_params["gemId"] = cand["gemId"]
-                        gem_params["nameSpec"] = cand.get("name") or str(new_gem_name).strip()
+                        gem_params["nameSpec"] = resolved_name
                     else:
                         gem_params["nameSpec"] = str(new_gem_name).strip()
-                for k in ("level", "quality", "enabled", "count"):
+                    if req_level is not None:
+                        gem_params["level"] = eff_lv
+                    elif eff_lv is not None and eff_lv < 20:
+                        gem_params["level"] = eff_lv
+                elif req_level is not None:
+                    existing_name = str(t_gem.get("name") or t_gem.get("nameSpec") or "").strip()
+                    eff_lv, res_c = _validate_gem_level(existing_name, req_level)
+                    skill_cautions = _merge_cautions(skill_cautions, res_c)
+                    gem_params["level"] = eff_lv
+                for k in ("quality", "enabled", "count"):
                     if k in op:
                         gem_params[k] = op[k]
                 w.call("set_gem", gem_params)
             cache.invalidate("skills")
-            step_results.append({"step": idx, "op": "skill", "group": g_idx})
+            sk_step: dict[str, Any] = {"step": idx, "op": "skill", "group": g_idx}
+            if skill_cautions:
+                sk_step["cautions"] = skill_cautions
+            step_results.append(sk_step)
 
         else:
             raise ValueError(f"Unsupported batch op type '{raw_kind}' at step {idx}.")
@@ -3093,9 +3514,15 @@ def _normalize_return_sections(return_sections: list[str] | str | None) -> list[
     if not return_sections:
         return []
     if isinstance(return_sections, str):
-        raw_items = [x.strip() for x in return_sections.split(",") if x.strip()]
+        pieces = [x.strip() for x in return_sections.split(",") if x.strip()]
     else:
-        raw_items = [str(x).strip() for x in return_sections if str(x).strip()]
+        pieces = [str(x).strip() for x in return_sections if str(x).strip()]
+    raw_items: list[str] = []
+    for piece in pieces:
+        if ":" not in piece and any(ch.isspace() for ch in piece):
+            raw_items.extend(tok for tok in piece.split() if tok)
+        else:
+            raw_items.append(piece)
     return raw_items
 
 
@@ -3231,6 +3658,9 @@ def run_batch(
             if callable(save_fn):
                 save_fn()
 
+            batch_cautions: list[str] = []
+            for st in step_results:
+                batch_cautions = _merge_cautions(batch_cautions, st.get("cautions"))
             result: dict[str, Any] = {
                 "applied": True,
                 "noUndo": True,
@@ -3248,6 +3678,8 @@ def run_batch(
                 "undoDepth": len(worker.undo_stack),
                 "redoDepth": len(worker.redo_stack),
             }
+            if batch_cautions:
+                result["cautions"] = batch_cautions
             if returns_map is not None:
                 result["returns"] = returns_map
             return result
@@ -3260,9 +3692,18 @@ def run_batch(
         step_results = _execute_batch_ops(w, ops, cache)
         if sections:
             captured_returns = _collect_return_sections(w, sections, keep=keep)
-        return {"steps": step_results}
+        batch_cautions: list[str] = []
+        for st in step_results:
+            batch_cautions = _merge_cautions(batch_cautions, st.get("cautions"))
+        detail: dict[str, Any] = {"steps": step_results}
+        if batch_cautions:
+            detail["cautions"] = batch_cautions
+        return detail
 
     res = run_mutation(worker, _do_batch, apply=apply)
+    cautions = (res.get("detail") or {}).get("cautions")
+    if cautions:
+        res["cautions"] = list(cautions)
     if captured_returns is not None:
         res["returns"] = captured_returns
     return res

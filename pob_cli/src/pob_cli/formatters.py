@@ -1033,11 +1033,26 @@ def format_diagnose_markdown(res: dict[str, Any], *, compact: bool = False) -> s
         f"- **Points**: `{pts.get('used', 0)}/{pts.get('usedMax', 0)}` (Asc `{pts.get('ascUsed', 0)}/{pts.get('ascMax', 0)}`) | "
         f"**Main Skill**: `#{mg.get('index', '-')} {mg_lbl}` (`{mg.get('slot') or '-'}`)"
     )
+    amulet_7l = res.get("amulet_7th_link") or res.get("amulet7thLink") or []
+    amulet_7l_str = ", ".join(strip_pob_escapes(str(x)) for x in amulet_7l if str(x).strip())
+    amulet_7l_suffix = f" + [Amulet 7L: {amulet_7l_str}]" if amulet_7l_str else ""
     if gems_str:
-        lines.append(f"- **Linked Gems**: {gems_str}")
+        lines.append(f"- **Linked Gems**: {gems_str}{amulet_7l_suffix}")
+    elif amulet_7l_str:
+        lines.append(f"- **Linked Gems**: [Amulet 7L: {amulet_7l_str}]")
     ks_list = res.get("keystones") or []
     if ks_list:
         lines.append(f"- **Keystones**: {', '.join(ks_list[:10])}")
+    panth = res.get("pantheon") or {}
+    if isinstance(panth, dict) and (panth.get("major") or panth.get("minor")):
+        p_parts: list[str] = []
+        if panth.get("major"):
+            mh = f" ({panth['majorHint']})" if panth.get("majorHint") else ""
+            p_parts.append(f"Major `{panth['major']}`{mh}")
+        if panth.get("minor"):
+            nh = f" ({panth['minorHint']})" if panth.get("minorHint") else ""
+            p_parts.append(f"Minor `{panth['minor']}`{nh}")
+        lines.append(f"- **Pantheon**: {' | '.join(p_parts)}")
 
     # Allocated Ascendancy & Bloodline Nodes (with stats)
     asc_nodes = res.get("ascendancyNodes") or []
@@ -1124,7 +1139,21 @@ def format_diagnose_markdown(res: dict[str, Any], *, compact: bool = False) -> s
     else:
         lines.append("- No critical resistance, attribute, accuracy, mana, or point gaps detected.")
 
-    # 2b. Build-Specific Mechanics & PoB Modeling Notes (Triggers, 0.033s tick CDR, CwC, Tinctures, Inversion)
+    # 2b. Core Build Synergies & Do-Not-Brick Advisories
+    core_syn = (
+        res.get("core_synergies")
+        or res.get("coreSynergies")
+        or (res.get("buildMechanics") or {}).get("coreSynergies")
+        or []
+    )
+    if core_syn:
+        lines.append("\n#### 2b. Core Build Synergies & Do-Not-Brick Advisories")
+        for syn in core_syn:
+            syn_txt = strip_pob_escapes(str(syn)).strip()
+            if syn_txt:
+                lines.append(f"- {syn_txt}")
+
+    # 2c. Build-Specific Mechanics & PoB Modeling Notes (Triggers, 0.033s tick CDR, CwC, Tinctures, Inversion)
     bm = res.get("buildMechanics") or {}
     has_bm_section = bool(
         isinstance(bm.get("swordOfAges"), dict)
@@ -1133,7 +1162,7 @@ def format_diagnose_markdown(res: dict[str, Any], *, compact: bool = False) -> s
         or isinstance(bm.get("resistanceInversion"), dict)
     )
     if has_bm_section:
-        lines.append("\n#### 2b. Build-Specific Mechanics & PoB Modeling")
+        lines.append("\n#### 2c. Build-Specific Mechanics & PoB Modeling")
         soa = bm.get("swordOfAges")
         if isinstance(soa, dict):
             tm = soa.get("temporalMirageCooldown") or {}
@@ -1265,12 +1294,31 @@ def format_diagnose_markdown(res: dict[str, Any], *, compact: bool = False) -> s
             lines.append(f"> {adv.get('tag', '[POE1-TRAP-WARN]')} `{adv.get('trigger')}`: {adv.get('message')}")
         for gc in gem_cards[: (4 if compact else 8)]:
             zh_p = f" ({gc['zhName']})" if gc.get("zhName") else ""
+            is_sup_card = bool(gc.get("isSupport") or gc.get("is_support"))
             bits: list[str] = []
-            bits.append("Support" if gc.get("isSupport") else "Active")
+            bits.append("Support" if is_sup_card else "Active")
             if gc.get("castTime") is not None:
                 bits.append(f"Cast={gc['castTime']}s")
+            cd_card = _parse_numeric_or_none(gc.get("cooldown"))
+            if cd_card is not None and cd_card > 0:
+                su_raw = gc.get("stored_uses") if gc.get("stored_uses") is not None else gc.get("storedUses")
+                try:
+                    su_int = int(su_raw) if su_raw is not None else 0
+                except (TypeError, ValueError):
+                    su_int = 0
+                cd_lbl = f"CD={cd_card:g}s" + (f" ({su_int} uses)" if su_int > 1 else "")
+                bits.append(cd_lbl)
             if gc.get("tags"):
                 bits.append(f"Tags={gc['tags']}")
+            if gc.get("legacy_removed_328") or gc.get("legacyRemoved328"):
+                bits.append("**[LEGACY REMOVED 3.28+]**")
+            elif gc.get("is_exceptional") or gc.get("isExceptional"):
+                nat_lv = gc.get("natural_max_level") or gc.get("naturalMaxLevel")
+                cor_lv = gc.get("corrupted_max_level") or gc.get("corruptedMaxLevel")
+                if nat_lv is not None and cor_lv is not None:
+                    bits.append(f"[Exceptional | MaxLv {nat_lv}/{cor_lv}]")
+                else:
+                    bits.append("[Exceptional]")
             lv_stats = list((gc.get("lv20Stats") or {}).items())[:4]
             if lv_stats:
                 bits.append("Lv20: " + ", ".join(f"{k}={v}" for k, v in lv_stats))
@@ -1368,3 +1416,324 @@ def format_ground_markdown(res: dict[str, Any]) -> str:
     if elapsed is not None:
         return f"{block}\n_(grounded in {elapsed:.1f}ms)_" if block else f"_(no entities or traps matched; {elapsed:.1f}ms)_"
     return block or "_(no entities or traps matched)_"
+
+
+def format_cautions(res: dict[str, Any] | list[str] | tuple[str, ...] | None) -> list[str]:
+    """Extract and format mutation caution lines (`> [CAUTION] <msg>`) deduplicated in order."""
+    raw_items: list[Any] = []
+    if isinstance(res, (list, tuple)):
+        raw_items.extend(res)
+    elif isinstance(res, dict):
+        if isinstance(res.get("cautions"), (list, tuple)):
+            raw_items.extend(res["cautions"])
+        detail = res.get("detail")
+        if isinstance(detail, dict) and isinstance(detail.get("cautions"), (list, tuple)):
+            raw_items.extend(detail["cautions"])
+        steps = res.get("steps") or (detail.get("steps") if isinstance(detail, dict) else None) or []
+        if isinstance(steps, list):
+            for st in steps:
+                if isinstance(st, dict) and isinstance(st.get("cautions"), (list, tuple)):
+                    raw_items.extend(st["cautions"])
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in raw_items:
+        msg = strip_pob_escapes(str(item or "")).strip()
+        if msg and msg not in seen:
+            seen.add(msg)
+            out.append(f"> [CAUTION] {msg}")
+    return out
+
+
+def format_mutation_report(title: str, res: dict[str, Any], *, target: str | None = None) -> str:
+    """Format mutation results (`tree change`, `skill set`, `skill add`, `batch`, etc.) into Markdown."""
+    stamp = format_recency_stamp(res, slot=target or res.get("targetSlot"))
+    lines = [stamp, f"### {title} — `{res.get('mode', '')}`"]
+    before = res.get("before") or {}
+    after = res.get("after") or {}
+    no_undo = bool(res.get("noUndo")) or (not before and bool(after))
+    p_key = after.get("primaryDpsKey") or before.get("primaryDpsKey") or "CombinedDPS"
+    b_pts = before.get("points") or {}
+    a_pts = after.get("points") or {}
+
+    if no_undo:
+        summary_rows = [
+            [f"Primary DPS ({p_key})", "-", fmt_num(after.get("primaryDps")), "(no-undo)"],
+            ["Effective HP (TotalEHP)", "-", fmt_num(after.get("totalEhp")), "(no-undo)"],
+            ["Maximum Life", "-", fmt_num(after.get("life")), "(no-undo)"],
+            [
+                "Passive Points",
+                "-",
+                f"{a_pts.get('used', 0)}/{a_pts.get('usedMax', 0)} (Asc {a_pts.get('ascUsed', 0)}/{a_pts.get('ascMax', 0)})",
+                "(no-undo)",
+            ],
+        ]
+    else:
+        summary_rows = [
+            [
+                f"Primary DPS ({p_key})",
+                fmt_num(before.get("primaryDps")),
+                fmt_num(after.get("primaryDps")),
+                fmt_delta(before.get("primaryDps"), after.get("primaryDps")),
+            ],
+            [
+                "Effective HP (TotalEHP)",
+                fmt_num(before.get("totalEhp")),
+                fmt_num(after.get("totalEhp")),
+                fmt_delta(before.get("totalEhp"), after.get("totalEhp")),
+            ],
+            [
+                "Maximum Life",
+                fmt_num(before.get("life")),
+                fmt_num(after.get("life")),
+                fmt_delta(before.get("life"), after.get("life")),
+            ],
+            [
+                "Passive Points",
+                f"{b_pts.get('used', 0)}/{b_pts.get('usedMax', 0)} (Asc {b_pts.get('ascUsed', 0)}/{b_pts.get('ascMax', 0)})",
+                f"{a_pts.get('used', 0)}/{a_pts.get('usedMax', 0)} (Asc {a_pts.get('ascUsed', 0)}/{a_pts.get('ascMax', 0)})",
+                fmt_delta(b_pts.get("used", 0), a_pts.get("used", 0), " pts"),
+            ],
+        ]
+    lines.append(render_table(["Headline Metric", "Before", "After", "Delta"], summary_rows))
+
+    diff = res.get("diff") or {}
+    deltas = diff.get("deltas") or []
+    if deltas:
+        lines.append("\n#### Changed Stats")
+        d_rows = [[d["label"], d["beforeStr"], d["afterStr"], d["deltaStr"]] for d in deltas]
+        lines.append(render_table(["Stat", "Before", "After", "Delta"], d_rows))
+    elif no_undo:
+        lines.append("\n_(Before/diff snapshot skipped in `--no-undo` mode)_")
+    else:
+        lines.append("\n_(No stat changes detected)_")
+
+    cascade_warn = res.get("cascadeWarning") or (res.get("detail") or {}).get("cascadeWarning")
+    if cascade_warn:
+        lines.append(f"\n> [WARN] {cascade_warn}")
+
+    caution_lines = format_cautions(res)
+    if caution_lines:
+        lines.append("")
+        lines.extend(caution_lines)
+
+    new_w = diff.get("newWarnings") or []
+    res_w = diff.get("resolvedWarnings") or []
+    if new_w:
+        lines.append("\n#### New Warnings")
+        for w in new_w:
+            lines.append(f"- [NEW WARNING] {w}")
+    if res_w:
+        lines.append("\n#### Resolved Warnings")
+        for w in res_w:
+            lines.append(f"- [RESOLVED] {w}")
+
+    return "\n".join(lines)
+
+
+def format_game_data(res: dict[str, Any], kind: str | None = None, query: str | None = None) -> str:
+    """Format `pob data <gem|unique|mod|base|translate>` local game data results into Markdown."""
+    kind_norm = str(res.get("kind") or kind or "gem").lower()
+    q_disp = str(query if query is not None else (res.get("query") or ""))
+    results = res.get("results") or []
+    lines: list[str] = []
+    for w in res.get("warnings") or []:
+        if isinstance(w, dict):
+            tag = "[POE1-PATCH-WARN]" if w.get("category") == "legacy_patch" else "[POE1-TRAP-WARN]"
+            canon = f" (canonical: {w['canonicalTerm']})" if w.get("canonicalTerm") else ""
+            lines.append(f"> {tag} `{w.get('trigger', '')}`{canon}: {w.get('warning', '')}")
+    alias = res.get("resolvedAlias")
+    alias_note = f" (alias `{alias['from']}` -> `{alias['to']}`)" if isinstance(alias, dict) and alias.get("to") else ""
+    lines.append(
+        f"### Local Game Data (`{kind_norm}`): `{q_disp}`{alias_note} — `{res.get('count', len(results))}` hits "
+        f"(PoB `{res.get('pobVersion')}` / Data `{res.get('dataVersion')}`)"
+    )
+    if not results:
+        lines.append("_(no matches)_")
+        sugs = res.get("suggestions") or []
+        if sugs:
+            s_rows = [
+                [s.get("name") or "-", s.get("zh_name") or "-", f"{float(s.get('score') or 0):.2f}"]
+                for s in sugs
+            ]
+            lines.append("\n#### Did You Mean")
+            lines.append(render_table(["Name (EN)", "Name (ZH)", "Score"], s_rows))
+        if res.get("hint"):
+            lines.append(f"\n> {res['hint']}")
+        return "\n".join(lines)
+
+    if kind_norm == "translate":
+        rows = [[r.get("en"), r.get("zh") or "-", r.get("category") or "-", r.get("match_type") or "-"] for r in results]
+        lines.append(render_table(["English", "Chinese", "Category", "Match"], rows))
+    elif kind_norm == "gem":
+        for r in results:
+            gem_name = r.get("display_name") or r.get("name") or "-"
+            zh_nm = r.get("zh_name") or r.get("zhName")
+            zh_part = f" ({zh_nm})" if zh_nm else ""
+            is_sup = bool(r.get("is_support") or r.get("isSupport"))
+            kind_lbl = "Support" if is_sup else "Active"
+            is_legacy_328 = bool(r.get("legacy_removed_328") or r.get("legacyRemoved328"))
+            is_exceptional = bool(r.get("is_exceptional") or r.get("isExceptional"))
+            badges: list[str] = []
+            if is_legacy_328:
+                badges.append("**[LEGACY REMOVED 3.28+]**")
+            elif r.get("legacyOnly"):
+                badges.append(f"**[LEGACY / REMOVED IN {r.get('removedInPatch') or '3.25'}]**")
+            if is_exceptional:
+                nat_lv = r.get("natural_max_level") if r.get("natural_max_level") is not None else r.get("naturalMaxLevel")
+                cor_lv = r.get("corrupted_max_level") if r.get("corrupted_max_level") is not None else r.get("corruptedMaxLevel")
+                if nat_lv is not None and cor_lv is not None:
+                    badges.append(f"[Exceptional | MaxLv {nat_lv}/{cor_lv}]")
+                else:
+                    badges.append("[Exceptional]")
+            badge_str = (" " + " ".join(badges)) if badges else ""
+            lines.append(f"\n#### {gem_name}{zh_part} — `{r.get('color') or '-'}` {kind_lbl}{badge_str}")
+            if r.get("legacyNote"):
+                lines.append(f"> [POE1-PATCH-WARN] {r['legacyNote']}")
+            elif is_legacy_328:
+                lines.append(
+                    f"> [POE1-PATCH-WARN] '{gem_name}' was drop-disabled in PoE1 3.28 (Mirage) "
+                    "and is unavailable in current leagues."
+                )
+
+            meta_bits: list[str] = []
+            if r.get("tag_string"):
+                meta_bits.append(f"Tags: {r['tag_string']}")
+            if r.get("cast_time") is not None:
+                meta_bits.append(f"Cast: {r['cast_time']}s")
+            cd_val = _parse_numeric_or_none(r.get("cooldown"))
+            if (cd_val is None or cd_val <= 0.0) and isinstance(r.get("levels"), dict):
+                lvls_map = r["levels"]
+                lvl_ref = lvls_map.get("20") or lvls_map.get(20) or (next(iter(lvls_map.values())) if lvls_map else {})
+                if isinstance(lvl_ref, dict):
+                    cd_val = _parse_numeric_or_none(lvl_ref.get("cooldown"))
+            if cd_val is not None and cd_val > 0.0:
+                su_raw = r.get("stored_uses") if r.get("stored_uses") is not None else r.get("storedUses")
+                try:
+                    su_int = int(su_raw) if su_raw is not None else 0
+                except (TypeError, ValueError):
+                    su_int = 0
+                cd_lbl = f"CD: {cd_val:g}s" + (f" ({su_int} uses)" if su_int > 1 else "")
+                meta_bits.append(cd_lbl)
+            if r.get("crit_chance") is not None:
+                meta_bits.append(f"Crit: {r['crit_chance']}%")
+            if r.get("damage_effectiveness") is not None:
+                meta_bits.append(f"DmgEff: {r['damage_effectiveness']}")
+            if r.get("mana_multiplier") is not None:
+                meta_bits.append(f"CostMult: {r['mana_multiplier']}%")
+            if meta_bits:
+                lines.append("- " + " | ".join(meta_bits))
+
+            lvls = r.get("levels") or {}
+            if lvls:
+                lvl_rows = []
+                for lk in sorted(lvls.keys(), key=lambda x: int(x) if str(x).isdigit() else 999):
+                    lv = lvls[lk]
+                    cost_s = ", ".join(f"{k}:{v}" for k, v in (lv.get("cost") or {}).items()) or "-"
+                    stats_s = "; ".join(f"{k}={v}" for k, v in list((lv.get("stats") or {}).items())[:6]) or "-"
+                    lvl_rows.append(
+                        [
+                            f"Lv.{lk}",
+                            lv.get("levelRequirement") if lv.get("levelRequirement") is not None else "-",
+                            cost_s,
+                            lv.get("critChance") if lv.get("critChance") is not None else "-",
+                            lv.get("damageEffectiveness") if lv.get("damageEffectiveness") is not None else "-",
+                            stats_s[:100],
+                        ]
+                    )
+                lines.append(render_table(["Lv", "ReqLv", "Cost", "Crit", "DmgEff", "Key Stats"], lvl_rows))
+
+            q_stats = r.get("quality_stats") or []
+            if q_stats:
+                q_parts = []
+                for q in q_stats[:4]:
+                    pq = q.get("per_quality")
+                    at20 = q.get("at_20_quality")
+                    at40 = q.get("at_40_quality")
+                    lbl = q.get("label")
+                    if lbl:
+                        q_parts.append(f"{lbl} [`{q['stat']}`, {pq}/1%, @20%={at20}, @40%={at40}]")
+                    else:
+                        q_parts.append(f"{q['stat']}={at20} (@20%, {pq}/1%, @40%={at40})")
+                lines.append(f"- **Quality**: {'; '.join(q_parts)}")
+            variants = r.get("variants") or []
+            if variants:
+                v_parts = []
+                for v in variants[:8]:
+                    v_zh = f" ({v['zh_name']})" if v.get("zh_name") else ""
+                    v_parts.append(f"{v.get('name')}{v_zh} [{v.get('relation')}]")
+                lines.append(f"- **Variants**: {', '.join(v_parts)}")
+    elif kind_norm == "unique":
+        for r in results:
+            zh_part = f" ({r['zh_name']})" if r.get("zh_name") else ""
+            base_zh = f" ({r['base_type_zh']})" if r.get("base_type_zh") else ""
+            lines.append(f"\n#### {r.get('name')}{zh_part} — {r.get('base_type')}{base_zh} (`{r.get('item_class')}`)")
+            meta = [x for x in [f"ReqLv {r['req_level']}" if r.get("req_level") else "", r.get("league") or "", r.get("source") or ""] if x]
+            if meta:
+                lines.append("- " + " | ".join(meta))
+            matched_mods = r.get("matched_mods") or []
+            if matched_mods:
+                for mm in matched_mods[:4]:
+                    lines.append(f"- **[Match]** {mm}")
+            for imp, imp_zh in zip(r.get("implicits") or [], (r.get("implicits_zh") or []) + [None] * 10):
+                lines.append(f"- [Implicit] {imp}" + (f" / {imp_zh}" if imp_zh else ""))
+            for exp, exp_zh in zip(r.get("explicits") or [], (r.get("explicits_zh") or []) + [None] * 30):
+                lines.append(f"- {exp}" + (f" / {exp_zh}" if exp_zh else ""))
+            fb_mods = r.get("foulborn_mods") or []
+            if fb_mods:
+                lines.append("- **Foulborn Mutations**:")
+                for fb in fb_mods[:8]:
+                    st_en = "; ".join(fb.get("stats") or [])
+                    st_zh = "; ".join(x for x in (fb.get("stats_zh") or []) if x)
+                    lines.append(f"  - {st_en}" + (f" / {st_zh}" if st_zh else ""))
+    elif kind_norm == "mod":
+        rows = []
+        for r in results:
+            en_s = "; ".join(r.get("stats") or [])
+            zh_s = "; ".join(x for x in (r.get("stats_zh") or []) if x)
+            stat_disp = f"{en_s} / {zh_s}" if zh_s else en_s
+            weights = r.get("weights") or {}
+            bench = r.get("bench_info")
+            if bench:
+                cost = bench.get("cost")
+                cost_s = ", ".join(f"{k}:{v}" for k, v in cost.items()) if isinstance(cost, dict) else str(cost or "")
+                types_s = ",".join((bench.get("types") or [])[:5])
+                w_disp = f"Bench[{types_s}]" + (f" ({cost_s})" if cost_s else "")
+            else:
+                w_disp = ", ".join(f"{k}:{v}" for k, v in list(weights.items())[:5]) or "-"
+            affix_grp = f"{r.get('affix') or '-'} ({r.get('group') or '-'})"
+            rows.append(
+                [
+                    r.get("source") or "-",
+                    r.get("generation_type") or "-",
+                    affix_grp[:40],
+                    r.get("level") if r.get("level") is not None else "-",
+                    stat_disp[:120],
+                    w_disp[:60],
+                ]
+            )
+        lines.append(render_table(["Source", "Type", "Affix (Group)", "iLvl", "Stats", "Weights / Bench"], rows))
+    elif kind_norm == "base":
+        rows = []
+        for r in results:
+            name_disp = f"{r.get('name')} ({r['zh_name']})" if r.get("zh_name") else r.get("name")
+            req = r.get("req") or {}
+            req_s = f"Lv{req.get('level', 0)}/{req.get('str', 0)}/{req.get('dex', 0)}/{req.get('int', 0)}"
+            props = r.get("properties") or {}
+            prop_bits = []
+            for pk, pv in props.items():
+                if isinstance(pv, dict):
+                    prop_bits.append(f"{pk}: " + ",".join(f"{k}={v}" for k, v in list(pv.items())[:4]))
+            imp_s = "; ".join(r.get("implicits") or []) or "-"
+            sub_part = f" ({r['sub_type']})" if r.get("sub_type") else ""
+            rows.append(
+                [
+                    name_disp,
+                    f"{r.get('type') or '-'}{sub_part}",
+                    req_s,
+                    "; ".join(prop_bits)[:60] or "-",
+                    imp_s[:80],
+                ]
+            )
+        lines.append(render_table(["Base", "Class", "Req (Lv/S/D/I)", "Properties", "Implicits"], rows))
+
+    return "\n".join(lines)

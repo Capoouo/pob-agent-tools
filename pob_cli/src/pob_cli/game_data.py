@@ -24,8 +24,507 @@ from typing import Any
 from . import updater as _updater
 from .updater import detect_source_checkout_root, get_runtime_dir
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 9
 _INDEX_BUILD_LOCK = threading.RLock()
+
+_POB_ESCAPE_RE = re.compile(r"\^x[0-9A-Fa-f]{6}|\^\d")
+_ACTIVE_AWAKENED_EXCEPTIONAL_LOWER: frozenset[str] = frozenset(
+    {"awakened empower", "awakened enhance", "awakened enlighten"}
+)
+
+# Built-in offline fallback bounds for PoE1 3.28+ Exceptional supports (nat 3 / corrupt 4;
+# Awakened Empower/Enhance/Enlighten nat 4 / corrupt 5) so offline tests work without SQLite.
+_EXCEPTIONAL_LV3_NAMES: tuple[str, ...] = (
+    "Annihilation",
+    "Bloodsoaked Banner",
+    "Bonespire",
+    "Cast on Ward Break",
+    "Communion",
+    "Companionship",
+    "Congregation",
+    "Cooldown Recovery",
+    "Coursing Current",
+    "Crystalfall",
+    "Cull the Weak",
+    "Divine Sentinel",
+    "Eclipse",
+    "Eldritch Blasphemy",
+    "Empower",
+    "Enhance",
+    "Enlighten",
+    "Fissure",
+    "Foulgrasp",
+    "Frostmage",
+    "Gluttony",
+    "Greater Ancestral Call",
+    "Greater Chain",
+    "Greater Devour",
+    "Greater Fork",
+    "Greater Kinetic Instability",
+    "Greater Multistrike",
+    "Greater Spell Cascade",
+    "Greater Spell Echo",
+    "Greater Unleash",
+    "Hexpass",
+    "Hextoad",
+    "Hiveborn",
+    "Invention",
+    "Invert the Rules",
+    "Lethal Dose",
+    "Machinations",
+    "Overheat",
+    "Overloaded Intensity",
+    "Pacifism",
+    "Pyre",
+    "Scornful Herald",
+    "Transfusion",
+    "Unholy Trinity",
+    "Vaal Sacrifice",
+    "Vaal Temptation",
+    "Void Shockwave",
+    "Voidstorm",
+)
+
+_EXCEPTIONAL_GEM_FALLBACK_BOUNDS: dict[str, dict[str, Any]] = {
+    **{
+        nm.lower(): {
+            "name": nm,
+            "natural_max_level": 3,
+            "corrupted_max_level": 4,
+            "is_exceptional": True,
+            "legacy_removed_328": False,
+        }
+        for nm in _EXCEPTIONAL_LV3_NAMES
+    },
+    "awakened empower": {
+        "name": "Awakened Empower",
+        "natural_max_level": 4,
+        "corrupted_max_level": 5,
+        "is_exceptional": True,
+        "legacy_removed_328": False,
+    },
+    "awakened enhance": {
+        "name": "Awakened Enhance",
+        "natural_max_level": 4,
+        "corrupted_max_level": 5,
+        "is_exceptional": True,
+        "legacy_removed_328": False,
+    },
+    "awakened enlighten": {
+        "name": "Awakened Enlighten",
+        "natural_max_level": 4,
+        "corrupted_max_level": 5,
+        "is_exceptional": True,
+        "legacy_removed_328": False,
+    },
+}
+
+# Traditional Chinese (TW) -> Canonical EN alias map (keys use `·` after dot normalization)
+TW_TO_EN_ALIASES: dict[str, str] = {
+    # Support Gems
+    "高階施放迴響輔助": "Greater Spell Echo",
+    "高階施放迴響": "Greater Spell Echo",
+    "冷卻恢復輔助": "Cooldown Recovery",
+    "冷卻恢復": "Cooldown Recovery",
+    "啟發輔助": "Inspiration",
+    "啟發": "Inspiration",
+    "咒閃輔助": "Hexpass",
+    "咒閃": "Hexpass",
+    "異界詛咒光環輔助": "Eldritch Blasphemy",
+    "異界詛咒光環": "Eldritch Blasphemy",
+    "殘酷輔助": "Cruelty",
+    "殘酷": "Cruelty",
+    "虐待輔助": "Sadism",
+    "虐待": "Sadism",
+    "犧牲輔助": "Immolate",
+    "犧牲": "Immolate",
+    "魔幻輔助": "Archmage",
+    "魔幻": "Archmage",
+    "聚眾輔助": "Congregation",
+    "聚眾": "Congregation",
+    "活栓輔助": "Lifetap",
+    "活栓": "Lifetap",
+    "穿透輔助": "Pierce",
+    "施放迴響輔助": "Spell Echo",
+    "施放迴響": "Spell Echo",
+    "元素集中輔助": "Elemental Focus",
+    "急凍輔助": "Hypothermia",
+    "極速苦痛輔助": "Swift Affliction",
+    "燃燒傷害輔助": "Burning Damage",
+    "致命異常輔助": "Deadly Ailments",
+    "暈眩時施放輔助": "Cast when Stunned",
+    "暈眩時施放": "Cast when Stunned",
+    "永恆祝福輔助": "Eternal Blessing",
+    "永恆祝福": "Eternal Blessing",
+    "持續時間延長輔助": "Increased Duration",
+    "增加暴擊傷害輔助": "Increased Critical Damage",
+    "秘能波動輔助": "Arcane Surge",
+    "投射物返回輔助": "Returning Projectiles",
+    # Active & Transfigured Gems
+    "喚醒幽魂": "Raise Spectre",
+    "咒術枯萎·矛盾": "Hexblast of Contradiction",
+    "怒焰奔騰·燃燒": "Flame Surge of Combusting",
+    "熔炎送葬·火山": "Cremation of the Volcano",
+    "烈炎風暴·猛擲": "Firestorm of Pelting",
+    "屍體爆破·清洗": "Detonate Dead of Scavenging",
+    "石化之血": "Petrified Blood",
+    # Awakened Supports
+    "覺醒·賦予輔助": "Awakened Empower",
+    "覺醒·賦予": "Awakened Empower",
+    "覺醒·增幅輔助": "Awakened Enhance",
+    "覺醒·增幅": "Awakened Enhance",
+    "覺醒·啟蒙輔助": "Awakened Enlighten",
+    "覺醒·啟蒙": "Awakened Enlighten",
+    "覺醒·元素集中輔助": "Awakened Elemental Focus",
+    "覺醒·元素集中": "Awakened Elemental Focus",
+    "覺醒·施放迴響輔助": "Awakened Spell Echo",
+    "覺醒·施放迴響": "Awakened Spell Echo",
+    # Uniques
+    "多里亞尼之型": "Doryani's Prototype",
+    "拒絕命運": "Defiance of Destiny",
+    "缺血症": "Bloodnotch",
+    "不變之力": "Immutable Force",
+    "戰日": "Valyrium",
+    "憎惡控告者": "The Hateful Accuser",
+    "烏爾尼多之誓": "Uul-Netol's Vow",
+    "希比爾之嘆": "Sibyl's Lament",
+    "無盡飢餓": "Unending Hunger",
+    "無限飢餓": "Unending Hunger",
+    "時間之潮": "The Tides of Time",
+    "時光浪潮": "The Tides of Time",
+    "史瓦林": "Svalinn",
+    "銀河星雲": "Nebulis",
+    "烈炎之袍": "Cloak of Flame",
+    "不眨之眼": "The Unblinking Eye",
+    "龍族印記": "Wyrmsign",
+    "三步突擊": "Three-step Assault",
+    "阿茲里聖徽": "Atziri's Foible",
+}
+
+_TW_ALIAS_RE = re.compile(
+    "|".join(re.escape(k) for k in sorted(TW_TO_EN_ALIASES.keys(), key=len, reverse=True))
+)
+
+_TRAD_TO_SIMP_MAP = str.maketrans(
+    {
+        "輔": "辅",
+        "迴": "回",
+        "響": "响",
+        "階": "阶",
+        "卻": "却",
+        "復": "复",
+        "啟": "启",
+        "發": "发",
+        "殘": "残",
+        "犧": "牺",
+        "覺": "觉",
+        "異": "异",
+        "詛": "诅",
+        "靈": "灵",
+        "體": "体",
+        "壓": "压",
+        "連": "连",
+        "結": "结",
+        "點": "点",
+        "暈": "晕",
+        "護": "护",
+        "藥": "药",
+        "劑": "剂",
+        "項": "项",
+        "鍊": "链",
+        "術": "术",
+        "閃": "闪",
+        "電": "电",
+        "氣": "气",
+        "勢": "势",
+        "喚": "唤",
+        "網": "网",
+        "堅": "坚",
+        "淨": "净",
+        "裝": "装",
+        "專": "专",
+        "傷": "伤",
+        "擊": "击",
+        "擴": "扩",
+        "縮": "缩",
+        "範": "范",
+        "圍": "围",
+        "減": "减",
+        "緩": "缓",
+        "凍": "冻",
+        "燒": "烧",
+        "毀": "毁",
+        "滅": "灭",
+        "屍": "尸",
+        "鋼": "钢",
+        "鐵": "铁",
+        "載": "载",
+        "聖": "圣",
+        "龍": "龙",
+        "記": "记",
+        "恆": "恒",
+        "賦": "赋",
+        "餓": "饿",
+        "飢": "饥",
+        "雙": "双",
+        "觸": "触",
+        "數": "数",
+        "層": "层",
+        "強": "强",
+        "廣": "广",
+        "貫": "贯",
+        "動": "动",
+        "戰": "战",
+        "劍": "剑",
+        "飾": "饰",
+        "環": "环",
+        "帶": "带",
+        "寶": "宝",
+        "團": "团",
+        "銳": "锐",
+        "惡": "恶",
+        "懲": "惩",
+        "懺": "忏",
+        "眾": "众",
+        "棄": "弃",
+        "斷": "断",
+        "絕": "绝",
+        "亂": "乱",
+        "災": "灾",
+        "燼": "烬",
+        "甕": "瓮",
+        "籠": "笼",
+        "濾": "滤",
+        "鏡": "镜",
+        "蝕": "蚀",
+        "汙": "污",
+        "穢": "秽",
+        "潔": "洁",
+        "衝": "冲",
+        "鋒": "锋",
+        "躍": "跃",
+        "傳": "传",
+        "遞": "递",
+        "轉": "转",
+        "換": "换",
+        "儲": "储",
+        "備": "备",
+        "補": "补",
+        "償": "偿",
+        "餘": "余",
+        "額": "额",
+        "閾": "阈",
+        "奪": "夺",
+        "竊": "窃",
+        "納": "纳",
+        "殺": "杀",
+        "斬": "斩",
+        "擲": "掷",
+        "彈": "弹",
+        "鏈": "链",
+        "歸": "归",
+        "疊": "叠",
+        "機": "机",
+        "幾": "几",
+        "總": "总",
+        "單": "单",
+        "獨": "独",
+        "實": "实",
+        "際": "际",
+        "顯": "显",
+        "隱": "隐",
+        "奧": "奥",
+        "遊": "游",
+        "蠻": "蛮",
+        "貴": "贵",
+        "衛": "卫",
+        "騎": "骑",
+        "軍": "军",
+        "隊": "队",
+        "營": "营",
+        "陣": "阵",
+        "幫": "帮",
+        "門": "门",
+        "廟": "庙",
+        "壇": "坛",
+        "國": "国",
+        "區": "区",
+        "時": "时",
+        "無": "无",
+        "盡": "尽",
+        "間": "间",
+        "長": "长",
+        "續": "续",
+        "變": "变",
+        "亞": "亚",
+        "爾": "尔",
+        "烏": "乌",
+        "嘆": "叹",
+        "銀": "银",
+        "雲": "云",
+        "極": "极",
+        "進": "进",
+        "開": "开",
+        "關": "关",
+        "質": "质",
+        "論": "论",
+        "風": "风",
+        "飛": "飞",
+        "與": "与",
+        "為": "为",
+        "會": "会",
+        "對": "对",
+        "還": "还",
+        "過": "过",
+        "．": "·",
+    }
+)
+
+
+def is_legacy_awakened_gem(name: str) -> bool:
+    """Return True iff `name` is a legacy Awakened support removed/drop-disabled in PoE1 3.28 (Mirage).
+
+    Only Awakened Empower, Awakened Enhance, and Awakened Enlighten remain active as Exceptional gems.
+    """
+    if not name:
+        return False
+    cleaned = _POB_ESCAPE_RE.sub("", str(name)).strip().lower()
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    cleaned = re.sub(r"\s+support$", "", cleaned).strip()
+    return cleaned.startswith("awakened ") and cleaned not in _ACTIVE_AWAKENED_EXCEPTIONAL_LOWER
+
+
+def normalize_tw_query(text: str) -> str:
+    """Normalize Traditional Chinese (TW) PoE1 gem/unique aliases and common Trad->Simp characters."""
+    if not text:
+        return ""
+    s = str(text)
+    if not _CJK_RE.search(s) and "．" not in s and "・" not in s:
+        return s
+
+    stripped = s.strip()
+    if stripped:
+        dot_norm = stripped.replace("．", "·").replace("・", "·")
+        exact = TW_TO_EN_ALIASES.get(dot_norm)
+        if exact is not None:
+            return exact
+
+    out = s.replace("．", "·").replace("・", "·")
+    if _TW_ALIAS_RE.search(out):
+        parts: list[str] = []
+        last_end = 0
+        prev_was_match_end = -1
+        for m in _TW_ALIAS_RE.finditer(out):
+            start, end = m.span()
+            if start > last_end:
+                parts.append(out[last_end:start])
+            rep = TW_TO_EN_ALIASES[m.group(0)]
+            need_pad_l = (start == prev_was_match_end) or (
+                start > 0 and out[start - 1].isascii() and out[start - 1].isalnum()
+            )
+            need_pad_r = end < len(out) and out[end].isascii() and out[end].isalnum()
+            parts.append((" " if need_pad_l else "") + rep + (" " if need_pad_r else ""))
+            last_end = end
+            prev_was_match_end = end
+        if last_end < len(out):
+            parts.append(out[last_end:])
+        out = "".join(parts)
+
+    return out.translate(_TRAD_TO_SIMP_MAP)
+
+
+def get_gem_level_bounds(name: str, *, db_path: Path | None = None) -> dict[str, Any] | None:
+    """Return level bounds and 3.28+ Exceptional / legacy-Awakened metadata for a PoE1 gem.
+
+    Returns `{"name", "natural_max_level", "corrupted_max_level", "is_exceptional", "legacy_removed_328"}`
+    or `None` if unknown and unavailable in SQLite. Queries local SQLite if present (after TW
+    normalization), with a fast built-in fallback map for Exceptional and legacy Awakened gems.
+    """
+    if not name:
+        return None
+    cleaned = _POB_ESCAPE_RE.sub("", str(name)).strip()
+    if not cleaned:
+        return None
+
+    norm = normalize_tw_query(cleaned).strip()
+    slang_hit = resolve_player_slang(norm)
+    if slang_hit is not None and slang_hit[1] == "gem":
+        norm = slang_hit[0]
+
+    stripped_disp = re.sub(r"\s+support$", "", norm, flags=re.IGNORECASE).strip()
+    norm_low = _fold_search_text(norm)
+    stripped_low = _fold_search_text(stripped_disp)
+
+    resolved_db: Path | None = None
+    if db_path is not None:
+        cand = Path(db_path)
+        if cand.is_file():
+            resolved_db = cand
+    else:
+        try:
+            cand = ensure_gamedata_index()
+            if cand.is_file():
+                resolved_db = cand
+        except (FileNotFoundError, OSError, sqlite3.Error):
+            resolved_db = None
+
+    if resolved_db is not None:
+        try:
+            conn = sqlite3.connect(_sqlite_ro_uri(resolved_db), uri=True)
+            try:
+                row = conn.execute(
+                    """
+                    SELECT data_json FROM gems
+                    WHERE name_lower IN (?, ?) OR display_name_lower IN (?, ?) OR zh_lower IN (?, ?)
+                    ORDER BY is_item_skill ASC
+                    LIMIT 1
+                    """,
+                    (norm_low, stripped_low, norm_low, stripped_low, norm_low, stripped_low),
+                ).fetchone()
+                if row is not None:
+                    obj = json.loads(row[0])
+                    g_name = str(obj.get("name") or stripped_disp)
+                    legacy_328 = (
+                        bool(obj["legacy_removed_328"])
+                        if "legacy_removed_328" in obj
+                        else is_legacy_awakened_gem(g_name)
+                    )
+                    is_exc = (
+                        bool(obj["is_exceptional"])
+                        if "is_exceptional" in obj
+                        else (
+                            "exceptional" in {str(t).lower() for t in (obj.get("tags") or [])}
+                            or _fold_search_text(g_name) in _EXCEPTIONAL_GEM_FALLBACK_BOUNDS
+                        )
+                    )
+                    nat_max = int(obj.get("natural_max_level") or (4 if _fold_search_text(g_name) in _ACTIVE_AWAKENED_EXCEPTIONAL_LOWER else (5 if legacy_328 else (3 if is_exc else 20))))
+                    corrupt_max = int(obj.get("corrupted_max_level") or (nat_max + 1))
+                    return {
+                        "name": g_name,
+                        "natural_max_level": nat_max,
+                        "corrupted_max_level": corrupt_max,
+                        "is_exceptional": is_exc,
+                        "legacy_removed_328": legacy_328,
+                    }
+            finally:
+                conn.close()
+        except (OSError, sqlite3.Error, ValueError):
+            pass
+
+    fallback = _EXCEPTIONAL_GEM_FALLBACK_BOUNDS.get(stripped_low)
+    if fallback is not None:
+        return dict(fallback)
+
+    if is_legacy_awakened_gem(norm):
+        return {
+            "name": stripped_disp,
+            "natural_max_level": 5,
+            "corrupted_max_level": 6,
+            "is_exceptional": False,
+            "legacy_removed_328": True,
+        }
+
+    return None
 
 _FOLD_CHAR_MAP = str.maketrans(
     {
@@ -1234,6 +1733,7 @@ def _compute_skill_level_stats(skill: dict[str, Any], lvl_num: int) -> dict[str,
         "damageEffectiveness": lvl.get("damageEffectiveness"),
         "manaMultiplier": lvl.get("manaMultiplier"),
         "cooldown": lvl.get("cooldown"),
+        "storedUses": lvl.get("storedUses"),
         "cost": cost,
         "stats": resolved_stats,
     }
@@ -1322,7 +1822,28 @@ def _parse_gems_and_skills(poe1_dir: Path, zh: _ZhDictionary) -> list[dict[str, 
             elif "intelligence" in tags_raw:
                 color = "Blue"
 
-        nat_max = int(gem.get("naturalMaxLevel") or 20)
+        name_low_nosup = re.sub(
+            r"\s+support$", "", _POB_ESCAPE_RE.sub("", name).strip().lower()
+        ).strip()
+        legacy_removed_328 = is_legacy_awakened_gem(name)
+        is_exceptional = bool(
+            tags_raw.get("exceptional")
+            or name_low_nosup in _EXCEPTIONAL_GEM_FALLBACK_BOUNDS
+        )
+
+        raw_nat = gem.get("naturalMaxLevel")
+        if raw_nat is not None:
+            nat_max = int(raw_nat)
+        elif name_low_nosup in _ACTIVE_AWAKENED_EXCEPTIONAL_LOWER:
+            nat_max = 4
+        elif legacy_removed_328:
+            nat_max = 5
+        elif is_exceptional:
+            nat_max = 3
+        else:
+            nat_max = 20
+        corrupted_max_level = nat_max + 1
+
         target_levels = sorted({1, nat_max, nat_max + 1, 20, 21})
         levels_out: dict[str, Any] = {}
         for lvl_num in target_levels:
@@ -1336,7 +1857,7 @@ def _parse_gems_and_skills(poe1_dir: Path, zh: _ZhDictionary) -> list[dict[str, 
                         merged_st = dict(sec_lvl.get("stats") or {})
                         merged_st.update(lvl_stats.get("stats") or {})
                         lvl_stats["stats"] = merged_st
-                        for k_aux in ("cooldown", "critChance", "damageEffectiveness", "manaMultiplier", "cost"):
+                        for k_aux in ("cooldown", "storedUses", "critChance", "damageEffectiveness", "manaMultiplier", "cost"):
                             if lvl_stats.get(k_aux) is None and sec_lvl.get(k_aux) is not None:
                                 lvl_stats[k_aux] = sec_lvl[k_aux]
             if lvl_stats is not None:
@@ -1364,7 +1885,16 @@ def _parse_gems_and_skills(poe1_dir: Path, zh: _ZhDictionary) -> list[dict[str, 
                     seen_cs.add(str(cs[0]))
                     constant_stats.append({"stat": cs[0], "value": cs[1]})
 
-        lvl20 = levels_out.get("20") or levels_out.get(str(nat_max)) or levels_out.get("1") or {}
+        lvl20 = levels_out.get(str(nat_max)) or levels_out.get("20") or levels_out.get("1") or {}
+        raw_cd = lvl20.get("cooldown")
+        if raw_cd is None:
+            raw_cd = skill.get("cooldown")
+        cooldown_val = float(raw_cd) if isinstance(raw_cd, (int, float)) else None
+        raw_uses = lvl20.get("storedUses")
+        if raw_uses is None:
+            raw_uses = skill.get("storedUses")
+        stored_uses_val = int(raw_uses) if isinstance(raw_uses, (int, float)) else None
+
         zh_name = zh.translate_gem(name)
         display_name = f"{name} Support" if (is_support and not name.endswith("Support") and ge_id != "SupportBarrage") else name
 
@@ -1382,6 +1912,8 @@ def _parse_gems_and_skills(poe1_dir: Path, zh: _ZhDictionary) -> list[dict[str, 
             "is_vaal": is_vaal,
             "is_transfigured": is_transfigured,
             "is_imbued": is_imbued,
+            "is_exceptional": is_exceptional,
+            "legacy_removed_328": legacy_removed_328,
             "is_item_skill": False,
             "color": color,
             "tag_string": str(gem.get("tagString") or ""),
@@ -1390,8 +1922,11 @@ def _parse_gems_and_skills(poe1_dir: Path, zh: _ZhDictionary) -> list[dict[str, 
             "req_dex": int(gem.get("reqDex") or 0),
             "req_int": int(gem.get("reqInt") or 0),
             "natural_max_level": nat_max,
+            "corrupted_max_level": corrupted_max_level,
             "description": str(skill.get("description") or ""),
             "cast_time": skill.get("castTime"),
+            "cooldown": cooldown_val,
+            "stored_uses": stored_uses_val,
             "crit_chance": lvl20.get("critChance"),
             "damage_effectiveness": lvl20.get("damageEffectiveness"),
             "mana_multiplier": lvl20.get("manaMultiplier"),
@@ -1472,6 +2007,16 @@ def _parse_gems_and_skills(poe1_dir: Path, zh: _ZhDictionary) -> list[dict[str, 
         )
         zh_name = zh.translate_gem(name) or (zh.passives.get(name) if zh.available else None)
 
+        item_nat_max = pick[-1] if pick else 1
+        raw_item_cd = ref_lvl.get("cooldown")
+        if raw_item_cd is None:
+            raw_item_cd = skill.get("cooldown")
+        item_cd_val = float(raw_item_cd) if isinstance(raw_item_cd, (int, float)) else None
+        raw_item_uses = ref_lvl.get("storedUses")
+        if raw_item_uses is None:
+            raw_item_uses = skill.get("storedUses")
+        item_uses_val = int(raw_item_uses) if isinstance(raw_item_uses, (int, float)) else None
+
         rec = {
             "id": f"Skill/{sk_id}",
             "name": name,
@@ -1486,6 +2031,8 @@ def _parse_gems_and_skills(poe1_dir: Path, zh: _ZhDictionary) -> list[dict[str, 
             "is_vaal": False,
             "is_transfigured": False,
             "is_imbued": False,
+            "is_exceptional": False,
+            "legacy_removed_328": False,
             "is_item_skill": True,
             "skill_source": skill_source,
             "color": color,
@@ -1494,9 +2041,12 @@ def _parse_gems_and_skills(poe1_dir: Path, zh: _ZhDictionary) -> list[dict[str, 
             "req_str": 0,
             "req_dex": 0,
             "req_int": 0,
-            "natural_max_level": pick[-1] if pick else 1,
+            "natural_max_level": item_nat_max,
+            "corrupted_max_level": item_nat_max + 1,
             "description": str(skill.get("description") or ""),
             "cast_time": skill.get("castTime"),
+            "cooldown": item_cd_val,
+            "stored_uses": item_uses_val,
             "crit_chance": ref_lvl.get("critChance"),
             "damage_effectiveness": ref_lvl.get("damageEffectiveness"),
             "mana_multiplier": ref_lvl.get("manaMultiplier"),
@@ -2187,6 +2737,10 @@ def _create_schema(conn: sqlite3.Connection) -> None:
             is_vaal INTEGER NOT NULL,
             is_transfigured INTEGER NOT NULL,
             is_imbued INTEGER NOT NULL,
+            is_exceptional INTEGER NOT NULL DEFAULT 0,
+            legacy_removed_328 INTEGER NOT NULL DEFAULT 0,
+            natural_max_level INTEGER NOT NULL DEFAULT 20,
+            corrupted_max_level INTEGER NOT NULL DEFAULT 21,
             is_item_skill INTEGER NOT NULL DEFAULT 0,
             color TEXT,
             tag_string TEXT,
@@ -2494,6 +3048,10 @@ def _write_gamedata_sqlite(
                     int(g["is_vaal"]),
                     int(g["is_transfigured"]),
                     int(g["is_imbued"]),
+                    int(bool(g.get("is_exceptional"))),
+                    int(bool(g.get("legacy_removed_328"))),
+                    int(g.get("natural_max_level") or 20),
+                    int(g.get("corrupted_max_level") or (int(g.get("natural_max_level") or 20) + 1)),
                     int(bool(g.get("is_item_skill"))),
                     g["color"],
                     g["tag_string"],
@@ -2502,7 +3060,7 @@ def _write_gamedata_sqlite(
                 )
             )
         conn.executemany(
-            "INSERT INTO gems VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO gems VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             gem_rows,
         )
         conn.execute("INSERT INTO gems_fts(gems_fts) VALUES('rebuild')")
@@ -2821,6 +3379,8 @@ def _mod_matches_slot(
 
 
 def _query_gems(conn: sqlite3.Connection, q_lower: str, limit: int) -> list[dict[str, Any]]:
+    if q_lower:
+        q_lower = _fold_search_text(normalize_tw_query(q_lower))
     if not q_lower:
         rows = conn.execute("SELECT data_json FROM gems ORDER BY is_item_skill, name LIMIT ?", (limit,)).fetchall()
         return [json.loads(r[0]) for r in rows]
@@ -2932,8 +3492,10 @@ def _query_uniques(
     *,
     mod_filter: str | None = None,
 ) -> list[dict[str, Any]]:
+    if q_lower:
+        q_lower = _fold_search_text(normalize_tw_query(q_lower))
     slot_spec = _normalize_slot_filter(slot) if slot else None
-    mod_lower = _fold_search_text(mod_filter or "").strip()
+    mod_lower = _fold_search_text(normalize_tw_query(mod_filter or "")).strip()
     mod_tokens = [t for t in mod_lower.split() if t] if mod_lower else []
 
     # Build combined search expression for FTS5 candidate narrowing when possible
@@ -3178,6 +3740,8 @@ def _query_mods(
 
 
 def _query_translate(conn: sqlite3.Connection, q_lower: str, limit: int, zh_available: bool) -> list[dict[str, Any]]:
+    if q_lower:
+        q_lower = _fold_search_text(normalize_tw_query(q_lower))
     if not q_lower:
         return []
 
@@ -3820,6 +4384,12 @@ def _format_gem_fact_card(gem_obj: dict[str, Any], *, matched_by: str | None = N
         "color": gem_obj.get("color"),
         "tags": gem_obj.get("tag_string"),
         "castTime": gem_obj.get("cast_time"),
+        "cooldown": gem_obj.get("cooldown"),
+        "storedUses": gem_obj.get("stored_uses"),
+        "isExceptional": bool(gem_obj.get("is_exceptional")),
+        "legacyRemoved328": bool(gem_obj.get("legacy_removed_328")),
+        "naturalMaxLevel": gem_obj.get("natural_max_level"),
+        "corruptedMaxLevel": gem_obj.get("corrupted_max_level"),
         "critChance": gem_obj.get("crit_chance") or lv20.get("critChance"),
         "damageEffectiveness": gem_obj.get("damage_effectiveness") or lv20.get("damageEffectiveness"),
         "manaMultiplier": gem_obj.get("mana_multiplier"),
@@ -3922,7 +4492,8 @@ def lookup_fact_cards_for_build(
         gem_cards: list[dict[str, Any]] = []
         seen_gems: set[str] = set()
         for raw_g in gem_names:
-            g_clean = re.sub(r"\s+support$", "", str(raw_g or "").strip(), flags=re.IGNORECASE)
+            g_norm = normalize_tw_query(str(raw_g or "").strip())
+            g_clean = re.sub(r"\s+support$", "", g_norm, flags=re.IGNORECASE)
             if not g_clean:
                 continue
             g_low = _fold_search_text(g_clean)
@@ -3947,7 +4518,7 @@ def lookup_fact_cards_for_build(
         unique_cards: list[dict[str, Any]] = []
         seen_uniques: set[str] = set()
         for raw_u in unique_names:
-            u_clean = str(raw_u or "").strip()
+            u_clean = normalize_tw_query(str(raw_u or "").strip()).strip()
             if not u_clean:
                 continue
             u_low = _fold_search_text(u_clean)
@@ -3990,15 +4561,16 @@ def ground_text_entities(
 
     t0 = time.perf_counter()
     raw = str(text or "").strip()
+    raw_tw = normalize_tw_query(raw) if raw else ""
     limit = max(0, int(limit))
 
-    traps = scan_text_traps(raw)
+    traps = scan_text_traps(raw_tw)
 
     resolved_slang: list[dict[str, str]] = []
-    if raw and limit > 0:
+    if raw_tw and limit > 0:
         # 1. Resolve player slang mentions in text (longest-first, engine-independent)
         for slang in _SLANG_SORTED_KEYS:
-            if slang in raw:
+            if slang in raw_tw:
                 canon_en, kind_hint = PLAYER_SLANG_MAP[slang]
                 resolved_slang.append({"slang": slang, "canonical": canon_en, "kind": kind_hint})
 
@@ -4054,9 +4626,9 @@ def ground_text_entities(
                 # 2. Scan live SQLite gem & unique names (ZH & EN word-bounded)
                 if len(entities) < limit:
                     idx = _get_ground_entity_index(conn, f"{db_path}:{pob_ver}:{data_ver}")
-                    has_cjk = bool(_CJK_RE.search(raw))
-                    text_zh_compact = normalize_zh_compact(raw) if has_cjk else ""
-                    text_en_norm = normalize_guardrail_text(raw)
+                    has_cjk = bool(_CJK_RE.search(raw_tw))
+                    text_zh_compact = normalize_zh_compact(raw_tw) if has_cjk else ""
+                    text_en_norm = normalize_guardrail_text(raw_tw)
                     has_ascii = bool(re.search(r"[a-z]{3,}", text_en_norm))
 
                     matched_refs: list[tuple[str, int, str]] = []  # (kind, rowid, matched_by)
@@ -4628,20 +5200,29 @@ def query_local_data(
         )
 
     q_clean = str(query or "").strip()
+    q_tw = normalize_tw_query(q_clean) if q_clean else ""
     mod_clean = str(mod_filter or "").strip() or None
+    mod_tw = normalize_tw_query(mod_clean) if mod_clean else None
     if mod_clean and kind_norm != "unique":
         raise ValueError("--mod filter is only supported for kind='unique'.")
     if q_clean:
         validate_url(q_clean, expected_game="poe1", cli_subcommand=f"data {kind_norm}")
-    warnings = check_input(q_clean, scope=_guardrail_scope_for_kind(kind_norm), expected_game="poe1") if q_clean else []
-    if mod_clean:
-        warnings.extend(check_input(mod_clean, scope=GuardrailScope.STAT_QUERY, expected_game="poe1"))
+    q_scope = _guardrail_scope_for_kind(kind_norm)
+    warnings = check_input(q_clean, scope=q_scope, expected_game="poe1") if q_clean else []
+    if q_tw and q_tw != q_clean:
+        seen_rids = {w.rule_id for w in warnings}
+        for w_tw in check_input(q_tw, scope=q_scope, expected_game="poe1"):
+            if w_tw.rule_id not in seen_rids:
+                warnings.append(w_tw)
+                seen_rids.add(w_tw.rule_id)
+    if mod_tw:
+        warnings.extend(check_input(mod_tw, scope=GuardrailScope.STAT_QUERY, expected_game="poe1"))
     if slot:
         check_input(slot, scope=GuardrailScope.SLOT, expected_game="poe1")
 
     db_path = ensure_gamedata_index(pob_dir=pob_dir, runtime_dir=runtime_dir)
     limit = max(0, int(limit))
-    q_lower = _fold_search_text(q_clean)
+    q_lower = _fold_search_text(q_tw)
 
     resolved_alias: dict[str, str] | None = None
     suggestions: list[dict[str, Any]] | None = None
@@ -4659,13 +5240,13 @@ def query_local_data(
             ilvl=ilvl,
             limit=limit,
             zh_available=zh_available,
-            mod_filter=mod_clean,
+            mod_filter=mod_tw,
         )
         needs_slang = (not results) or (
             kind_norm == "translate" and not any(r.get("match_type") == "exact" for r in results)
         )
-        if needs_slang and limit > 0 and q_clean:
-            slang_hit = resolve_player_slang(q_clean)
+        if needs_slang and limit > 0 and q_tw:
+            slang_hit = resolve_player_slang(q_tw) or (resolve_player_slang(q_clean) if q_tw != q_clean else None)
             if slang_hit is not None:
                 canon_en, _ = slang_hit
                 slang_res = _dispatch_query(
@@ -4676,17 +5257,17 @@ def query_local_data(
                     ilvl=ilvl,
                     limit=limit,
                     zh_available=zh_available,
-                    mod_filter=mod_clean,
+                    mod_filter=mod_tw,
                 )
                 if slang_res:
                     results = slang_res
                     resolved_alias = {"from": q_clean, "to": canon_en}
-            if not results and not mod_clean:
+            if not results and not mod_tw:
                 suggestions = _suggest_similar(conn, kind_norm, q_lower, limit=5, zh_available=zh_available)
                 hint = _build_zero_result_hint(kind_norm, q_clean, suggestions)
-        elif not results and mod_clean and limit > 0:
+        elif not results and mod_tw and limit > 0:
             # Try player slang expansion on mod_filter if direct match returned 0
-            slang_mod = resolve_player_slang(mod_clean)
+            slang_mod = resolve_player_slang(mod_tw)
             if slang_mod is not None:
                 canon_mod, _ = slang_mod
                 slang_res = _dispatch_query(
@@ -4701,7 +5282,7 @@ def query_local_data(
                 )
                 if slang_res:
                     results = slang_res
-                    resolved_alias = {"from": mod_clean, "to": canon_mod}
+                    resolved_alias = {"from": mod_clean or mod_tw, "to": canon_mod}
         _annotate_legacy_gem_rows(results, kind_norm)
     finally:
         conn.close()
@@ -4758,10 +5339,20 @@ def query_multi(
     if slot:
         check_input(slot, scope=GuardrailScope.SLOT, expected_game="poe1")
     mod_clean = str(mod_filter or "").strip() or None
+    mod_tw = normalize_tw_query(mod_clean) if mod_clean else None
     warnings_by_query: dict[str, list[dict[str, Any]]] = {}
+    q_tw_map: dict[str, str] = {}
     for q_clean in clean_queries:
         validate_url(q_clean, expected_game="poe1", cli_subcommand=f"data {kind_norm}")
+        q_tw = normalize_tw_query(q_clean)
+        q_tw_map[q_clean] = q_tw
         ws = check_input(q_clean, scope=q_scope, expected_game="poe1")
+        if q_tw and q_tw != q_clean:
+            seen_rids = {w.rule_id for w in ws}
+            for w_tw in check_input(q_tw, scope=q_scope, expected_game="poe1"):
+                if w_tw.rule_id not in seen_rids:
+                    ws.append(w_tw)
+                    seen_rids.add(w_tw.rule_id)
         if ws:
             warnings_by_query[q_clean] = [w.to_dict() for w in ws]
 
@@ -4781,7 +5372,8 @@ def query_multi(
         data_ver = meta.get("data_version", "unknown")
         results_by_query: dict[str, dict[str, Any]] = {}
         for q_clean in clean_queries:
-            q_folded = _fold_search_text(q_clean)
+            q_tw = q_tw_map[q_clean]
+            q_folded = _fold_search_text(q_tw)
             res = _dispatch_query(
                 conn,
                 kind_norm,
@@ -4790,7 +5382,7 @@ def query_multi(
                 ilvl=ilvl,
                 limit=limit,
                 zh_available=zh_available,
-                mod_filter=mod_clean,
+                mod_filter=mod_tw,
             )
             resolved_alias: dict[str, str] | None = None
             suggestions: list[dict[str, Any]] | None = None
@@ -4798,8 +5390,8 @@ def query_multi(
             needs_slang_m = (not res) or (
                 kind_norm == "translate" and not any(r.get("match_type") == "exact" for r in res)
             )
-            if needs_slang_m and limit > 0 and q_clean:
-                slang_hit = resolve_player_slang(q_clean)
+            if needs_slang_m and limit > 0 and q_tw:
+                slang_hit = resolve_player_slang(q_tw) or (resolve_player_slang(q_clean) if q_tw != q_clean else None)
                 if slang_hit is not None:
                     canon_en, _ = slang_hit
                     slang_res = _dispatch_query(
@@ -4810,12 +5402,12 @@ def query_multi(
                         ilvl=ilvl,
                         limit=limit,
                         zh_available=zh_available,
-                        mod_filter=mod_clean,
+                        mod_filter=mod_tw,
                     )
                     if slang_res:
                         res = slang_res
                         resolved_alias = {"from": q_clean, "to": canon_en}
-                if not res and not mod_clean:
+                if not res and not mod_tw:
                     suggestions = _suggest_similar(conn, kind_norm, q_folded, limit=5, zh_available=zh_available)
                     hint = _build_zero_result_hint(kind_norm, q_clean, suggestions)
             _annotate_legacy_gem_rows(res, kind_norm)
@@ -5351,8 +5943,9 @@ def query_tree_data(
     resolved_aliases: list[dict[str, str]] = []
     expanded_queries: list[tuple[str, str]] = []  # (folded_primary, folded_alt_or_empty)
     for q in raw_queries:
-        qf = _fold_search_text(q)
-        sl = resolve_player_slang(q)
+        q_tw = normalize_tw_query(q)
+        qf = _fold_search_text(q_tw)
+        sl = resolve_player_slang(q_tw) or resolve_player_slang(q)
         if sl is not None:
             resolved_aliases.append({"from": q, "to": sl[0]})
             expanded_queries.append((qf, _fold_search_text(sl[0])))
@@ -5362,8 +5955,9 @@ def query_tree_data(
     asc_folded = ""
     asc_alt = ""
     if asc_clean:
-        asc_folded = _fold_search_text(asc_clean)
-        sl_a = resolve_player_slang(asc_clean)
+        asc_tw = normalize_tw_query(asc_clean)
+        asc_folded = _fold_search_text(asc_tw)
+        sl_a = resolve_player_slang(asc_tw) or resolve_player_slang(asc_clean)
         if sl_a is not None:
             resolved_aliases.append({"from": asc_clean, "to": sl_a[0]})
             asc_alt = _fold_search_text(sl_a[0])

@@ -1072,7 +1072,8 @@ SAME_NAME_FALSE_FRIENDS_POE1: tuple[FalseFriendRule, ...] = (
         zh_phrases=("辅助宝石", "重复辅助", "六连", "6连", "宝石孔", "不能重复辅助"),
         canonical_term="PoE1 Gear Sockets & Support Gems",
         summary=(
-            "In PoE1, skill sockets/links live on **gear** (up to 6-link), support gems level 1-20 (Awakened 1-5), "
+            "In PoE1, skill sockets/links live on **gear** (up to 6-link), support gems level 1-20 "
+            "(Exceptional Supports Lv1-3 / corrupt 4; only Awakened Empower/Enhance/Enlighten remain at Lv1-4 / corrupt 5 since 3.28), "
             "and **duplicate support gems ARE completely legal across different skill groups** (do NOT apply PoE2's 1-per-character limit)!"
         ),
         poe1_behavior="Gear holds linked sockets (up to 6L); multiple skill groups can each socket their own copy of the same support gem.",
@@ -1566,10 +1567,10 @@ LEGACY_PATCH_TRAPS_POE1: tuple[LegacyPatchTrapRule, ...] = (
         canonical_term="Cast while Channelling (Fixed Interval — CDR has ZERO effect)",
         summary=(
             "**PoE1 Mechanic Rule (`Cast while Channelling` / `吟唱时施放`)**: CwC triggers on a **fixed channelling interval** "
-            "(`0.32s` / `320ms` at Lv20–21; `0.30s` / `300ms` for Awakened Lv5–6) — it is **NOT a Cooldown**! "
+            "(`0.32s` / `320ms` at Lv20–21) — it is **NOT a Cooldown**! "
             "Stacking `Cooldown Recovery Rate (CDR)` has **ZERO effect** on CwC trigger interval (only CwC gem level changes it)."
         ),
-        remediation="Do NOT stack CDR expecting faster CwC triggers; level up CwC / use Awakened CwC (Lv5 = 300ms + stun immunity) instead.",
+        remediation="Do NOT stack CDR expecting faster CwC triggers; level up Cast while Channelling (Lv20–21 = 320ms) instead (regular Awakened CwC was removed/drop-disabled in 3.28).",
         equivalent_command='pob data gem "Cast while Channelling"',
     ),
     # 17. Esh's Visage Low-Life Chaos Bypass Trap
@@ -1587,6 +1588,154 @@ LEGACY_PATCH_TRAPS_POE1: tuple[LegacyPatchTrapRule, ...] = (
         ),
         remediation="For Low-Life Chaos bypass protection, use `Shavronne's Wrappings`, `Solaris Lorica`, `The Ivory Tower` (with unreserved Mana), or `Coruscating Elixir` (100% uptime). Search all via `pob data unique --mod \"Chaos Damage taken does not bypass\"`.",
         equivalent_command='pob data unique --mod "Chaos Damage taken does not bypass"',
+    ),
+    # 18. 3.28 Removed: Regular Awakened Support Gems (ONLY Awakened Empower/Enhance/Enlighten remain)
+    LegacyPatchTrapRule(
+        rule_id="PATCH_328_AWAKENED_REMOVED",
+        patch_version="3.28",
+        scopes=frozenset({S.GEM_NAME, S.DATA_QUERY, S.CALC_QUERY, S.STAT_QUERY}),
+        hard_block_on_mutate=False,
+        en_words=(
+            "awakened added chaos damage",
+            "awakened added cold damage",
+            "awakened added fire damage",
+            "awakened added lightning damage",
+            "awakened ancestral call",
+            "awakened arrow nova",
+            "awakened blasphemy",
+            "awakened brutality",
+            "awakened burning damage",
+            "awakened cast on critical strike",
+            "awakened cast while channelling",
+            "awakened chain",
+            "awakened cold penetration",
+            "awakened controlled destruction",
+            "awakened deadly ailments",
+            "awakened elemental damage with attacks",
+            "awakened elemental focus",
+            "awakened fire penetration",
+            "awakened fork",
+            "awakened generosity",
+            "awakened greater multiple projectiles",
+            "awakened hextouch",
+            "awakened increased area of effect",
+            "awakened lightning penetration",
+            "awakened melee physical damage",
+            "awakened melee splash",
+            "awakened minion damage",
+            "awakened multistrike",
+            "awakened spell cascade",
+            "awakened spell echo",
+            "awakened swift affliction",
+            "awakened unbound ailments",
+            "awakened unleash",
+            "awakened vicious projectiles",
+            "awakened void manipulation",
+            "awakened coc",
+            "awakened cwc",
+            "awakened gmp",
+            "awakened edwa",
+        ),
+        regex=re.compile(
+            r"(?:觉醒|覺醒)\s*[·・.．]?\s*(?!赋予|賦予|增幅|启蒙|啟蒙|六分仪|六分儀|宝石|寶石|辅助|輔助|者|之|的|后|後|了|吗|嗎|被|已|都|和|与|與)[\u4e00-\u9fff]{2,}"
+        ),
+        canonical_term="Exceptional Supports (3.28+) / Only Awakened Empower, Enhance, Enlighten remain",
+        summary=(
+            "**3.28 (Mirage) Removal**: Regular **Awakened Support Gems** (`觉醒辅助`) were **removed/drop-disabled in 3.28** "
+            "(replaced by 3.28+ **Exceptional Supports**, max natural Lv3 / corrupt Lv4). "
+            "**ONLY `Awakened Empower`, `Awakened Enhance`, and `Awakened Enlighten`** (max natural Lv4 / corrupt Lv5) remain obtainable in 3.28–3.30 leagues! "
+            "(Legacy Awakened rows remain in PoB solely for old Standard character imports.)"
+        ),
+        remediation="Use standard Lv20/21 supports or 3.28+ Exceptional supports (e.g. `Greater Spell Echo`, `Greater Multistrike`, `Cooldown Recovery`) instead of removed Awakened supports.",
+        equivalent_command='pob data gem "Greater Spell Echo"',
+    ),
+    # 19. 3.30 Inspiration Support High-Mana Reset Threshold (Lv20: 800 Mana / Lv21: 922 Mana)
+    LegacyPatchTrapRule(
+        rule_id="PATCH_330_INSPIRATION_MANA_RESET",
+        patch_version="3.30",
+        scopes=frozenset({S.GEM_NAME, S.DATA_QUERY, S.CALC_QUERY, S.STAT_QUERY}),
+        hard_block_on_mutate=False,
+        en_words=("inspiration", "inspiration support", "inspiration charge", "inspiration charges"),
+        zh_phrases=("启迪", "启迪辅助", "启迪球", "啟發", "啟發輔助", "启发辅助"),
+        canonical_term="Inspiration Support (Lv20 resets at 800 Mana / Lv21 at 922 Mana)",
+        summary=(
+            "**PoE1 Mechanic Trap (`Inspiration Support` / `启迪` / `啟發`)**: "
+            "`Inspiration` **loses ALL Inspiration Charges** after spending a total of **`800 Mana` at Lv20 (`922 Mana` at Lv21)**! "
+            "On high-mana-cost builds (e.g. Archmage / Indigon / ManaCost >= 400), charges reset every 1–2 casts — "
+            "real average charges and DPS are far below PoB's assumed permanent 5 charges."
+        ),
+        remediation="Check main skill `ManaCost` vs 800 (Lv20) / 922 (Lv21); reduce ManaCost or use Lv21 Inspiration / an alternative multiplier if resetting every 1–2 casts.",
+        equivalent_command='pob data gem "Inspiration"',
+    ),
+    # 20. 3.30 Sadism Support 70% Less Ailment Duration Trap
+    LegacyPatchTrapRule(
+        rule_id="PATCH_330_SADISM_DURATION_TRAP",
+        patch_version="3.30",
+        scopes=frozenset({S.GEM_NAME, S.DATA_QUERY, S.CALC_QUERY, S.STAT_QUERY}),
+        hard_block_on_mutate=False,
+        en_words=("sadism", "sadism support"),
+        zh_phrases=("凌虐", "凌虐辅助", "虐待", "虐待辅助", "虐待輔助", "施虐辅助"),
+        canonical_term="Sadism Support (70% LESS Ailment Duration Trap)",
+        summary=(
+            "**PoE1 DPS Trap (`Sadism Support` / `凌虐` / `虐待`)**: "
+            "`Sadism` makes damaging ailments deal damage faster (`98%` at Lv20) at the cost of **`70% LESS Ailment Duration`**! "
+            "This artificially inflates PoB's Ignite/Bleed/Poison DPS rate while **slashing total damage per ailment (~-70%+)** and breaking uptime whenever you move/dodge."
+        ),
+        remediation="Compare `Total Damage per Ignite` / ailment duration alongside DPS before socketing `Sadism Support`; prefer `Deadly Ailments`, `Swift Affliction`, or `Cruelty` for reliable uptime.",
+        equivalent_command='pob data gem "Sadism"',
+    ),
+    # 21. 3.30 The Agnostic ES=0 Lock Synergy for Valyrium / Bloodnotch / Cast when Stunned (CWS)
+    LegacyPatchTrapRule(
+        rule_id="PATCH_330_AGNOSTIC_CWS_SYNERGY",
+        patch_version="3.30",
+        scopes=frozenset({S.DATA_QUERY, S.CALC_QUERY, S.STAT_QUERY, S.ITEM_RAW, S.GEM_NAME}),
+        hard_block_on_mutate=False,
+        en_words=("the agnostic", "agnostic", "valyrium", "bloodnotch", "cast when stunned", "immutable force"),
+        zh_phrases=("惘信者", "不可知论", "不可知論", "女武神", "战日", "戰日", "血痕", "缺血症", "晕眩时施放", "暈眩時施放", "永恒之力", "不變之力", "不变之力"),
+        canonical_term="The Agnostic ES=0 Lock (CWS / Valyrium / Bloodnotch Core Synergy)",
+        summary=(
+            "**PoE1 Core Synergy (`The Agnostic` / `惘信者` + `Valyrium` / `Bloodnotch` / `Cast when Stunned`)**: "
+            "`The Agnostic` locks **Maximum Energy Shield = 0**, which sets `Valyrium`'s ES-based Stun Threshold to 0 AND "
+            "removes Energy Shield's inherent **50% Stun Avoidance** — essential for `Cast when Stunned` (`CWS`) / `Bloodnotch` + `Immutable Force` loops! "
+            "**Do NOT unspec `The Agnostic` even when using `Blood Magic`** (unspec'ing it restores ES > 0 and bricks the build)."
+        ),
+        remediation="Keep `The Agnostic` allocated (ES = 0) on any `Valyrium` / `Bloodnotch` / `Cast when Stunned` build.",
+    ),
+    # 22. 3.30 Doryani's Prototype Intentional -200% Lightning Res & Lightning DoT Lethality
+    LegacyPatchTrapRule(
+        rule_id="PATCH_330_DORYANI_PROTOTYPE_NEG_RES",
+        patch_version="3.30",
+        scopes=frozenset({S.DATA_QUERY, S.ITEM_RAW, S.CALC_QUERY, S.STAT_QUERY}),
+        hard_block_on_mutate=False,
+        en_words=("doryani's prototype", "doryanis prototype"),
+        zh_phrases=("多里亚尼的试作甲", "多里亚尼的原型", "多里亞尼之型", "多里亚尼之型", "多利亚尼的试作甲", "多利亚尼的原型"),
+        canonical_term="Doryani's Prototype (-200% Lightning Res Intentional; Armour = Hits Only)",
+        summary=(
+            "**PoE1 Core Mechanic (`Doryani's Prototype` / `多里亚尼的试作甲` / `多里亞尼之型`)**: "
+            "Stacking **`-200%` Lightning Resistance** is **INTENTIONAL** (sets nearby enemies' Lightning Resistance within 6m equal to yours for massive DPS). "
+            "Armour mitigates **Lightning Damage from HITS only** — **Lightning Damage over Time (DoT)** (Mana Siphoner, Shaper Beam, Baran runes) "
+            "**bypasses Armour completely and is deadly** unless converted away (e.g. `Divine Flesh`, `Tempered by War`, `Mahuxotl's Machination`, `Eyes of the Greatwolf`, `Avian Twins`)."
+        ),
+        remediation="Do NOT try to cap or fix negative Lightning Resistance on a `Doryani's Prototype` build; instead stack high Armour for Lightning Hits and Lightning-DoT-taken-as-Fire/Chaos/Cold mitigation.",
+        equivalent_command='pob data unique "Doryani\'s Prototype"',
+    ),
+    # 23. 3.30 Chieftain Ramako, Sun's Light Fixed -20% Fire Res vs DoT (Flammability/Exposure/Scorch do NOT stack!)
+    LegacyPatchTrapRule(
+        rule_id="PATCH_330_RAMAKO_FIXED_DOT_RES",
+        patch_version="3.30",
+        scopes=frozenset({S.DATA_QUERY, S.CALC_QUERY, S.STAT_QUERY, S.GEM_NAME}),
+        hard_block_on_mutate=False,
+        en_words=("ramako", "ramako, sun's light", "ramako sun's light"),
+        zh_phrases=("雷默科", "烈阳之光", "烈陽之光", "太阳之光", "太陽之光"),
+        canonical_term="Ramako, Sun's Light (Fixed -20% Enemy Fire Res vs DoT While Stationary)",
+        summary=(
+            "**PoE1 Core Mechanic (`Ramako, Sun's Light` / `雷默科`)**: "
+            "While Stationary, nearby enemies' Fire Resistance against Damage over Time is **SET TO A FIXED `-20%`** — "
+            "`Flammability`, `Elemental Weakness`, Fire Exposure, and Scorch have **ZERO effect** on Fire DoT while Ramako is active! "
+            "Use `Punishment` (increased damage taken on Low Life) or defensive curses instead of `Flammability`."
+        ),
+        remediation="Do NOT swap `Punishment` for `Flammability` on a stationary `Ramako` Chieftain DoT build; `Flammability` cannot lower Fire DoT resistance below Ramako's fixed `-20%`.",
+        equivalent_command='pob data tree "Ramako"',
     ),
 )
 

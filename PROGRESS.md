@@ -1,12 +1,19 @@
 # PROGRESS
 
 ## ACTIVE
-- 目标：合并远端 origin/main (PR #6 README 更新) 并完成 pob-agent-tools v0.5.0 发版准备与推送
-- 已做：[x] 合入 origin/main (2abee10, PR #6 中英 README 润色与 Scoop 清单) 并对齐 v0.5.0 版本号、安装指引、新增命令示例与社区致谢；[x] 更新 pob_cli/__init__.py (0.5.0)、pob.spec hiddenimports、AGENTS.md (v0.5) 及 ci.yml/release.yml 冻结二进制冒烟门禁 (diagnose/ground/data tick)；[x] 通过发版前本地全套门禁：pytest 662 passed、无引擎隔离回归 339 passed、pip wheel 打包与 spec hiddenimports 校验、install.ps1 AST 与 workflow YAML 校验
-- 下一步：[ ] 完成本地 main 分支无损合并与 v0.5.0 tag 打标，向用户确认后推送 origin main 与 v0.5.0 触发 GitHub Actions CI/Release（禁踩：切分支或全仓 git add -A 把 NS曼波过滤/poedb_wiki/builds 等私人未跟踪目录混入发版提交；pob data gem 仅解析主 grantedEffectId 忽略 secondaryGrantedEffectId 导致强辅 CoC 等双段宝石丢 CDR 词条；pob data tree 漏索引 LegionPassives.lua 导致永恒核心天赋漏查；未向用户确认直接执行 git push origin main / v0.5.0）
-- 验证：pytest F:/poe/pob_cli/tests -> 662 passed (ec=0); isolated no-engine pytest -> 339 passed, 1 skipped (ec=0); pip wheel -> pob_cli-0.5.0-py3-none-any.whl (ec=0); install.ps1 AST + YAML/JSON -> OK (ec=0)（2026-11-22 19:13）
+- 目标：完成 pob4agents 3.28–3.30 防幻觉加固、DSH 实机验收及二阶精修
+- 已做：[x] P0/P1/P2 全栈防幻觉与构筑守卫加固（game_data/guardrails/mutators/comparator/analyzer/formatters/cli/daemon + skills/pob/ + 3套新单测）；[x] DSH skill 模式三套真实 Build（H01/H02/H03）验收 3/3 全部 PASS（0 项红线违规，致命幻觉与毁号建议清零）；[x] 二阶精修落地：Ramako 站立固定 -20% DoT 火抗护栏与诊断守卫、Frost Bomb -75% 禁回血非诅咒提示、Raise Spectre 藏身处招灵+Lifetap 说明、diagnose 直出 Pantheon 主次神与效果、batch --return 容忍 PowerShell 空格拆分、SKILL.md 步数纪律收紧（已同步 ~/.agents/skills/pob-poe1 与 dsh-pob-assistant）
+- 下一步：[ ] 检查 H03 plugin 模式复验步数与 Ramako/Frost Bomb 表现，随后确认是否 git commit / push F:/poe 改动
+- 验证：PYTHONPATH=F:\poe\pob_cli\src POB_OFFLINE=1 pytest (883 passed 全量 + 二阶精修后 531/207 passed in 1.86s) + DSH H01/H02/H03 3/3 PASS + 实机 diagnose B1/B3 输出 Pantheon/Ramako/Frost Bomb/Spectre 与 batch --return "skills summary" 全绿（2026-11-22 22:33）
 
 ## LOG
+### 2026-11-22 完成 DSH 3/3 实机验收（H01/H02/H03 全 PASS）并落地二阶精修（Ramako 固定 -20% DoT 抗、Frost Bomb 禁回血、幽魂藏身处施法、diagnose 展示 Pantheon、PowerShell --return 空格容错、SKILL 步数纪律） → pytest 531/207 passed + 实机 smoke 全绿
+### 2026-11-22 Swarm 3 路 + 文档落地 pob4agents 3.28–3.30 防幻觉与构筑守卫全栈加固（退场觉醒过滤/卓越上限硬拦截/台服繁简映射/冷却提取/CWS零盾与多里亚尼等8项诊断守卫/rank-nodes双修/Skill同步） → 全量 pytest 883 passed (1 skipped) + 最终复检 393 passed + 3 套真实 PoB 实机验收全绿
+### 2026-11-22 完成项目改名 pob-agent-tools -> pob4agents（b7df897 + 合并 3dc7128 -> 0035f32），同步重命名 GitHub 仓库为 exilemoulei/pob4agents 并推送 origin/main → PYTHONPATH=F:/poe/pob_cli/src pytest 228 passed (1 skipped) + git push exit 0
+### 2026-11-22 将项目从 pob-agent-tools 重命名为 pob4agents（15 文件 + 旧运行态目录/PATH/缓存平滑兼容）并提交本地 main → PYTHONPATH=F:/poe/pob_cli/src pytest 228 passed (1 skipped) + install.ps1/JSON 校验通过
+### 2026-11-22 完成 PR #5 合并适配（d627bc5）并经确认推送 origin/main，PR #5 已自动 MERGED → pytest 全量通过 + git push origin main exit 0
+### 2026-11-22 本地合并 PR #5（d627bc5，pob item inspect + --bench-craft 交易试算），解决 3 处与 v0.5.0 冲突并补齐 PoE2 跨代护栏、pob.spec 打包项、无引擎容错与 skills/pob 索引 → pytest 全量 682+72 回归全绿（待确认是否推送 origin/main）
+### 2026-11-22 修复无引擎时 pob ground 崩溃（c859d5e）并完成 pob-agent-tools v0.5.0 正式发版（Win/Linux/macOS CI + Release + Scoop 清单全绿） → pytest 662 passed + CI #45018335612 & Release #45018339764 success
 ### 2026-11-22 同步合并 origin/main (2abee10, PR #6 中英双语 README) 并准备 pob-agent-tools v0.5.0 发版（融合通用认知卸载 CLI 原语、反向跨代/补丁防幻觉护栏与跨宿主泛用 skills/pob） → pytest 662 passed + Wheel/AST/YAML/Spec 门禁全绿
 ### 2026-11-22 泛化落地 pob_cli 全流派认知卸载层（diagnose -c/-q、引擎0%死链与Caveat、CoC超速/CwC非冷却/0.033s data tick、低血艾许之面/EB+CI探针、unique --mod、含永恒大点的 data tree、双段宝石合并、rev近因钢印）与 62 行跨宿主通用 SKILL.md → pytest 662 passed + 纯 Skill 模式 G01..G04 新流派盲测 4/4 全绿
 ### 2026-11-22 打通 F:/dsh -> Magpie (opencode-go/deepseek-v4.1-flash)，提取 6 道玩家历史真题 (R01..R06) 拷打验收并经 Neon Swarm 全栈加固（一站式 pob diagnose + 0.033s 帧率器 + 喋血之刃保酊剂 + 0ms 品质台阶检索 + dsh-pob-assistant Markdown/timeless/sum/compare_with） → pytest 650 passed + 二轮真机 6/6 全过（步数 -82%、pwsh 144->0、耗时 -68%）
@@ -15,15 +22,3 @@
 ### 2026-11-21 按用户反馈完成 poedb_wiki 去 AI 味与 60%+ 首屏减法重构（原生 nav-tabs 净颜方案 A + fa-info-circle 悬浮提示 + collapse/details 按需展开 + 极简 5 键 MD 编辑器） → pytest 76 passed (ec=0) + 真机 CN/US 263/263 (100%) 零误差
 ### 2026-11-21 同步落地 PoE1 (pob_cli) 反向跨代防幻觉护栏 guardrails.py 与 test_cross_game_guardrails.py（136 项），拦截 <PathOfBuilding2>、trade2/poe2db/poe.ninja-poe2、PoE2 专属职业/珠宝/精魂/护符/符文/涂灌并精确豁免元素集中/灵盾/愤怒狂灵等合法词条 → 全量隔离 pytest 502 passed (0 failed)
 ### 2026-11-21 重写 v0.4.0 详尽中文主文档 README.md 并新增英文版 README_EN.md（补齐 macOS/Linux 安装、多槽位/pob serve、audit --keep 逐项归因、19-op batch、sweep、timeless 永恒珠宝搜索与退出码契约完整实战示例）
-### 2026-11-21 合入 feat/macos-support 与 PR #2/#3/#4 至 main（d65774b）并发布 pob-agent-tools v0.4.0（Release #44884549831 产出 Windows x64 zip/wheel/sdist + Scoop 820c43a 自动更新；main CI #44884549832 三端 3/3 全绿），在 PR #2/#3/#4 回复架构融合说明与致谢后全部关闭
-### 2026-11-21 推送 feat/macos-support（bb9041f + 8bb3952 POSIX os.kill OverflowError 修复）并通过 GitHub Actions 三端真机 CI（Run #44882210076：Windows-x64 80s、macOS-arm64 154s、Linux-x64 74s 3/3 全绿，覆盖 PR #2/#3/#4 全链路无头 PoB E2E）
-### 2026-11-21 为 pob trade search 新增官方 Weighted Sum（--sum / --search-sort sum / --sort sum / Sum 列提取），并实测 Covens 国际服魔力+暴伤珠宝加权和排序全通 → pytest trade 套件 144 passed (2.84s) + 真机 Covens 3 组加权和搜索全通
-### 2026-11-21 4 波 17 路 Gemini 4 Neon (XHigh) Swarm 完成 PR #2（去水逐项归因/--keep/verify_restored）、PR #3（pob timeless 永恒珠宝无头搜索）、PR #4（errorKind 退出码 1/5 无堆栈）及 origin/main 融合，修复瓦尔 enableGlobal1/2 极性与主技能切换、POSIX stat mtime 并发竞态、count 型配置 true->1 等全部 P0/P1/P2 → 隔离全量 pytest 364 passed (0 failed, 0 skipped) + pob-zh.exe 真机 E2E 全通
-### 2026-11-21 3 路 Carbon 设计+终审 × 3 路 Neon 施工落地 F:/poe/poedb_wiki（Wraeclast Codex 无 script 暗黑攻略组件库、PFM <55ms 编译器、三层双语 [[English]] 消歧、五源适配器、双栏 SSE 热同步 Web Studio 与油猴/Bookmarklet 上传桥接） → pytest 67 passed (2.61s) + 编年史真机 markdown_parse CN/US 401/401 (100%) 零误差
-### 2026-11-21 4 路 Gemini 4 Carbon (High) 并行复审并全量清零 35 项缺陷（1 P0 .build.lock 死循环/抢锁 + 20 P1 + 14 P2，含并行重叠冷启更新检查、TradeRateLimiter 跨进程锁、translate 谚语隔离、tree BFS 邻近排序、source 技能组保护、POSIX headless_runner.lua arg={} 与 CLI 全命令 --compact/--out 对齐） → 隔离全量回归 249 passed (0 failed, 1 skipped)
-### 2026-11-21 Swarm 全栈剖析近 13 份真实 PoB 会话并落地引擎/守护进程/CLI 性能优化（call_batch 流水线、多命名槽位并发、<1ms 死 PID 清理、pob serve、延迟导入、共享 SQLite v5 缓存、19-op batch+sweep、matrix 脱水缓存与并发多查），Principal 复审 14 项 P0/P1/P2 清零 → 隔离全量 pytest 225 passed (0 failed, 1 skipped) + 真机基准 summary 5.4× / tree 14.4× / items 8.1× / matrix(6) 5.1× / CLI 启动 2.3× / 死 PID 1667× 提速
-### 2026-11-21 feat/macos-support（56d79cb）三端真机 CI 全绿（Run #44777911376）：macOS-15 (Apple Silicon)、Linux-x64 均完成原生 LuaJIT 2.1 + lua-utf8.so 编译与真实 pob bootstrap/load/summary/audit/skill add/export-code 回环/matrix/bench/trade/stop 全链路验收，Windows-x64 零回归 → 本地 pytest 186 passed + GitHub Actions 3/3 jobs success
-### 2026-11-21 在 feat/macos-support 分支落地 macOS/Linux 原生 LuaJIT 无头宿主（headless_runner.lua + build_posix_runtime.sh + 平台化 updater/bridge_client/daemon + macOS-14/Ubuntu 真机 E2E CI），复用 MIT bridge.lua 且不破坏 Windows 链路 → 本地 pytest 186 passed (0 failed)
-### 2026-11-20 发布 pob-agent-tools v0.3.0（0b5ffc7，Co-authored-by: ChangMenQAQ），推送 main 与 v0.3.0 tag 触发 CI/Release 流水线，并在 PR #1 回复架构重构说明与致谢后关闭 → 本地 pytest 179 passed (1 skipped) + 零引擎/离线/YAML/Spec 全通
-### 2026-11-20 Clean-Room 重构落地 PR #1 交易与工艺台工作流（pob trade / pob bench）：对齐 PoB 2.68.1 TradeSiteStats.lua 本地 0ms 槽位双语词缀路由、GGG 动态响应头持久化限流、3.30 高保真物品重建与 Harvest 同组冲突校验、ModMaster.lua 主源 + 30KB 级费用叠加层、daemon 单快照批验与 PyInstaller 打包门禁（排除直接合入 17,756 行爬虫脏快照与散文化 AGENTS.md） → pytest 179 passed (1 skipped) + 离线/零引擎/YAML/Spec 门禁全通
-### 2026-11-20 落地 `pob-agent-tools` 打包 CI、tag 发版（PyInstaller `--onedir` + wheel/sdist + 仓内 Scoop bucket `bucket/pob.json`）与 Windows 一键安装 `install.ps1`，修复冻结版守护进程拉起（`pob _daemon`）与运行态目录（`%LOCALAPPDATA%/pob-agent-tools`） → 47 项单测/集成全通 + `install.ps1`/`bucket/pob.json`/YAML 校验全通
