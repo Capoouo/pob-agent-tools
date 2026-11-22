@@ -73,7 +73,7 @@ irm https://raw.githubusercontent.com/exilemoulei/pob-agent-tools/main/install.p
 若访问 GitHub 需要代理：
 
 ```powershell
-$env:POB_PROXY = "http://127.0.0.1:7890"
+$env:POB_PROXY = "your_proxy_here"
 irm https://raw.githubusercontent.com/exilemoulei/pob-agent-tools/main/install.ps1 | iex
 ```
 
