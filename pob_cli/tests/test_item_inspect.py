@@ -56,7 +56,7 @@ def test_crafted_lines_only_match_bench_source() -> None:
 
 
 def test_unique_item_never_reports_craftable_space(monkeypatch) -> None:
-    monkeypatch.setattr(item_inspect, "_load_entries", lambda *args, **kwargs: ([], False))
+    monkeypatch.setattr(item_inspect, "_load_entries", lambda *args, **kwargs: ([], False, frozenset()))
     report = item_inspect.inspect_item("Rarity: UNIQUE\nGold Ring\nItem Level: 80\n", slot="Ring 1")
     assert report["craftEligible"] is False
     assert report["open"] == {"prefix": None, "suffix": None}
@@ -69,7 +69,7 @@ def test_cogwork_ring_capacity_and_scaled_suffix_rolls(monkeypatch) -> None:
         _entry("strength", "Suffix", "Strength", "+(60-79) to Strength"),
         _entry("fire", "Suffix", "FireResistance", "+(40-47)% to Fire Resistance"),
     ]
-    monkeypatch.setattr(item_inspect, "_load_entries", lambda *args, **kwargs: (entries, True))
+    monkeypatch.setattr(item_inspect, "_load_entries", lambda *args, **kwargs: (entries, True, frozenset()))
     raw = "\n".join([
         "Rarity: RARE", "Test Ring", "Cogwork Ring", "Item Level: 85", "Implicits: 3",
         "-1 Prefix Modifier allowed", "+1 Suffix Modifier allowed",
@@ -90,7 +90,7 @@ def test_replacing_suffix_does_not_free_a_prefix(monkeypatch) -> None:
                _entry('mana', 'Prefix', 'Mana', '+50 to maximum Mana'),
                _entry('armour', 'Prefix', 'Armour', '+100 to Armour'),
                _entry('res', 'Suffix', 'FireResistance', '+20% to Fire Resistance', source='Bench')]
-    monkeypatch.setattr(item_inspect, '_load_entries', lambda *a, **k: (entries, True))
+    monkeypatch.setattr(item_inspect, '_load_entries', lambda *a, **k: (entries, True, frozenset()))
     recipe = SimpleNamespace(group='AreaDamage', affix='prefix', level=1)
     monkeypatch.setattr(item_inspect.bench, 'search', lambda *a, **k: [SimpleNamespace(score=1, recipe=recipe)])
     monkeypatch.setattr(item_inspect.bench, 'can_craft_on_item', lambda *a, **k: (True, ''))
@@ -105,7 +105,7 @@ def test_replacing_suffix_does_not_free_a_prefix(monkeypatch) -> None:
 
 @pytest.mark.parametrize('identified', [True, False])
 def test_unidentified_item_has_unknown_capacity(monkeypatch, identified):
-    monkeypatch.setattr(item_inspect, '_load_entries', lambda *a, **k: ([], True))
+    monkeypatch.setattr(item_inspect, '_load_entries', lambda *a, **k: ([], True, frozenset()))
     monkeypatch.setattr(item_inspect.bench, 'search', lambda *a, **k: [])
     raw = 'Rarity: RARE\nTest Ring\nIron Ring\nItem Level: 85\nImplicits: 0\n'
     if not identified:
@@ -125,3 +125,38 @@ def test_inspect_empty_input_is_clean_cli_error(raw):
     assert 'Error:' in result.output
     assert 'Traceback' not in result.output
     assert not isinstance(result.exception, ValueError)
+
+
+def test_merged_line_outside_any_tier_hides_open_slots(monkeypatch) -> None:
+    # Pure ES% and the ES% part of a hybrid display as one summed line; it fits no
+    # single tier, so the item may have a hidden third prefix.
+    entries = [
+        _entry("es", "Prefix", "LocalEnergyShieldPercent", "(80-91)% increased Energy Shield"),
+        _entry("life", "Prefix", "IncreasedLife", "+(90-99) to maximum Life"),
+        _entry("fire", "Suffix", "FireResistance", "+(36-41)% to Fire Resistance"),
+    ]
+    monkeypatch.setattr(item_inspect, "_load_entries", lambda *a, **k: (entries, True, frozenset()))
+    raw = "\n".join(["Rarity: RARE", "Doom Shell", "Vaal Regalia", "Item Level: 86", "Implicits: 0",
+                     "136% increased Energy Shield", "+98 to maximum Life", "+40% to Fire Resistance"])
+    report = item_inspect.inspect_item(raw, slot="Body Armour", wants=("Energy Shield",))
+    assert report["certain"] is False
+    assert report["open"] == {"prefix": None, "suffix": None}
+    assert any("fits no single tier" in w for w in report["dataWarnings"])
+    assert all(s["status"] == "verify_item" for s in report["suggestions"])
+
+
+def test_local_defence_craft_requires_matching_base_defence() -> None:
+    from types import SimpleNamespace
+    armour = SimpleNamespace(id="Master_LocalPhysicalDamageReductionRating_Prefix_30_132",
+                             lines=("+(50-75) to Armour",), text="+(50-75) to Armour")
+    hybrid = SimpleNamespace(id="Master_LocalArmourAndEnergyShield_Prefix_30_154",
+                             lines=("(26-35)% increased Armour and Energy Shield",), text="")
+    global_es = SimpleNamespace(id="Master_EnergyShield_Prefix_50_149",
+                                lines=("+(21-25) to maximum Energy Shield",), text="")
+    es_base = frozenset({"armour", "body_armour", "int_armour", "default"})
+    str_int_base = frozenset({"armour", "shield", "str_int_armour", "str_int_shield"})
+    assert not item_inspect._defence_craft_fits_base(armour, es_base)
+    assert not item_inspect._defence_craft_fits_base(hybrid, es_base)
+    assert item_inspect._defence_craft_fits_base(hybrid, str_int_base)
+    assert item_inspect._defence_craft_fits_base(global_es, frozenset({"ring", "default"}))
+    assert item_inspect._defence_craft_fits_base(armour, frozenset())

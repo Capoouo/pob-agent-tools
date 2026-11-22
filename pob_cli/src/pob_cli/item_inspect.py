@@ -97,7 +97,7 @@ def _bench_slot(
 
 def _load_entries(
     slot: str | None, base_type: str, *, pob_dir: Path | None, runtime_dir: Path | None
-) -> tuple[list[dict[str, Any]], bool]:
+) -> tuple[list[dict[str, Any]], bool, frozenset[str]]:
     db_path = game_data.ensure_gamedata_index(pob_dir=pob_dir, runtime_dir=runtime_dir)
     conn = sqlite3.connect(game_data._sqlite_ro_uri(db_path), uri=True)
     try:
@@ -128,7 +128,37 @@ def _load_entries(
         entry = json.loads(payload)
         if _affix_type(entry):
             out.append(entry)
-    return out, bool(base_row)
+    return out, bool(base_row), frozenset(base_tags)
+
+
+_DEFENCE_ATTRS = (("armour", "str"), ("evasion", "dex"), ("energy shield", "int"))
+_ATTR_PARTS = {"str", "dex", "int"}
+
+
+def _base_defence_attrs(base_tags: frozenset[str]) -> set[str]:
+    """Attributes of an armour base's defence type, e.g. ``str_int_armour`` -> {str, int}."""
+    attrs: set[str] = set()
+    for tag in base_tags:
+        parts = tag.split("_")
+        if len(parts) > 1 and parts[-1] in ("armour", "shield") and set(parts[:-1]) <= _ATTR_PARTS:
+            attrs.update(parts[:-1])
+    return attrs
+
+
+def _defence_craft_fits_base(recipe: Any, base_tags: frozenset[str]) -> bool:
+    """Local defence crafts need the matching defence on the base (no Armour craft on ES bases).
+
+    Bench data only restricts by slot, so derive the necessary condition from the
+    base's ``*_armour``/``*_shield`` tags. Unknown bases are not filtered here;
+    occupancy is already uncertain for them.
+    """
+    if not base_tags or not str(getattr(recipe, "id", "")).startswith("Master_Local"):
+        return True
+    needed = {
+        attr for line in getattr(recipe, "lines", ()) or (getattr(recipe, "text", ""),)
+        for word, attr in _DEFENCE_ATTRS if word in str(line).lower()
+    }
+    return needed <= _base_defence_attrs(base_tags)
 
 
 def _find_attempt(
@@ -218,7 +248,7 @@ def inspect_item(
     target_mods = [m for m in item.mods if m.kind in ("explicit", "crafted", "fractured", "veiled")]
     unsupported = [m.raw for m in target_mods if m.kind == "veiled"]
     matchable = [m for m in target_mods if m.kind in ("explicit", "crafted", "fractured")]
-    entries, base_resolved = _load_entries(bench_slot, item.base_type, pob_dir=pob_dir, runtime_dir=runtime_dir)
+    entries, base_resolved, base_tags = _load_entries(bench_slot, item.base_type, pob_dir=pob_dir, runtime_dir=runtime_dir)
     capacity = {"prefix": 3, "suffix": 3}
     scaled_types: set[str] = set()
     for mod in item.mods:
@@ -237,10 +267,21 @@ def inspect_item(
             affix["matchedTier"] = False
             affix["scaledRoll"] = True
     unmatched = classified["unmatched"] + unsupported
+    # The game merges identical stats from different affixes into one line
+    # (e.g. pure + hybrid "% increased Energy Shield"). Such a line fits no single
+    # tier, so a wording-only match may hide an occupied affix.
+    out_of_range = [
+        affix for affix in classified["affixes"]
+        if not affix["matchedTier"] and not affix.get("scaledRoll")
+    ]
     tier_conflicts = [
         f"{affix['group']} matched only ilvl {min(affix['tierLevels'])}+ tiers above item level {item.item_level}"
         for affix in classified["affixes"]
         if item.item_level and affix["tierLevels"] and min(affix["tierLevels"]) > item.item_level
+    ] + [
+        f"{affix['group']} value fits no single tier ({' / '.join(affix['lines'])}); "
+        "it may combine several affixes"
+        for affix in out_of_range
     ]
     if unsupported or item.unidentified or item.rarity != "RARE" or not base_resolved or tier_conflicts:
         classified["certain"] = False
@@ -262,6 +303,8 @@ def inspect_item(
                 if recipe.group in natural_groups:
                     continue
                 if item.item_level and recipe.level > item.item_level:
+                    continue
+                if not _defence_craft_fits_base(recipe, base_tags):
                     continue
                 allowed, _ = bench.can_craft_on_item(recipe, existing_templates, has_crafted_mod=has_crafted)
                 if not allowed:
