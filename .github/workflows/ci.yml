@@ -33,6 +33,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install "./pob_cli[dev]"
 
+      - name: Run lint & architecture gate (fast + self-test)
+        run: |
+          python pob_cli/scripts/check.py --fast
+          python pob_cli/scripts/check.py --self-test
+
       - name: Run unit tests (offline mode)
         env:
           POB_OFFLINE: "1"
@@ -123,6 +128,11 @@ jobs:
         run: |
           python3 -m pip install --upgrade pip
           pip install "./pob_cli[dev]"
+
+      - name: Run lint & architecture gate (fast + self-test)
+        run: |
+          python3 pob_cli/scripts/check.py --fast
+          python3 pob_cli/scripts/check.py --self-test
 
       - name: Run unit tests (offline mode)
         env:

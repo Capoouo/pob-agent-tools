@@ -142,24 +142,49 @@ def test_release_tools_pack_and_scoop_manifest_update(tmp_path: Path) -> None:
 
 
 def test_lazy_subcommands_listed_in_pyinstaller_hiddenimports() -> None:
+    import pkgutil
+
     from pob_cli.cli import _LAZY_SUBCOMMANDS
 
     spec_path = Path(__file__).resolve().parents[1] / "packaging" / "pob.spec"
     spec_text = spec_path.read_text(encoding="utf-8")
+    uses_collect = 'collect_submodules("pob_cli")' in spec_text or "collect_submodules('pob_cli')" in spec_text
+    discovered = {
+        m.name
+        for m in pkgutil.walk_packages(pob_cli.__path__, prefix="pob_cli.")
+    }
     for cmd_name, (mod_path, _attr, _help) in _LAZY_SUBCOMMANDS.items():
         full_mod = f"pob_cli{mod_path}" if mod_path.startswith(".") else mod_path
-        assert f'"{full_mod}"' in spec_text or f"'{full_mod}'" in spec_text, (
-            f"Lazy subcommand {cmd_name!r} module {full_mod!r} must be listed in pob.spec hiddenimports"
-        )
+        if uses_collect:
+            assert full_mod in discovered, (
+                f"Lazy subcommand {cmd_name!r} module {full_mod!r} not discoverable by collect_submodules('pob_cli')"
+            )
+        else:
+            assert f'"{full_mod}"' in spec_text or f"'{full_mod}'" in spec_text, (
+                f"Lazy subcommand {cmd_name!r} module {full_mod!r} must be listed in pob.spec hiddenimports"
+            )
 
 
 def test_pob_spec_includes_errors_and_timeless_hiddenimports() -> None:
+    import pkgutil
+
     spec_path = Path(__file__).resolve().parents[1] / "packaging" / "pob.spec"
     spec_text = spec_path.read_text(encoding="utf-8")
-    for mod_name in ("pob_cli.errors", "pob_cli.timeless", "pob_cli.cli_timeless"):
-        assert f'"{mod_name}"' in spec_text or f"'{mod_name}'" in spec_text, (
-            f"Required module {mod_name!r} missing from pob.spec hiddenimports"
-        )
+    uses_collect = 'collect_submodules("pob_cli")' in spec_text or "collect_submodules('pob_cli')" in spec_text
+    assert uses_collect, "pob.spec should use collect_submodules('pob_cli') to bundle all modular subpackages"
+    discovered = {
+        m.name
+        for m in pkgutil.walk_packages(pob_cli.__path__, prefix="pob_cli.")
+    }
+    for mod_name in (
+        "pob_cli.errors",
+        "pob_cli.ticks",
+        "pob_cli.timeless",
+        "pob_cli.cli_timeless",
+        "pob_cli.cli_trade",
+        "pob_cli.daemon",
+    ):
+        assert mod_name in discovered, f"Required module {mod_name!r} missing from pob_cli package discovery"
 
 
 def test_cli_timeless_has_zero_cli_trade_or_httpx_imports() -> None:

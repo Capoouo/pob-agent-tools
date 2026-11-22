@@ -10,6 +10,14 @@ class DaemonRequestError(RuntimeError):
     """Raised when the PoB daemon rejects a request due to invalid arguments or build state."""
 
 
+class BootstrapMissingError(RuntimeError):
+    """Raised when no local PoB engine exists and GitHub bootstrap failed or is offline."""
+
+    def __init__(self, message: str, update_status: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.update_status = update_status or {}
+
+
 class CrossGameHallucinationError(DaemonRequestError):
     """Raised when a PoE2-only input/mechanic is sent to `pob` (or a PoE1-only input to `pob2`).
 
@@ -70,7 +78,7 @@ class CrossGameHallucinationError(DaemonRequestError):
         return payload
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any], *, default_game: str = "poe1") -> "CrossGameHallucinationError":
+    def from_dict(cls, data: dict[str, Any], *, default_game: str = "poe1") -> CrossGameHallucinationError:
         game = str(data.get("game") or default_game)
         detected = str(data.get("detectedGame") or ("poe1" if game == "poe2" else "poe2"))
         return cls(
@@ -138,7 +146,7 @@ class LegacyPatchTrapError(DaemonRequestError):
         return payload
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "LegacyPatchTrapError":
+    def from_dict(cls, data: dict[str, Any]) -> LegacyPatchTrapError:
         return cls(
             trigger=str(data.get("trigger") or ""),
             patch_version=str(data.get("patchVersion") or "3.25"),
@@ -182,7 +190,7 @@ class HallucinationWarning:
         return out
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any], *, default_game: str = "poe1") -> "HallucinationWarning":
+    def from_dict(cls, data: dict[str, Any], *, default_game: str = "poe1") -> HallucinationWarning:
         return cls(
             rule_id=str(data.get("ruleId") or ""),
             game=str(data.get("game") or default_game),

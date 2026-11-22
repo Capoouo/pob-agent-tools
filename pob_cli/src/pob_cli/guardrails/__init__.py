@@ -1,0 +1,93 @@
+"""Reverse PoE2 -> PoE1 cross-game isolation and anti-hallucination guardrails (`pob_cli`)."""
+
+from __future__ import annotations
+
+from .build_gate import (
+    POE1_ONLY_CLASSES,
+    POE2_ONLY_CLASSES,
+    URL_GATE_RULES,
+    UrlGateRule,
+    validate_build_xml,
+    validate_engine_root,
+    validate_url,
+)
+from .rules_false_friends import SAME_NAME_FALSE_FRIENDS_POE1, FalseFriendRule
+from .rules_legacy import LEGACY_PATCH_TRAPS_POE1, LegacyPatchTrapRule
+from .rules_poe2 import (
+    POE2_ONLY_ASCENDANCIES_EN,
+    POE2_ONLY_ASCENDANCIES_ZH,
+    POE2_ONLY_CLASSES_EN,
+    POE2_ONLY_CLASSES_ZH,
+    POE2_ONLY_REVERSE_TRAPS_FOR_POB1,
+    POE2_ONLY_TIMELESS_JEWELS_EN,
+    POE2_ONLY_TIMELESS_JEWELS_ZH,
+    TrapRule,
+)
+from .scanner import (
+    check_input,
+    check_input_item_raw,
+    check_poe2_class_or_ascendancy,
+    check_poe2_timeless_jewel,
+    scan_text_traps,
+)
+from .warnings import (
+    ALL_QUERY_SCOPES,
+    EQUIPMENT_SLOT_ALIASES,
+    GAME_ID,
+    GuardrailScope,
+    S,
+    emit_stderr_warnings_from_dicts,
+    extract_scannable_item_parts,
+    get_active_warning_dicts,
+    get_active_warnings,
+    match_phrase_zh,
+    match_word_en,
+    normalize_equipment_slot,
+    normalize_guardrail_text,
+    normalize_zh_compact,
+    reset_cli_warnings,
+    warning_context,
+)
+
+__all__ = [
+    "ALL_QUERY_SCOPES",
+    "EQUIPMENT_SLOT_ALIASES",
+    "GAME_ID",
+    "LEGACY_PATCH_TRAPS_POE1",
+    "POE1_ONLY_CLASSES",
+    "POE2_ONLY_ASCENDANCIES_EN",
+    "POE2_ONLY_ASCENDANCIES_ZH",
+    "POE2_ONLY_CLASSES",
+    "POE2_ONLY_CLASSES_EN",
+    "POE2_ONLY_CLASSES_ZH",
+    "POE2_ONLY_REVERSE_TRAPS_FOR_POB1",
+    "POE2_ONLY_TIMELESS_JEWELS_EN",
+    "POE2_ONLY_TIMELESS_JEWELS_ZH",
+    "SAME_NAME_FALSE_FRIENDS_POE1",
+    "URL_GATE_RULES",
+    "FalseFriendRule",
+    "GuardrailScope",
+    "LegacyPatchTrapRule",
+    "S",
+    "TrapRule",
+    "UrlGateRule",
+    "check_input",
+    "check_input_item_raw",
+    "check_poe2_class_or_ascendancy",
+    "check_poe2_timeless_jewel",
+    "emit_stderr_warnings_from_dicts",
+    "extract_scannable_item_parts",
+    "get_active_warning_dicts",
+    "get_active_warnings",
+    "match_phrase_zh",
+    "match_word_en",
+    "normalize_equipment_slot",
+    "normalize_guardrail_text",
+    "normalize_zh_compact",
+    "reset_cli_warnings",
+    "scan_text_traps",
+    "validate_build_xml",
+    "validate_engine_root",
+    "validate_url",
+    "warning_context",
+]

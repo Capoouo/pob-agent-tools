@@ -1,12 +1,15 @@
 # PROGRESS
 
 ## ACTIVE
-- 目标：完成 pob4agents 3.28–3.30 防幻觉加固、DSH 实机验收及二阶精修
-- 已做：[x] P0/P1/P2 全栈防幻觉与构筑守卫加固（game_data/guardrails/mutators/comparator/analyzer/formatters/cli/daemon + skills/pob/ + 3套新单测）；[x] DSH skill 模式三套真实 Build（H01/H02/H03）验收 3/3 全部 PASS（0 项红线违规，致命幻觉与毁号建议清零）；[x] 二阶精修落地：Ramako 站立固定 -20% DoT 火抗护栏与诊断守卫、Frost Bomb -75% 禁回血非诅咒提示、Raise Spectre 藏身处招灵+Lifetap 说明、diagnose 直出 Pantheon 主次神与效果、batch --return 容忍 PowerShell 空格拆分、SKILL.md 步数纪律收紧（已同步 ~/.agents/skills/pob-poe1 与 dsh-pob-assistant）
-- 下一步：[ ] 检查 H03 plugin 模式复验步数与 Ramako/Frost Bomb 表现，随后确认是否 git commit / push F:/poe 改动
-- 验证：PYTHONPATH=F:\poe\pob_cli\src POB_OFFLINE=1 pytest (883 passed 全量 + 二阶精修后 531/207 passed in 1.86s) + DSH H01/H02/H03 3/3 PASS + 实机 diagnose B1/B3 输出 Pantheon/Ramako/Frost Bomb/Spectre 与 batch --return "skills summary" 全绿（2026-11-22 22:33）
+- 目标：确认并推送 pob4agents 5层模块化拆分与 check.py 门禁改动至 origin/main，随后落地 Hook 硬护栏
+- 已做：[x] 完成 pob_cli 5层严格单向 DAG 重构（149受检文件全部<=641L/<=23995B、单函数<=200L）与 Ruff + check.py 三模门禁落地；[x] 完成 Paseo 3路 DeepSeek V4.1 Flash 子代理盲测验收 3/3 PASS：均主动 wc -l 后直接全文 [Read] 模块（替代原数千行局部 grep），并修复 DS3 沙盒实测捕获的 Ruff known-first-party 跨目录排序差异及并入 test_ticks_unit.py（17条单测，总计 907 passed）；[x] 编写重构后 Hook 防假执行硬护栏施工方案 docs/HOOK_GUARDRAILS_PLAN.md
+- 下一步：[ ] 经用户确认后执行 git commit 与 git push origin main，随后按 docs/HOOK_GUARDRAILS_PLAN.md 落地 pob hook 与 DSH/hooks.json 挂载
+- 验证：python pob_cli/scripts/check.py --fast (repo root & pob_cli/ 均 ruff=0, arch=0) && python pob_cli/scripts/check.py --self-test (5/5 PASS) && pytest 907 passed (1 skipped) + 3/3 DS V4.1F subagents verified（2026-11-23 02:51）
 
 ## LOG
+### 2026-11-23 通过 Paseo 拉起 3 路 DeepSeek V4.1 Flash 子代理完成新架构实战验收（3/3 主动全文 Read 模块，捕获并修复 pyproject.toml known-first-party 排序差异，新增 test_ticks_unit.py 17 用例） → 双目录 check.py --fast + --self-test (5/5) + 902+5 passed 全绿
+### 2026-11-23 完成 pob_cli 5层严格单向 DAG 重构（149受检文件全部<=641L/<=23995B，避开24KB钩子墙）并接入 Ruff + check.py 三模门禁与 CI/pob.spec → check.py --self-test (5/5) + --fast (0.97s) + 全量 pytest 890 passed (1 skipped) + 实机 daemon/wheel 全绿
+### 2026-11-23 编写重构后 Hook 硬护栏防假执行施工方案 docs/HOOK_GUARDRAILS_PLAN.md（三道闸门+进程外回执+否定语境豁免+自动代跑塞真值） → 未改重构中源码
 ### 2026-11-22 完成 DSH 3/3 实机验收（H01/H02/H03 全 PASS）并落地二阶精修（Ramako 固定 -20% DoT 抗、Frost Bomb 禁回血、幽魂藏身处施法、diagnose 展示 Pantheon、PowerShell --return 空格容错、SKILL 步数纪律） → pytest 531/207 passed + 实机 smoke 全绿
 ### 2026-11-22 Swarm 3 路 + 文档落地 pob4agents 3.28–3.30 防幻觉与构筑守卫全栈加固（退场觉醒过滤/卓越上限硬拦截/台服繁简映射/冷却提取/CWS零盾与多里亚尼等8项诊断守卫/rank-nodes双修/Skill同步） → 全量 pytest 883 passed (1 skipped) + 最终复检 393 passed + 3 套真实 PoB 实机验收全绿
 ### 2026-11-22 完成项目改名 pob-agent-tools -> pob4agents（b7df897 + 合并 3dc7128 -> 0035f32），同步重命名 GitHub 仓库为 exilemoulei/pob4agents 并推送 origin/main → PYTHONPATH=F:/poe/pob_cli/src pytest 228 passed (1 skipped) + git push exit 0

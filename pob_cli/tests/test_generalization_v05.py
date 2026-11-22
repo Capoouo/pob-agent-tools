@@ -110,7 +110,7 @@ def test_detect_anti_synergy_supports_and_zero_mana_inspiration() -> None:
             }
         ],
     }
-    gaps, mech = analyzer._detect_build_mechanics_and_pitfalls(
+    gaps, _mech = analyzer._detect_build_mechanics_and_pitfalls(
         stats={"ManaCost": 0, "IgniteChance": 0, "Life": 4000, "LifeUnreserved": 4000, "LifeUnreservedPercent": 100},
         skills_res=skills_res,
         items_res={"slots": [], "items": []},

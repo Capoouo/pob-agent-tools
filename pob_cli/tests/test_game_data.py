@@ -24,8 +24,9 @@ HAS_MANAGED_POB = (MANAGED_POB_DIR / "PoE1" / "Data" / "Gems.lua").is_file()
 
 
 @pytest.mark.skipif(not HAS_REAL_POB, reason="Real PobTools[20261102] directory not available")
-def test_cold_build_and_warm_query_benchmarks(tmp_path: Path) -> None:
+def test_cold_build_and_warm_query_benchmarks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Verify cold SQLite index builds < 12s and warm queries execute < 15ms."""
+    monkeypatch.delenv("POB_CACHE_DIR", raising=False)
     t0 = time.perf_counter()
     db_path = ensure_gamedata_index(pob_dir=REAL_POB_DIR, runtime_dir=tmp_path)
     cold_sec = time.perf_counter() - t0
@@ -526,6 +527,7 @@ def test_concurrent_build_lockfile_prevents_thundering_herd_and_recovers_stale_l
     """Verify atomic build lockfile serializes concurrent cold builds, cleans .tmp, and recovers stale locks."""
     import concurrent.futures
     import json
+
     from pob_cli import game_data
 
     monkeypatch.delenv("POB_ROOT", raising=False)
@@ -639,6 +641,7 @@ def test_build_lock_timeout_same_pid_stale_token_ownership_and_force_rebuild_err
 ) -> None:
     """Verify P0/P2 build lock hardening: no infinite spin, same-PID stale reclaim, token ownership, force_rebuild error."""
     import json
+
     from pob_cli import game_data
 
     monkeypatch.delenv("POB_ROOT", raising=False)

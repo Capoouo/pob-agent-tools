@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import pytest
+
 from pob_cli import item_inspect
 from pob_cli.trade_item import make_mod
-import pytest
 
 
 def _entry(ident: str, kind: str, group: str, *lines: str, level: int = 1, source: str = "Explicit") -> dict:
@@ -119,6 +120,7 @@ def test_unidentified_item_has_unknown_capacity(monkeypatch, identified):
 @pytest.mark.parametrize('raw', ['', '   \n'])
 def test_inspect_empty_input_is_clean_cli_error(raw):
     from click.testing import CliRunner
+
     from pob_cli.cli import main
     result = CliRunner().invoke(main, ['--offline', 'item', 'inspect', '--raw', raw])
     assert result.exit_code == 1

@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import math
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
-from .bridge_client import BridgeWorker, MAX_UNDO_STEPS
+from .bridge_client import MAX_UNDO_STEPS, BridgeWorker
 from .errors import DaemonRequestError
 from .formatters import _parse_numeric_or_none, fmt_delta, fmt_num, strip_pob_escapes
 
@@ -71,7 +72,7 @@ def _call_batch(
         else:
             try:
                 results.append(worker.call(method, params or {}))
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 results.append({"ok": False, "_error": str(exc), "error": str(exc)})
     return results
 

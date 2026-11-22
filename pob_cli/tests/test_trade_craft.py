@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 from pob_cli import trade_craft
-from pob_cli.trade_eval import Candidate, report_json, format_report
+from pob_cli.trade_eval import Candidate, format_report, report_json
 from pob_cli.trade_item import parse_item_text
 
 RAW = 'Rarity: RARE\nTest Hand\nConjurer Gloves\nItem Level: 85\nImplicits: 0\n+115 to maximum Life\n'
@@ -49,6 +49,7 @@ def test_expand_keeps_original_and_replaces_only_bench_lines(monkeypatch, action
 def test_weapon_crafts_follow_actual_base_class(monkeypatch, tmp_path, slot, item_type, maximum):
     import json
     import sqlite3
+
     from pob_cli.bench import BenchRecipe, classes_to_slots
 
     db = tmp_path / 'game.sqlite'
@@ -128,6 +129,7 @@ def test_bench_craft_coexists_with_weighted_sum_report(monkeypatch):
 
 def test_item_inspect_and_bench_craft_poe2_guardrails_and_missing_engine(monkeypatch):
     from click.testing import CliRunner
+
     from pob_cli import cli as cli_mod
     from pob_cli import item_inspect
 

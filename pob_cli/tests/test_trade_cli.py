@@ -1035,7 +1035,6 @@ def test_carbon_p2_sweep_dict_scenario_none_deltas_tuples_query_alignment_and_lo
     import pob_cli.poedb_client as pc_mod
     from pob_cli.formatters import (
         format_matrix_markdown,
-        format_sweep_markdown,
         format_tree_markdown,
         sanitize_for_output,
         to_json_str,

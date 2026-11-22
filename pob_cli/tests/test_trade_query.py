@@ -11,7 +11,6 @@ import pytest
 from pob_cli import trade_query as tq
 from pob_cli.updater import resolve_engine_root
 
-
 # Representative real PoE1 trade stat entries (exact IDs and texts from GGG / TradeSiteStats.lua)
 SAMPLE_ENTRIES: list[dict[str, str]] = [
     # Resistances

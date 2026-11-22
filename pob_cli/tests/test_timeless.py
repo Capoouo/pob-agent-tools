@@ -190,7 +190,7 @@ def test_narrow_down_finds_a_rare_valuable_byte_without_calculating_everything()
     for rng_seed in range(20):  # a purely random first sample misses byte 99 in most of these
         results: dict[bytes, dict[str, float]] = {}
         estimate = timeless.narrow_down(
-            sigs, results, lambda todo: results.update({sig: {"X": truth[sig]} for sig in todo}),
+            sigs, results, lambda todo, _res=results: _res.update({sig: {"X": truth[sig]} for sig in todo}),
             "X", 5, random.Random(rng_seed), lambda _msg: None,
         )
         assert estimate is not None and len(results) < len(sigs) // 2
@@ -838,7 +838,7 @@ def test_corrupt_table_and_cli_timeless_exit_5_without_traceback(
 
     with pytest.raises(RuntimeError, match="Failed to decompress"):
         timeless.load_table(fake_engine.game_dir, "MilitantFaith")
-    with pytest.raises(RuntimeError, match="Malformed NodeIndexMapping.lua"):
+    with pytest.raises(RuntimeError, match=r"Malformed NodeIndexMapping\.lua"):
         timeless.load_node_index(fake_engine.game_dir)
 
     # Restore valid NodeIndexMapping.lua so timeless.search reaches load_table on the corrupt .zip

@@ -652,7 +652,7 @@ def test_split_timeout_and_stale_cache_fallbacks(
     # 3. query_wiki stale fallback
     import hashlib
 
-    slug_hash = hashlib.sha1("mind over matter".encode("utf-8")).hexdigest()[:12]
+    slug_hash = hashlib.sha1(b"mind over matter").hexdigest()[:12]
     (cache_dir / f"poewiki_{slug_hash}.json").write_text(
         json.dumps(
             {
@@ -682,7 +682,7 @@ def test_split_timeout_and_stale_cache_fallbacks(
         ),
         encoding="utf-8",
     )
-    p_hash = hashlib.sha1("cn:Mageblood".encode("utf-8")).hexdigest()[:16]
+    p_hash = hashlib.sha1(b"cn:Mageblood").hexdigest()[:16]
     (cache_dir / f"poedb_page_cn_{p_hash}.json").write_text(
         json.dumps(
             {
@@ -908,7 +908,7 @@ def test_shared_cache_dir_ro_fallback_and_detailed_stash_partial_fallback_and_wi
 
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
-    h = hashlib.sha1("empty topic".encode("utf-8")).hexdigest()[:12]
+    h = hashlib.sha1(b"empty topic").hexdigest()[:12]
     (cache_dir / f"poewiki_{h}.json").write_text(json.dumps({"_ts": time.time(), "data": {}}), encoding="utf-8")
     wm = external_data.query_wiki_multi([" Empty Topic ", "   "])
     assert wm["queries"] == ["Empty Topic"]

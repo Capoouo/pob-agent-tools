@@ -13,7 +13,14 @@ from typing import Any
 import pytest
 from click.testing import CliRunner
 
-from pob_cli import analyzer, cli_trade, daemon, external_data, game_data, importers, mutators, poedb_client, updater
+from pob_cli import (
+    daemon,
+    external_data,
+    importers,
+    mutators,
+    poedb_client,
+    updater,
+)
 from pob_cli.bridge_client import BridgeWorker
 from pob_cli.cli import _prepare_load_source, main
 from pob_cli.errors import CrossGameHallucinationError, DaemonRequestError
@@ -65,7 +72,7 @@ def test_error_contract_and_formatters_untouched() -> None:
     )
     assert isinstance(exc, DaemonRequestError)
     payload = exc.to_dict()
-    assert list(payload.keys())[0] == "game"
+    assert next(iter(payload.keys())) == "game"
     assert payload == {
         "game": "poe1",
         "ok": False,

@@ -130,7 +130,7 @@ class FakeWorker:
             else:
                 try:
                     results.append(self.call(method, params or {}))
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
                     results.append({"ok": False, "_error": str(exc), "error": str(exc)})
         return results
 
@@ -508,10 +508,12 @@ def test_run_matrix_forwards_keep_to_pinnacle() -> None:
 
 
 def test_fmt_signed_pct() -> None:
-    assert cli_mod._fmt_signed_pct(None, None) == "-"
-    assert cli_mod._fmt_signed_pct(0, 0) == "0"
-    assert cli_mod._fmt_signed_pct(1234.4, 4.21) == "+1,234 (+4.2%)"
-    assert cli_mod._fmt_signed_pct(-50, -1.0) == "-50 (-1.0%)"
+    from pob_cli.formatters import fmt_signed_pct
+
+    assert fmt_signed_pct(None, None) == "-"
+    assert fmt_signed_pct(0, 0) == "0"
+    assert fmt_signed_pct(1234.4, 4.21) == "+1,234 (+4.2%)"
+    assert fmt_signed_pct(-50, -1.0) == "-50 (-1.0%)"
 
 
 def test_cli_audit_passes_keep_and_renders_attribution(monkeypatch: pytest.MonkeyPatch) -> None:

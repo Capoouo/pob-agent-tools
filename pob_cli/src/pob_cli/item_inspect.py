@@ -44,7 +44,7 @@ def _fits(rolled: str, data_line: str, *, strict: bool) -> bool:
     actual, tier = _spans(rolled), _spans(data_line)
     return len(actual) == len(tier) and all(
         lo >= t_lo - 1e-6 and hi <= t_hi + 1e-6
-        for (lo, hi), (t_lo, t_hi) in zip(actual, tier)
+        for (lo, hi), (t_lo, t_hi) in zip(actual, tier, strict=False)
     )
 
 

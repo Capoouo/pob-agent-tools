@@ -1066,7 +1066,7 @@ def test_analyzer_pipelined_summary_items_skills_config_tree_calcs() -> None:
     assert 1006 not in by_id  # outside 2880 Massive radius
     assert 3000 not in by_id  # ascendancy node excluded
     # Verify format_tree_markdown renders socket_radius & masteries cleanly without TypeError
-    from pob_cli.formatters import format_matrix_markdown, format_tree_markdown
+    from pob_cli.formatters import format_tree_markdown
 
     rad_md = format_tree_markdown(t_rad)
     assert "Jewel Socket Radius: `1000`" in rad_md

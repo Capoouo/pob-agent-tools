@@ -13,16 +13,13 @@ from typing import Any
 import pytest
 from click.testing import CliRunner
 
-from pob_cli import analyzer, cli, game_data, mutators, trade_query
+from pob_cli import analyzer, cli, game_data, trade_query
 from pob_cli.errors import CrossGameHallucinationError, HallucinationWarning, LegacyPatchTrapError
 from pob_cli.formatters import format_diagnose_markdown, format_ground_markdown
 from pob_cli.guardrails import (
-    LEGACY_PATCH_TRAPS_POE1,
-    SAME_NAME_FALSE_FRIENDS_POE1,
     GuardrailScope,
     check_input,
     normalize_equipment_slot,
-    scan_text_traps,
     warning_context,
 )
 

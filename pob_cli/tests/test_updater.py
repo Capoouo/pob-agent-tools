@@ -32,7 +32,6 @@ from pob_cli.updater import (
     bootstrap_engine,
     build_manifest_file_url,
     check_and_apply_updates,
-    diff_pob_manifest,
     find_local_manifest_mismatches,
     format_stderr_update_alert,
     get_update_warning,
@@ -681,6 +680,7 @@ def test_daemon_hot_reload_serializes_concurrent_get_worker_and_status(
 ) -> None:
     """Verify DLL-unlock concurrency safety: get_worker/status/periodic check cannot touch workers mid-hot-reload."""
     import threading
+
     import pob_cli.daemon as daemon_mod
 
     rt = tmp_path / "runtime"
@@ -754,7 +754,7 @@ def test_daemon_hot_reload_serializes_concurrent_get_worker_and_status(
     def _run_reload() -> None:
         try:
             mgr._hot_reload_update()
-        except BaseException as exc:  # noqa: BLE001
+        except BaseException as exc:
             errs.append(exc)
 
     t_reload = threading.Thread(target=_run_reload)
@@ -767,7 +767,7 @@ def test_daemon_hot_reload_serializes_concurrent_get_worker_and_status(
             w = mgr.get_worker("main")
             assert w is not old_worker
             events.append("get_worker_after_reload")
-        except BaseException as exc:  # noqa: BLE001
+        except BaseException as exc:
             errs.append(exc)
 
     def _run_status() -> None:
@@ -775,7 +775,7 @@ def test_daemon_hot_reload_serializes_concurrent_get_worker_and_status(
             st = mgr.dispatch("status", {})
             assert st["main"]["alive"] is True
             events.append("status_after_reload")
-        except BaseException as exc:  # noqa: BLE001
+        except BaseException as exc:
             errs.append(exc)
 
     t_gw = threading.Thread(target=_run_get_worker)
@@ -912,6 +912,7 @@ def test_daemon_start_non_blocking_background_update_check(
 ) -> None:
     """Verify DaemonManager.start() starts serving immediately when engine exists and checks updates in background."""
     import threading
+
     import pob_cli.daemon as daemon_mod
 
     rt = tmp_path / "rt"
@@ -989,6 +990,7 @@ def test_daemon_boot_bg_update_triggers_hot_reload_and_fresh_ok_checks_update_av
 ) -> None:
     """Verify P1-1: boot check_only with updateAvailable=True invokes _hot_reload_update and fresh_ok rejects updateAvailable."""
     import threading
+
     import pob_cli.daemon as daemon_mod
 
     rt = tmp_path / "rt"
@@ -1068,6 +1070,7 @@ def test_updater_edge_hardening_cache_pob_root_readonly_and_tmp_cleanup(
 ) -> None:
     """Verify P2-4: check_and_apply_updates forwards pob_root=active_dir, get_shared_cache_dir handles OSError, and tmp is unlinked."""
     import os
+
     import pob_cli.updater as upd_mod
 
     # 1. check_and_apply_updates passes pob_root=active_dir to get_shared_cache_dir

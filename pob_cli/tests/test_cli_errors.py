@@ -490,7 +490,7 @@ def test_trade_search_pob_on_exits_6_on_daemon_errors(
 
 
 def test_config_bool_on_count_var_and_vaal_support_guard() -> None:
-    from pob_cli.mutators import _BatchCache, _apply_config_in_place, _is_vaal_gem_entry
+    from pob_cli.mutators import _apply_config_in_place, _BatchCache, _is_vaal_gem_entry
 
     assert _is_vaal_gem_entry({"name": "Vaal Sacrifice", "support": True, "skillId": "SupportVaalSacrifice"}) is False
     assert _is_vaal_gem_entry({"name": "Vaal Temptation", "support": True}) is False
@@ -822,7 +822,7 @@ def test_verify_candidates_batch_propagates_bootstrap_missing_error(
 
 
 def test_mutators_validation_and_serve_bootstrap_cli_errors(monkeypatch: pytest.MonkeyPatch) -> None:
-    from pob_cli.mutators import _apply_class_ascendancy_in_place, _execute_batch_ops, _BatchCache
+    from pob_cli.mutators import _apply_class_ascendancy_in_place, _BatchCache, _execute_batch_ops
 
     class _MiniWorker:
         def __init__(self) -> None:

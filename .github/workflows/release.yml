@@ -60,6 +60,11 @@ jobs:
           "is_prerelease=$isPre" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           Write-Host "Validated release tag $tag (version $pkgVersion, prerelease=$isPre)"
 
+      - name: Run lint & architecture gate (fast + self-test)
+        run: |
+          python pob_cli/scripts/check.py --fast
+          python pob_cli/scripts/check.py --self-test
+
       - name: Run unit tests (offline mode)
         env:
           POB_OFFLINE: "1"

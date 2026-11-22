@@ -8,9 +8,9 @@ from typing import Any
 
 import click
 
-from . import cli as _cli_mod
+from . import cli_common as _cli_mod
 from .bridge_client import BridgeError
-from .cli import (
+from .cli_common import (
     _daemon_call,
     _echo_stderr_utf8,
     _emit_json,

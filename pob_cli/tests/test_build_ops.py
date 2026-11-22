@@ -793,7 +793,7 @@ class _FakeBridgeWorker:
             else:
                 try:
                     out.append(self.call(method, params or {}))
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
                     out.append({"error": str(exc)})
         return out
 

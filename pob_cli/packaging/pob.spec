@@ -2,31 +2,25 @@
 """PyInstaller spec for standalone Windows x64 `pob` (--onedir for fast CLI startup and daemon persistence)."""
 
 import os
-from PyInstaller.utils.hooks import collect_data_files
+import sys
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 spec_dir = SPECPATH
 src_dir = os.path.abspath(os.path.join(spec_dir, "..", "src"))
+if src_dir not in sys.path:
+    sys.path.insert(0, src_dir)
 entry_script = os.path.join(spec_dir, "pyinstaller_entry.py")
 
 datas = collect_data_files("certifi") + [
     (os.path.join(src_dir, "pob_cli", "data", "bench_costs.json"), os.path.join("pob_cli", "data")),
     (os.path.join(src_dir, "pob_cli", "lua", "headless_runner.lua"), os.path.join("pob_cli", "lua")),
 ]
-hiddenimports = [
-    "socksio",
-    "pob_cli.errors",
-    "pob_cli.guardrails",
-    "pob_cli.analyzer",
-    "pob_cli.comparator",
-    "pob_cli.game_data",
-    "pob_cli.formatters",
-    "pob_cli.daemon",
-    "pob_cli.cli_trade",
-    "pob_cli.item_inspect",
-    "pob_cli.trade_craft",
-    "pob_cli.timeless",
-    "pob_cli.cli_timeless",
-]
+hiddenimports = sorted(
+    {
+        "socksio",
+        *collect_submodules("pob_cli"),
+    }
+)
 
 a = Analysis(
     [entry_script],

@@ -246,6 +246,7 @@ def test_bridge_worker_start_restore_code_skips_redundant_new_build(
     import io
     import json
     import queue as _queue
+
     import pob_cli.bridge_client as bc
 
     fake_root = tmp_path / "eng"
@@ -346,6 +347,7 @@ def test_daemon_spawn_breakaway_fallback_on_access_denied(
 ) -> None:
     """Verify _spawn_daemon_process retries without CREATE_BREAKAWAY_FROM_JOB on WinError 5."""
     import io
+
     import pob_cli.daemon as daemon_mod
 
     if daemon_mod.sys.platform != "win32":
@@ -375,6 +377,7 @@ def test_daemon_pid_liveness_and_fast_stale_cleanup(tmp_path: Path, monkeypatch:
     import json
     import os
     import time
+
     import pob_cli.daemon as daemon_mod
 
     assert daemon_mod._is_pid_alive(os.getpid()) is True
@@ -411,6 +414,7 @@ def test_daemon_multi_slot_parallel_locks_and_status(tmp_path: Path, monkeypatch
     """Verify named multi-slot workers run concurrently under per-slot locks and expose backward-compat status."""
     import threading
     import time
+
     import pob_cli.daemon as daemon_mod
 
     assert daemon_mod.normalize_slot_name(None) == "main"
@@ -472,7 +476,7 @@ def test_daemon_multi_slot_parallel_locks_and_status(tmp_path: Path, monkeypatch
     def _run_slot(slot: str) -> None:
         try:
             results[slot] = mgr.dispatch("export", {"target": slot})
-        except BaseException as exc:  # noqa: BLE001
+        except BaseException as exc:
             errors.append(exc)
 
     t1 = threading.Thread(target=_run_slot, args=("agent-a",))
@@ -524,6 +528,7 @@ def test_bridge_worker_runtime_dir_slot_state_and_kill_resets_translate(
     import io
     import json
     import queue as _queue
+
     import pob_cli.bridge_client as bc
     import pob_cli.daemon as daemon_mod
 
@@ -611,6 +616,7 @@ def test_daemon_rw_reentrancy_under_concurrent_reload_and_busy_status(tmp_path: 
     """Verify nested _reader_barrier() never deadlocks when an exclusive writer arrives, and status reports busy=True."""
     import threading
     import time
+
     import pob_cli.daemon as daemon_mod
 
     eng = tmp_path / "eng"
@@ -639,7 +645,7 @@ def test_daemon_rw_reentrancy_under_concurrent_reload_and_busy_status(tmp_path: 
                 with mgr._reader_barrier():
                     assert not writer_entered.is_set()
                     nested_ok.set()
-        except BaseException as exc:  # noqa: BLE001
+        except BaseException as exc:
             errs.append(exc)
 
     def _writer() -> None:
@@ -648,7 +654,7 @@ def test_daemon_rw_reentrancy_under_concurrent_reload_and_busy_status(tmp_path: 
             writer_waiting.set()
             with mgr._exclusive_barrier():
                 writer_entered.set()
-        except BaseException as exc:  # noqa: BLE001
+        except BaseException as exc:
             errs.append(exc)
 
     t_r = threading.Thread(target=_reader)
@@ -671,10 +677,12 @@ def test_daemon_rw_reentrancy_under_concurrent_reload_and_busy_status(tmp_path: 
 
     class _AliveWorker:
         last_good_code = "CODE"
-        undo_stack: list[str] = []
-        redo_stack: list[str] = []
-        hello_info: dict[str, object] = {}
         source_label = None
+
+        def __init__(self) -> None:
+            self.undo_stack: list[str] = []
+            self.redo_stack: list[str] = []
+            self.hello_info: dict[str, object] = {}
 
         def is_alive(self) -> bool:
             return True
@@ -709,6 +717,7 @@ def test_call_daemon_timeout_preserves_live_daemon_and_403_404_respawns(
     """Verify P1-2 (TimeoutError preserves live daemon.json; HTTP 403/404 unlinks & respawns) and P1-1 warm degraded alert."""
     import json
     import os
+
     import pob_cli.daemon as daemon_mod
 
     rt = tmp_path / "rt"
@@ -747,10 +756,17 @@ def test_call_daemon_timeout_preserves_live_daemon_and_403_404_respawns(
         )
         calls: list[int] = []
 
-        def _rpc_foreign_then_ok(port: int, token: str, payload: dict, **_kw):
-            calls.append(port)
+        def _rpc_foreign_then_ok(
+            port: int,
+            token: str,
+            payload: dict,
+            _calls: list[int] = calls,
+            _status: int = foreign_status,
+            **_kw: object,
+        ):
+            _calls.append(port)
             if port == 51234:
-                return foreign_status, {"ok": False, "error": f"HTTP {foreign_status}"}
+                return _status, {"ok": False, "error": f"HTTP {_status}"}
             return 200, {"ok": True, "result": {"respawned": True}}
 
         monkeypatch.setattr(daemon_mod, "_http_post_rpc", _rpc_foreign_then_ok)
@@ -868,6 +884,7 @@ def test_daemon_shutdown_concurrency_aborts_inflight_and_waits(
     """Verify P2-2: shutdown_all() aborts in-flight worker before barrier and concurrent callers wait for teardown."""
     import threading
     import time
+
     import pob_cli.daemon as daemon_mod
 
     eng = tmp_path / "eng"
@@ -943,6 +960,7 @@ def test_daemon_edge_hardening_pid_bounds_http_handler_and_lua_arg_reset(tmp_pat
     import http.client
     import threading
     from http.server import ThreadingHTTPServer
+
     import pob_cli.daemon as daemon_mod
 
     # P2-4: Oversized 64-bit PID must return False instead of raising OverflowError on Windows
