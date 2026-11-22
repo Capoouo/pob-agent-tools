@@ -53,6 +53,13 @@ def _copy_tree_filtered(src: Path, dst: Path) -> None:
             (dst / entry.name).write_bytes(Path(entry.path).read_bytes())
 
 
+def _utf8_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    return env
+
+
 def run_ruff(pob_cli_root: Path) -> tuple[bool, str]:
     targets = [
         str(pob_cli_root / sub)
@@ -68,7 +75,14 @@ def run_ruff(pob_cli_root: Path) -> tuple[bool, str]:
         str(pob_cli_root / "pyproject.toml"),
         *targets,
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    proc = subprocess.run(
+        cmd,
+        env=_utf8_env(),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
     combined = (proc.stdout + "\n" + proc.stderr).strip()
     return proc.returncode == 0, combined
 
@@ -173,6 +187,7 @@ def run_self_test(pob_cli_root: Path) -> int:
                 target_file.write_bytes(original + snippet.encode("utf-8"))
                 proc = subprocess.run(
                     [sys.executable, str(check_script), "--fast", "--root", str(staged)],
+                    env=_utf8_env(),
                     capture_output=True,
                     text=True,
                     encoding="utf-8",
@@ -193,6 +208,7 @@ def run_self_test(pob_cli_root: Path) -> int:
 
         clean_proc = subprocess.run(
             [sys.executable, str(check_script), "--fast", "--root", str(staged)],
+            env=_utf8_env(),
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -210,6 +226,11 @@ def run_self_test(pob_cli_root: Path) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+        except Exception:
+            pass
     parser = argparse.ArgumentParser(description="pob_cli lint, architecture DAG, and offline test gate.")
     parser.add_argument("--fast", action="store_true", help="Run ruff + AST arch-lint only (<3s).")
     parser.add_argument("--self-test", action="store_true", help="Run mutation self-test in %TEMP%.")

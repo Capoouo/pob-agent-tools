@@ -1,12 +1,13 @@
 # PROGRESS
 
 ## ACTIVE
-- 目标：确认并推送 pob4agents 5层模块化拆分与 check.py 门禁改动至 origin/main，随后落地 Hook 硬护栏
-- 已做：[x] 完成 pob_cli 5层严格单向 DAG 重构（149受检文件全部<=641L/<=23995B、单函数<=200L）与 Ruff + check.py 三模门禁落地；[x] 完成 Paseo 3路 DeepSeek V4.1 Flash 子代理盲测验收 3/3 PASS：均主动 wc -l 后直接全文 [Read] 模块（替代原数千行局部 grep），并修复 DS3 沙盒实测捕获的 Ruff known-first-party 跨目录排序差异及并入 test_ticks_unit.py（17条单测，总计 907 passed）；[x] 编写重构后 Hook 防假执行硬护栏施工方案 docs/HOOK_GUARDRAILS_PLAN.md
-- 下一步：[ ] 经用户确认后执行 git commit 与 git push origin main，随后按 docs/HOOK_GUARDRAILS_PLAN.md 落地 pob hook 与 DSH/hooks.json 挂载
-- 验证：python pob_cli/scripts/check.py --fast (repo root & pob_cli/ 均 ruff=0, arch=0) && python pob_cli/scripts/check.py --self-test (5/5 PASS) && pytest 907 passed (1 skipped) + 3/3 DS V4.1F subagents verified（2026-11-23 02:51）
+- 目标：推送 Windows CI 修复与 v0.6.0 正式发版标签并验收 GitHub Actions CI + Release 全绿
+- 已做：[x] 完成 pob_cli 5层严格单向 DAG 重构、Ruff + check.py 三模门禁落地及 3 路 DeepSeek V4.1F 实战验收（a5f100c）；[x] 修复 GitHub Actions windows-latest 上的 CRLF 字节膨胀（.gitattributes *.py eol=lf + 拆薄 parsers_special/batch_ops_skills/mutation_md + arch_lint 按最坏 CRLF 字节上限校验 <=24000B）、cp1252 控制台编码报错及 pwsh 退出码检查，升级版本号至 v0.6.0；[x] 编写重构后 Hook 防假执行硬护栏施工方案 docs/HOOK_GUARDRAILS_PLAN.md
+- 下一步：[ ] 经用户确认后执行 git push origin main 与 v0.6.0 tag 推送，监控 CI 与 Release 全绿及 Scoop 清单自动更新，随后按 docs/HOOK_GUARDRAILS_PLAN.md 落地 pob hook
+- 验证：python pob_cli/scripts/check.py --fast (max CRLF=23768B) && PYTHONIOENCODING=cp1252 python pob_cli/scripts/check.py --self-test (5/5 PASS) && pytest 78+ passed && pob --version (0.6.0)（2026-11-23 03:08）
 
 ## LOG
+### 2026-11-23 修复 Windows CI CRLF 字节膨胀与 cp1252 编码报错（.gitattributes + 3 子模块拆薄 + arch_lint 最坏 CRLF 字节校验 <=23768B + check.py UTF-8 加固）并准备 pob4agents v0.6.0 发版 → cp1252 --self-test (5/5) + --fast + 回归单测全绿
 ### 2026-11-23 通过 Paseo 拉起 3 路 DeepSeek V4.1 Flash 子代理完成新架构实战验收（3/3 主动全文 Read 模块，捕获并修复 pyproject.toml known-first-party 排序差异，新增 test_ticks_unit.py 17 用例） → 双目录 check.py --fast + --self-test (5/5) + 902+5 passed 全绿
 ### 2026-11-23 完成 pob_cli 5层严格单向 DAG 重构（149受检文件全部<=641L/<=23995B，避开24KB钩子墙）并接入 Ruff + check.py 三模门禁与 CI/pob.spec → check.py --self-test (5/5) + --fast (0.97s) + 全量 pytest 890 passed (1 skipped) + 实机 daemon/wheel 全绿
 ### 2026-11-23 编写重构后 Hook 硬护栏防假执行施工方案 docs/HOOK_GUARDRAILS_PLAN.md（三道闸门+进程外回执+否定语境豁免+自动代跑塞真值） → 未改重构中源码

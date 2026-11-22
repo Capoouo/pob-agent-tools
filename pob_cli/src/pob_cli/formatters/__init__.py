@@ -6,10 +6,8 @@ from .build_md import (
     _extract_metrics_block,
     _format_calc_cell,
     _safe_min_ele_max_hit,
-    format_cautions,
     format_compare_markdown,
     format_matrix_markdown,
-    format_mutation_report,
     format_sweep_markdown,
 )
 from .diagnose_compare_md import (
@@ -18,6 +16,7 @@ from .diagnose_compare_md import (
 )
 from .diagnose_md import format_diagnose_markdown
 from .gamedata_md import format_game_data
+from .mutation_md import format_cautions, format_mutation_report
 from .primitives import (
     LARGE_JSON_STDOUT_BYTES,
     POB_ESCAPE_RE,

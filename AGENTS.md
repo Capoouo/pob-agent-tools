@@ -1,4 +1,4 @@
-# AGENTS.md — `pob4agents` (`pob`) Headless PoB CLI (v0.5)
+# AGENTS.md — `pob4agents` (`pob`) Headless PoB CLI (v0.6)
 
 ## 1. Quick Commands (`pob [--offline] [--compact] [--out <file>]`)
 

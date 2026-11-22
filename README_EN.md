@@ -93,16 +93,16 @@ scoop update pob
 
 #### Option 3: Portable GitHub release
 
-Download `pob-v0.5.0-windows-x64.zip` from [GitHub Releases](https://github.com/exilemoulei/pob4agents/releases/latest), extract it, and add the folder containing `pob.exe` to your `PATH`.
+Download `pob-v0.6.0-windows-x64.zip` from [GitHub Releases](https://github.com/exilemoulei/pob4agents/releases/latest), extract it, and add the folder containing `pob.exe` to your `PATH`.
 
 #### Option 4: Python package (Python 3.11+, `uv` / `pipx` / `pip`)
 
 ```powershell
 # Use uv (recommended)
-uv tool install "git+https://github.com/exilemoulei/pob4agents.git@v0.5.0#subdirectory=pob_cli"
+uv tool install "git+https://github.com/exilemoulei/pob4agents.git@v0.6.0#subdirectory=pob_cli"
 
 # Or install the release wheel
-pip install "https://github.com/exilemoulei/pob4agents/releases/download/v0.5.0/pob_cli-0.5.0-py3-none-any.whl"
+pip install "https://github.com/exilemoulei/pob4agents/releases/download/v0.6.0/pob_cli-0.6.0-py3-none-any.whl"
 ```
 
 > **Load the bundled AI Agent Skill (optional, recommended)**: Copy [`skills/pob`](skills/pob) into your agent's skill folder (such as `~/.agents/skills/pob`, `~/.claude/skills/pob`, or DeepSeek Harness's `skills` directory) so fast models follow concise `pob` workflows and avoid cross-patch hallucinations.

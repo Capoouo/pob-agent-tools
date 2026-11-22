@@ -74,7 +74,7 @@ SKIP_COPY_DIRS: frozenset[str] = frozenset(
 
 
 def _fmt_fail(rule: str, path: str, line: int, problem: str, fix: str) -> str:
-    return f"FAIL [{rule}] {path}:{line} — {problem} | Fix: {fix}"
+    return f"FAIL [{rule}] {path}:{line} -- {problem} | Fix: {fix}"
 
 
 def _top_unit_for_rel(rel: Path) -> str:
@@ -357,9 +357,11 @@ def _check_budget_for_file(
     extremes: dict[str, tuple[int, str]],
 ) -> ast.Module:
     raw = fpath.read_bytes()
-    text = raw.decode("utf-8")
+    text = raw.decode("utf-8").replace("\r\n", "\n")
     line_count = len(text.splitlines())
-    byte_count = len(raw)
+    lf_bytes = len(text.encode("utf-8"))
+    # Enforce worst-case CRLF byte ceiling across all OS line-ending configs
+    byte_count = max(len(raw), lf_bytes + line_count)
 
     if line_count > extremes["maxLines"][0]:
         extremes["maxLines"] = (line_count, disp_path)

@@ -73,11 +73,11 @@ from .parsers_gems import (
     _round_pob,
 )
 from .parsers_items import (
-    _extract_special_lua_blocks,
     _parse_bases,
     _parse_mods,
     _parse_uniques,
 )
+from .parsers_special import _extract_special_lua_blocks
 from .paths import (
     _is_pid_alive,
     _resolve_poe1_data_dirs,

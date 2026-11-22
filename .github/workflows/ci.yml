@@ -36,7 +36,9 @@ jobs:
       - name: Run lint & architecture gate (fast + self-test)
         run: |
           python pob_cli/scripts/check.py --fast
+          if ($LASTEXITCODE -ne 0) { throw "check.py --fast failed (exit $LASTEXITCODE)" }
           python pob_cli/scripts/check.py --self-test
+          if ($LASTEXITCODE -ne 0) { throw "check.py --self-test failed (exit $LASTEXITCODE)" }
 
       - name: Run unit tests (offline mode)
         env:

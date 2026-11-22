@@ -93,16 +93,16 @@ scoop update pob
 
 #### 方式三：GitHub Releases 便携压缩包
 
-前往 [GitHub Releases](https://github.com/exilemoulei/pob4agents/releases/latest) 下载 `pob-v0.5.0-windows-x64.zip`，解压后将包含 `pob.exe` 的目录加入系统 `PATH`。
+前往 [GitHub Releases](https://github.com/exilemoulei/pob4agents/releases/latest) 下载 `pob-v0.6.0-windows-x64.zip`，解压后将包含 `pob.exe` 的目录加入系统 `PATH`。
 
 #### 方式四：Python 包安装（Python 3.11+，`uv` / `pipx` / `pip`）
 
 ```powershell
 # 使用 uv（推荐）
-uv tool install "git+https://github.com/exilemoulei/pob4agents.git@v0.5.0#subdirectory=pob_cli"
+uv tool install "git+https://github.com/exilemoulei/pob4agents.git@v0.6.0#subdirectory=pob_cli"
 
 # 或直接安装 Release Wheel
-pip install "https://github.com/exilemoulei/pob4agents/releases/download/v0.5.0/pob_cli-0.5.0-py3-none-any.whl"
+pip install "https://github.com/exilemoulei/pob4agents/releases/download/v0.6.0/pob_cli-0.6.0-py3-none-any.whl"
 ```
 
 > **为 AI Agent 挂载通用 Skill（可选，推荐）**：将仓库内的 [`skills/pob`](skills/pob) 目录复制到你的 Agent 技能目录（如 `~/.agents/skills/pob`、`~/.claude/skills/pob` 或 DeepSeek Harness 的 `skills` 目录），即可让快速模型（如 DeepSeek Flash / Hydrogen / Haiku）按精简路由调用 `pob` 并规避跨版本幻觉。
