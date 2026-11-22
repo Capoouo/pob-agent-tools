@@ -1162,5 +1162,89 @@ def test_carbon_p2_sweep_dict_scenario_none_deltas_tuples_query_alignment_and_lo
     assert proc.returncode == 0, proc.stderr or proc.stdout
 
 
+def test_trade_search_weighted_sum_cli_and_pseudo_sum_extraction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli_trade, "load_trade_stats", _mock_trade_stats)
+    monkeypatch.setattr(cli_trade, "_resolve_league", lambda *_a, **_kw: "Covens")
+
+    captured_queries: list[dict[str, Any]] = []
+
+    class _SumClient(TradeClient):
+        def search(self, league: str, query: dict[str, Any]) -> dict[str, Any]:
+            captured_queries.append(query)
+            return {"id": "qsum", "total": 2, "result": ["r_low", "r_high"]}
+
+        def fetch_many(self, ids: list[str], query_id: str, limit: int = 10) -> list[dict[str, Any]]:
+            return [
+                {
+                    "id": "r_low",
+                    "item": {
+                        "name": "Low Sum",
+                        "typeLine": "Slink Gloves",
+                        "rarity": "Rare",
+                        "frameType": 2,
+                        "ilvl": 82,
+                        "pseudoMods": ["Sum: 55"],
+                        "explicitMods": [
+                            {"description": "+70 to maximum Life"},
+                            {"description": "+30% to Fire Resistance"},
+                            {"description": "+25% to Cold Resistance"},
+                        ],
+                    },
+                    "listing": {"price": {"amount": 5, "currency": "chaos"}},
+                },
+                {
+                    "id": "r_high",
+                    "item": {
+                        "name": "High Sum",
+                        "typeLine": "Slink Gloves",
+                        "rarity": "Rare",
+                        "frameType": 2,
+                        "ilvl": 84,
+                        "pseudoMods": ["Sum: 88"],
+                        "explicitMods": [
+                            {"description": "+70 to maximum Life"},
+                            {"description": "+45% to Fire Resistance"},
+                            {"description": "+43% to Cold Resistance"},
+                        ],
+                    },
+                    "listing": {"price": {"amount": 20, "currency": "chaos"}},
+                },
+            ]
+
+    monkeypatch.setattr(cli_trade, "TradeClient", _SumClient)
+
+    runner = CliRunner()
+    res = runner.invoke(
+        main,
+        [
+            "trade",
+            "search",
+            "--slot",
+            "gloves",
+            "--stat",
+            "+# to maximum Life=60",
+            "--sum",
+            "+#% to Fire Resistance|+#% to Cold Resistance>=50",
+            "--search-sort",
+            "sum",
+            "--sort",
+            "sum",
+            "--pob",
+            "off",
+            "--no-compare",
+            "--json",
+        ],
+    )
+    assert res.exit_code == 0, res.output
+    assert captured_queries[0]["sort"] == {"statgroup.0": "desc"}
+    assert captured_queries[0]["query"]["stats"][0]["type"] == "weight"
+    data = json.loads(res.output)
+    assert [c["name"] for c in data["candidates"]] == ["High Sum (Slink Gloves)", "Low Sum (Slink Gloves)"]
+    assert [c["weighted_sum"] for c in data["candidates"]] == [88.0, 55.0]
+
+
+
 
 

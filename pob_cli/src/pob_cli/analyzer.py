@@ -240,6 +240,1308 @@ def _has_mageblood_equipped(items_res: dict[str, Any]) -> bool:
     return False
 
 
+def _is_tincture_item(item: dict[str, Any] | None) -> bool:
+    """Return True if a PoB item entry represents a PoE1 Tincture (NOT a Flask)."""
+    if not isinstance(item, dict):
+        return False
+    if str(item.get("type") or "").strip().lower() == "tincture":
+        return True
+    text = " ".join(
+        str(item.get(k) or "")
+        for k in ("name", "nameZh", "title", "titleZh", "baseName", "baseNameZh")
+    ).lower()
+    return "tincture" in text or "酊剂" in text or "sap of the seasons" in text or "四季之侵" in text
+
+
+def _has_bloodsoaked_blade_keystone(
+    worker: BridgeWorker,
+    tree_summary: dict[str, Any] | None = None,
+) -> bool:
+    """Detect whether the Bloodsoaked Blade (`喋血之刃`) keystone is allocated on the passive tree."""
+    if isinstance(tree_summary, dict):
+        for ks in tree_summary.get("keystones") or []:
+            if isinstance(ks, dict):
+                nm = strip_pob_escapes(str(ks.get("name") or "")).lower()
+                nm_zh = strip_pob_escapes(str(ks.get("nameZh") or "")).lower()
+                if "bloodsoaked blade" in nm or "喋血之刃" in nm_zh or int(ks.get("id") or 0) == 13019:
+                    return True
+        return False
+    try:
+        tree_state = worker.call("get_tree_state", {})
+        alloc_ids = {int(x) for x in (tree_state.get("allocatedNodes") or [])}
+        if not alloc_ids:
+            return False
+        if 13019 in alloc_ids:
+            return True
+        nodes_db = worker.get_cached_tree_data(tree_state.get("treeVersion")).get("nodes", {})
+        for nid in alloc_ids:
+            nd = nodes_db.get(str(nid)) or {}
+            nm = str(nd.get("name") or "").lower()
+            if "bloodsoaked blade" in nm:
+                return True
+    except Exception:
+        return False
+    return False
+
+
+POE1_SERVER_TICK_SEC = 0.033
+_GLOBAL_CDR_LINE_RE = re.compile(
+    r"^(?:\{[^}]+\})*\s*\+?(\d+(?:\.\d+)?)%\s+increased\s+cooldown\s+recovery\s+rate\s*$",
+    re.IGNORECASE,
+)
+_ITEM_SOCKETS_RE = re.compile(r"^Sockets:\s*([RGBWADrgbwad\-\s]+)$", re.MULTILINE)
+_ITEM_SEL_VARIANT_RE = re.compile(r"^Selected Variant:\s*(\d+)\s*$", re.MULTILINE)
+_MOD_VARIANT_RE = re.compile(r"\{variant:([0-9,]+)\}")
+_ELE_CURSE_OR_EXPOSURE_NAMES = frozenset(
+    {
+        "conductivity",
+        "flammability",
+        "frostbite",
+        "elemental weakness",
+        "wave of conviction",
+        "hydrosphere",
+        "frost bomb",
+    }
+)
+
+# Exact PoE1 3.30 Cast while Channelling (sup_int.lua) fixed trigger intervals (ms) by gem level
+_CWC_INTERVAL_MS: dict[int, int] = {
+    1: 400, 2: 390, 3: 390, 4: 380, 5: 380, 6: 380, 7: 370, 8: 370, 9: 360, 10: 360,
+    11: 360, 12: 350, 13: 350, 14: 340, 15: 340, 16: 340, 17: 330, 18: 330, 19: 320, 20: 320,
+    21: 320, 22: 310, 23: 310, 24: 300, 25: 300, 26: 300, 27: 290, 28: 290, 29: 280, 30: 280,
+}
+_AWAKENED_CWC_INTERVAL_MS: dict[int, int] = {
+    1: 340, 2: 330, 3: 320, 4: 310, 5: 300, 6: 300, 7: 290, 8: 290, 9: 280, 10: 280,
+}
+
+# Supports whose value is non-DPS utility, multi-hit overlap, or handled by dedicated checks
+# (exempt from generic 0%-delta "dead support" alarm so we NEVER false-alarm).
+_DEAD_SUPPORT_EXEMPT_NAMES = frozenset(
+    {
+        "enlighten",
+        "empower",
+        "enhance",
+        "lifetap",
+        "item rarity",
+        "item quantity",
+        "culling strike",
+        "life leech",
+        "mana leech",
+        "energy shield leech",
+        "life gain on hit",
+        "fortify",
+        "blind",
+        "maim",
+        "power charge on critical",
+        "endurance charge on melee stun",
+        "rage",
+        "arcane surge",
+        "greater multiple projectiles",
+        "awakened greater multiple projectiles",
+        "lesser multiple projectiles",
+        "volley",
+        "greater volley",
+        "returning projectiles",
+        "spell cascade",
+        "greater spell cascade",
+        "awakened spell cascade",
+        "multistrike",
+        "greater multistrike",
+        "awakened multistrike",
+        "spell echo",
+        "greater spell echo",
+        "awakened spell echo",
+        "unleash",
+        "chain",
+        "greater chain",
+        "awakened chain",
+        "fork",
+        "greater fork",
+        "awakened fork",
+        "pierce",
+        "greater pierce",
+        "awakened pierce",
+        "ancestral call",
+        "greater ancestral call",
+        "awakened ancestral call",
+        "melee splash",
+        "awakened melee splash",
+        "increased area of effect",
+        "increased duration",
+        "less duration",
+        "second wind",
+        "cast on critical strike",
+        "awakened cast on critical strike",
+        "cast while channelling",
+        "awakened cast while channelling",
+        "cast when damage taken",
+        "cast when stunned",
+        "cast on death",
+        "cast on melee kill",
+        "cast on ward break",
+        "spellslinger",
+        "arcanist brand",
+        "spell totem",
+        "ballista totem",
+        "multiple totems",
+        "trap",
+        "cluster traps",
+        "multiple traps",
+        "high-impact mine",
+        "blastchain mine",
+        "minefield",
+        "automation",
+        "autoexertion",
+        "generosity",
+        "awakened generosity",
+        "arrogance",
+        "eternal blessing",
+        "guardian's blessing",
+        "hextouch",
+        "awakened hextouch",
+        "mark on hit",
+        "blasphemy",
+        "awakened blasphemy",
+        "manaforged arrows",
+        "bonechill",
+        "feeding frenzy",
+        "meat shield",
+        "elemental army",
+        "minion life",
+        "minion speed",
+        "summon phantasm",
+        "withering touch",
+        "mirage archer",
+        "focused ballista",
+        "shockwave",
+        "prismatic burst",
+    }
+)
+
+_AILMENT_DEPENDENT_SUPPORTS = frozenset({"hypothermia", "immolate", "combustion", "ice bite", "innervate"})
+_ELE_OR_CHAOS_DAMAGE_SUPPORTS = frozenset(
+    {
+        "added fire damage",
+        "added cold damage",
+        "added lightning damage",
+        "added chaos damage",
+        "elemental damage with attacks",
+        "elemental focus",
+        "void manipulation",
+        "trinity",
+        "cold penetration",
+        "fire penetration",
+        "lightning penetration",
+        "elemental penetration",
+        "hypothermia",
+        "immolate",
+    }
+)
+_PURE_ELE_DAMAGE_SUPPORTS = frozenset(
+    {
+        "added fire damage",
+        "added cold damage",
+        "added lightning damage",
+        "elemental damage with attacks",
+        "elemental focus",
+        "trinity",
+        "cold penetration",
+        "fire penetration",
+        "lightning penetration",
+        "elemental penetration",
+        "hypothermia",
+        "immolate",
+    }
+)
+_ELE_AURA_NAMES = frozenset({"hatred", "anger", "wrath"})
+
+
+def _normalize_support_base_name(name: str) -> str:
+    low = strip_pob_escapes(str(name or "")).strip().lower()
+    if low.startswith("awakened "):
+        low = low[len("awakened ") :].strip()
+    if low.endswith(" support"):
+        low = low[: -len(" support")].strip()
+    return low
+
+
+def _awakened_coc_gem_cdr(level: int) -> int:
+    """Exact 3.30 Awakened CoC (`SupportCastOnCritTriggeredPlus`) spell CDR by gem level."""
+    lv = max(1, int(level or 1))
+    return 10 + (lv - 1) * 3
+
+
+def _cwc_interval_ms(level: int, *, awakened: bool = False) -> int:
+    lv = max(1, int(level or 1))
+    if awakened:
+        if lv in _AWAKENED_CWC_INTERVAL_MS:
+            return _AWAKENED_CWC_INTERVAL_MS[lv]
+        return 300 if lv >= 5 else 340
+    if lv in _CWC_INTERVAL_MS:
+        return _CWC_INTERVAL_MS[lv]
+    return 320 if lv >= 20 else max(260, 400 - (lv - 1) * 4)
+
+
+def compute_server_tick_cooldown(
+    base_cd: float,
+    cdr_pct: float,
+    *,
+    aps: float | None = None,
+    triggered_spells: int = 1,
+) -> dict[str, Any]:
+    """Compute exact PoE1 0.033s (33ms, NOT 1/30=33.33ms) server-tick effective cooldown & next breakpoint."""
+    base = max(0.001, float(base_cd))
+    cdr = max(0.0, float(cdr_pct))
+    spells = max(1, int(triggered_spells or 1))
+    raw_cd = base / (1.0 + cdr / 100.0)
+    ticks = max(1, math.ceil(raw_cd / POE1_SERVER_TICK_SEC - 1e-9))
+    eff_cd = round(ticks * POE1_SERVER_TICK_SEC, 3)
+    eff_ms = ticks * 33
+    max_rate = round(1.0 / eff_cd, 2) if eff_cd > 0 else 0.0
+    eff_cap = round(max_rate * spells, 2)
+
+    next_ticks = ticks - 1
+    next_info: dict[str, Any] | None = None
+    if next_ticks >= 1:
+        next_cdr_pct = math.ceil((base / (next_ticks * POE1_SERVER_TICK_SEC) - 1.0) * 100.0 - 1e-9)
+        cdr_delta = max(0, int(next_cdr_pct - math.floor(cdr + 1e-9)))
+        next_rate = round(1.0 / (next_ticks * POE1_SERVER_TICK_SEC), 2)
+        next_info = {
+            "targetTicks": next_ticks,
+            "requiredCdrPct": int(next_cdr_pct),
+            "cdrNeededPct": int(cdr_delta),
+            "effectiveCdSec": round(next_ticks * POE1_SERVER_TICK_SEC, 3),
+            "effectiveCdMs": next_ticks * 33,
+            "maxTriggersPerSec": next_rate,
+            "effectiveCapPerSec": round(next_rate * spells, 2),
+        }
+
+    out: dict[str, Any] = {
+        "baseCdSec": base,
+        "serverTickSec": POE1_SERVER_TICK_SEC,
+        "serverTickMs": 33,
+        "globalCdrPct": round(cdr, 2),
+        "rawCdSec": round(raw_cd, 4),
+        "ticks": ticks,
+        "effectiveCdSec": eff_cd,
+        "effectiveCdMs": eff_ms,
+        "maxTriggersPerSec": max_rate,
+        "triggeredSpells": spells,
+        "effectiveCapPerSec": eff_cap,
+        "nextBreakpoint": next_info,
+    }
+    if aps is not None and math.isfinite(float(aps)) and float(aps) > 0:
+        aps_f = round(float(aps), 2)
+        overspeed = aps_f > (eff_cap * 1.01)
+        out["aps"] = aps_f
+        out["overspeed"] = overspeed
+        out["apsRatioToCap"] = round(aps_f / eff_cap, 3) if eff_cap > 0 else None
+        if overspeed:
+            out["overspeedNote"] = (
+                f"APS ({aps_f:.2f}/s) exceeds trigger cap ({eff_cap:.2f}/s at {cdr:g}% CDR, {ticks}t={eff_ms}ms): "
+                "attacks land during cooldown and HALVE effective trigger rate!"
+            )
+    return out
+
+
+def build_server_tick_table(
+    base_cd: float,
+    *,
+    cdr_pct: float | None = None,
+    aps: float | None = None,
+    triggered_spells: int = 1,
+    max_ticks: int = 16,
+) -> dict[str, Any]:
+    """Build exact PoE1 0.033s (33ms) server-tick CDR breakpoint table for any cooldown skill/trigger."""
+    base = max(0.001, float(base_cd))
+    spells = max(1, int(triggered_spells or 1))
+    base_ticks = max(1, math.ceil(base / POE1_SERVER_TICK_SEC - 1e-9))
+    start_ticks = min(max(1, int(max_ticks)), base_ticks)
+
+    rows: list[dict[str, Any]] = []
+    seen_cdrs: set[int] = set()
+    for t in range(start_ticks, 0, -1):
+        req_cdr = max(0, math.ceil((base / (t * POE1_SERVER_TICK_SEC) - 1.0) * 100.0 - 1e-9))
+        if req_cdr in seen_cdrs:
+            continue
+        seen_cdrs.add(req_cdr)
+        eff_cd = round(t * POE1_SERVER_TICK_SEC, 3)
+        rate = round(1.0 / eff_cd, 2)
+        rows.append(
+            {
+                "ticks": t,
+                "minCdrPct": int(req_cdr),
+                "effectiveCdSec": eff_cd,
+                "effectiveCdMs": t * 33,
+                "maxTriggersPerSec": rate,
+                "maxApsCap": round(rate * spells, 2),
+            }
+        )
+
+    current = (
+        compute_server_tick_cooldown(base, float(cdr_pct), aps=aps, triggered_spells=spells)
+        if cdr_pct is not None
+        else (
+            compute_server_tick_cooldown(base, 0.0, aps=aps, triggered_spells=spells)
+            if aps is not None
+            else None
+        )
+    )
+    return {
+        "baseCdSec": base,
+        "serverTickSec": POE1_SERVER_TICK_SEC,
+        "serverTickMs": 33,
+        "triggeredSpells": spells,
+        "breakpoints": rows,
+        "current": current,
+        "cwcNote": (
+            "Note: Cast while Channelling (CwC) uses a FIXED channelling interval "
+            "(320ms at Lv20, 300ms Awakened Lv5), NOT a Cooldown — CDR has ZERO effect on CwC."
+        ),
+    }
+
+
+def _active_item_lines(raw_text: str | None) -> list[str]:
+    """Return active mod lines from a PoB item raw block (respecting Selected Variant if present)."""
+    if not raw_text:
+        return []
+    m_sel = _ITEM_SEL_VARIANT_RE.search(raw_text)
+    sel_var = int(m_sel.group(1)) if m_sel else None
+    out: list[str] = []
+    for raw_ln in raw_text.splitlines():
+        ln = raw_ln.strip()
+        if not ln:
+            continue
+        if sel_var is not None:
+            mv = _MOD_VARIANT_RE.search(ln)
+            if mv:
+                allowed = {int(x) for x in mv.group(1).split(",") if x.isdigit()}
+                if allowed and sel_var not in allowed:
+                    continue
+        out.append(ln)
+    return out
+
+
+def _count_item_sockets(raw_text: str | None) -> int | None:
+    if not raw_text:
+        return None
+    m = _ITEM_SOCKETS_RE.search(raw_text)
+    if not m:
+        return None
+    letters = re.findall(r"[RGBWADrgbwad]", m.group(1))
+    return len(letters) if letters else None
+
+
+def _extract_global_cdr_sources(
+    alloc_node_stats: list[tuple[str, list[str]]],
+    equipped_slots: list[dict[str, Any]],
+    cfg_res: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Collect global Cooldown Recovery Rate sources (excluding Travel/Guard/Warcry/other-group gem CDR)."""
+    sources: list[dict[str, Any]] = []
+    total_cdr = 0.0
+
+    for node_label, stats_lines in alloc_node_stats:
+        for ln in stats_lines:
+            clean = strip_pob_escapes(str(ln or "")).strip()
+            m = _GLOBAL_CDR_LINE_RE.match(clean)
+            if m:
+                val = float(m.group(1))
+                total_cdr += val
+                sources.append({"source": f"Tree: {node_label}", "value": val, "line": clean})
+
+    for slot_entry in equipped_slots:
+        sname = str(slot_entry.get("slotName") or "")
+        if "Swap" in sname or slot_entry.get("inactive"):
+            continue
+        if slot_entry.get("isFlask") and not slot_entry.get("active"):
+            continue
+        raw_txt = slot_entry.get("raw")
+        if not raw_txt:
+            continue
+        it = slot_entry.get("item") or {}
+        it_name = strip_pob_escapes(str(it.get("title") or it.get("name") or sname))
+        for ln in _active_item_lines(raw_txt):
+            clean = strip_pob_escapes(ln).strip()
+            m = _GLOBAL_CDR_LINE_RE.match(clean)
+            if m:
+                val = float(m.group(1))
+                total_cdr += val
+                sources.append({"source": f"{sname} ({it_name})", "value": val, "line": clean})
+
+    for blk in (cfg_res or {}).get("customMods") or []:
+        if not isinstance(blk, dict) or blk.get("enabled", True) is False:
+            continue
+        for raw_ln in str(blk.get("text") or "").splitlines():
+            clean = strip_pob_escapes(raw_ln).strip()
+            if not clean or clean.startswith("#"):
+                continue
+            m = _GLOBAL_CDR_LINE_RE.match(clean)
+            if m:
+                val = float(m.group(1))
+                total_cdr += val
+                sources.append({"source": "customMods", "value": val, "line": clean})
+
+    return {
+        "totalGlobalCdrPct": round(total_cdr, 2),
+        "sources": sources,
+    }
+
+
+def _detect_build_mechanics_and_pitfalls(
+    *,
+    stats: dict[str, Any],
+    skills_res: dict[str, Any] | None,
+    items_res: dict[str, Any] | None,
+    cfg_res: dict[str, Any] | None,
+    tree_summary: dict[str, Any] | None = None,
+    equipped_slots_raw: list[dict[str, Any]] | None = None,
+    alloc_node_stats: list[tuple[str, list[str]]] | None = None,
+    trigger_attack_aps: float | None = None,
+) -> tuple[list[dict[str, str]], dict[str, Any]]:
+    """Detect high-impact PoE1 3.30 build mechanics, dead/anti-synergy links, triggers, & defensive bricks."""
+    gaps: list[dict[str, str]] = []
+    mechanics: dict[str, Any] = {}
+
+    groups = (skills_res or {}).get("groups") or []
+    main_idx = (skills_res or {}).get("mainSocketGroup")
+    items_by_id = {it["id"]: it for it in (items_res or {}).get("items", [])}
+    slots_list = (items_res or {}).get("slots") or []
+
+    # Check active equipped items by slot name (excluding weapon swap)
+    active_items_by_slot: dict[str, dict[str, Any]] = {}
+    for s in slots_list:
+        iid = s.get("selItemId")
+        sname = str(s.get("name") or "")
+        if iid and not s.get("inactive") and "Swap" not in sname:
+            active_items_by_slot[sname] = items_by_id.get(iid, {})
+
+    raw_by_slot: dict[str, str] = {}
+    for entry in equipped_slots_raw or []:
+        sn = str(entry.get("slotName") or "")
+        if sn and entry.get("raw"):
+            raw_by_slot[sn] = str(entry["raw"])
+
+    def _item_display(it: dict[str, Any]) -> str:
+        return strip_pob_escapes(str(it.get("title") or it.get("name") or "")).strip()
+
+    def _item_names_low(it: dict[str, Any]) -> str:
+        return " ".join(
+            strip_pob_escapes(str(it.get(k) or ""))
+            for k in ("title", "titleZh", "name", "nameZh", "baseName", "baseNameZh")
+        ).lower()
+
+    w1_item = active_items_by_slot.get("Weapon 1") or {}
+    has_sword_of_ages = "the sword of ages" in _item_names_low(w1_item)
+
+    # Check allocated keystones & ascendancy names
+    ks_lower: set[str] = set()
+    asc_names_lower: set[str] = set()
+    if isinstance(tree_summary, dict):
+        for ks in tree_summary.get("keystones") or []:
+            if isinstance(ks, dict):
+                ks_lower.add(strip_pob_escapes(str(ks.get("name") or "")).lower())
+        for an in tree_summary.get("ascendancyNodes") or []:
+            if isinstance(an, dict):
+                asc_names_lower.add(strip_pob_escapes(str(an.get("name") or "")).lower())
+
+    has_perfect_crime = "perfect crime" in asc_names_lower
+    has_bloodsoaked_blade = "bloodsoaked blade" in ks_lower
+    has_living_blade = "the living blade" in asc_names_lower
+    has_toads_price = "toad's price" in asc_names_lower
+
+    # Check customMods active lines
+    active_custom_lines: list[str] = []
+    for blk in (cfg_res or {}).get("customMods") or []:
+        if isinstance(blk, dict) and blk.get("enabled", True) is not False:
+            for ln in str(blk.get("text") or "").splitlines():
+                s_ln = strip_pob_escapes(ln).strip()
+                if s_ln and not s_ln.startswith("#"):
+                    active_custom_lines.append(s_ln)
+    custom_mods_joined = "\n".join(active_custom_lines).lower()
+
+    # Collect global CDR once for all cooldown triggers (Sword of Ages, CoC, Cospri, Mjolner, Poet's Pen, etc.)
+    cdr_data = _extract_global_cdr_sources(
+        alloc_node_stats or [],
+        equipped_slots_raw or [],
+        cfg_res,
+    )
+    global_cdr_pct = float(cdr_data["totalGlobalCdrPct"])
+
+    # Collect all enabled non-swap active skill names across the build (for aura/burning cross-checks)
+    all_active_non_swap_low: set[str] = set()
+    for g in groups:
+        if not g.get("enabled", True) or "Swap" in str(g.get("slot") or ""):
+            continue
+        for gm in g.get("gems") or []:
+            if gm.get("enabled", True) and not gm.get("support"):
+                all_active_non_swap_low.add(
+                    strip_pob_escapes(str(gm.get("name") or gm.get("nameSpec") or "")).strip().lower()
+                )
+
+    # 1. Main group dead/anti-synergy supports + Firestorm/Cascade cap + Lv1 + empty sockets
+    main_mana_cost = _finite_float(stats.get("ManaCost"), default=-1.0)
+    main_group = next(
+        (g for g in groups if g.get("isMain") or (main_idx is not None and g.get("index") == main_idx)),
+        None,
+    )
+    if main_group and main_group.get("enabled", True):
+        mg_idx = main_group.get("index")
+        mg_slot = str(main_group.get("slot") or "")
+        mg_gems = [gm for gm in (main_group.get("gems") or []) if gm.get("enabled", True)]
+        mg_names_low = {strip_pob_escapes(str(gm.get("name") or gm.get("nameSpec") or "")).lower() for gm in mg_gems}
+        mg_skill_ids = {str(gm.get("skillId") or "") for gm in mg_gems}
+        mg_sup_norms = {
+            _normalize_support_base_name(str(gm.get("name") or gm.get("nameSpec") or ""))
+            for gm in mg_gems
+            if gm.get("support")
+        }
+
+        is_zero_mana_group = (main_mana_cost == 0.0) or (has_sword_of_ages and mg_slot == "Weapon 1")
+        has_arcane_surge_in_main = (
+            "SupportArcaneSurge" in mg_skill_ids
+            or "arcane surge" in mg_sup_norms
+        )
+        if is_zero_mana_group and has_arcane_surge_in_main:
+            gaps.append(
+                {
+                    "category": "Mechanic",
+                    "severity": "HIGH",
+                    "message": (
+                        f"Dead Arcane Surge Support in 0-mana triggered Group #{mg_idx} ({mg_slot or 'main'}): "
+                        "Arcane Surge requires spending mana and NEVER procs on a 0-mana triggered skill; "
+                        "PoB buffArcaneSurge=True is fake water. Move Arcane Surge to a mana-spending utility skill "
+                        "(e.g. Arcane Cloak/Frostblink) and replace with a real damage support."
+                    ),
+                }
+            )
+
+        # Inspiration Support in a 0-mana group generates 0 Inspiration Charges in live play
+        if is_zero_mana_group and (
+            "SupportInspiration" in mg_skill_ids or "inspiration" in mg_sup_norms
+        ):
+            gaps.append(
+                {
+                    "category": "Mechanic",
+                    "severity": "HIGH",
+                    "message": (
+                        f"Dead Inspiration Support in 0-mana Group #{mg_idx} ({mg_slot or 'main'}): "
+                        "Inspiration Support in a 0-mana group generates 0 Inspiration Charges in live play — "
+                        "PoB max-charge assumption is fake water! Spend mana on a linked/supported skill or swap support."
+                    ),
+                }
+            )
+
+        # Elemental Focus + Ailment-dependent supports (Hypothermia / Immolate / Combustion / Ice Bite / Innervate)
+        if "elemental focus" in mg_sup_norms:
+            ailment_conflicts = sorted(mg_sup_norms & _AILMENT_DEPENDENT_SUPPORTS)
+            if ailment_conflicts:
+                c_disp = ", ".join(x.title() for x in ailment_conflicts)
+                gaps.append(
+                    {
+                        "category": "Mechanic",
+                        "severity": "HIGH",
+                        "message": (
+                            f"Anti-synergy in Group #{mg_idx}: Elemental Focus prevents the supported skill from "
+                            f"inflicting Elemental Ailments (Chill/Freeze/Ignite/Shock), disabling linked {c_disp} "
+                            "unless a separate skill/ground effect reliably applies the ailment (verify PoB enemy "
+                            "Chilled/Ignited config is NOT fake water!)."
+                        ),
+                    }
+                )
+
+        # Brutality + Elemental/Chaos damage supports or auras
+        if "brutality" in mg_sup_norms:
+            brut_sup_conflicts = sorted(mg_sup_norms & _ELE_OR_CHAOS_DAMAGE_SUPPORTS)
+            brut_aura_conflicts = sorted(all_active_non_swap_low & _ELE_AURA_NAMES)
+            if brut_sup_conflicts or brut_aura_conflicts:
+                parts = [x.title() for x in brut_sup_conflicts] + [f"{x.title()} (aura)" for x in brut_aura_conflicts]
+                gaps.append(
+                    {
+                        "category": "Mechanic",
+                        "severity": "HIGH",
+                        "message": (
+                            f"Anti-synergy in Group #{mg_idx}: Brutality Support causes supported skill to deal NO "
+                            f"Elemental or Chaos damage, nullifying {', '.join(parts)}!"
+                        ),
+                    }
+                )
+
+        # Void Manipulation + Pure Elemental damage supports
+        if "void manipulation" in mg_sup_norms:
+            vm_conflicts = sorted(mg_sup_norms & _PURE_ELE_DAMAGE_SUPPORTS)
+            if vm_conflicts:
+                gaps.append(
+                    {
+                        "category": "Mechanic",
+                        "severity": "HIGH",
+                        "message": (
+                            f"Anti-synergy in Group #{mg_idx}: Void Manipulation prevents Elemental damage, "
+                            f"nullifying {', '.join(x.title() for x in vm_conflicts)}!"
+                        ),
+                    }
+                )
+
+        # Controlled Destruction on CoC or high-crit builds
+        if "controlled destruction" in mg_sup_norms:
+            has_coc_main = "cast on critical strike" in mg_sup_norms
+            crit_val = _finite_float(stats.get("CritChance"), default=0.0)
+            if has_coc_main:
+                gaps.append(
+                    {
+                        "category": "Mechanic",
+                        "severity": "HIGH",
+                        "message": (
+                            f"Anti-synergy in Group #{mg_idx}: Controlled Destruction (80% less Crit Chance) "
+                            "bricks Cast On Critical Strike trigger reliability!"
+                        ),
+                    }
+                )
+            elif crit_val >= 35.0:
+                gaps.append(
+                    {
+                        "category": "Mechanic",
+                        "severity": "MEDIUM",
+                        "message": (
+                            f"Caveat in Group #{mg_idx}: Controlled Destruction imposes 80% less Critical Strike Chance "
+                            f"on a crit build (current CritChance={crit_val:.1f}%)."
+                        ),
+                    }
+                )
+
+        # Immolate without Ignite chance or burning ground
+        if "immolate" in mg_sup_norms and "elemental focus" not in mg_sup_norms:
+            ignite_ch = _finite_float(stats.get("IgniteChance"), default=-1.0)
+            has_burn_skill = any(
+                k in nm
+                for nm in all_active_non_swap_low
+                for k in ("righteous fire", "flame wall", "scorching ray", "searing bond", "fire trap")
+            )
+            if ignite_ch == 0.0 and not has_burn_skill:
+                gaps.append(
+                    {
+                        "category": "Mechanic",
+                        "severity": "MEDIUM",
+                        "message": (
+                            f"Conditional Support in Group #{mg_idx}: Immolate requires enemies to be Burning/Ignited, "
+                            "but build has 0% Ignite Chance and no burning-ground skill."
+                        ),
+                    }
+                )
+
+        # Firestorm of Pelting + Greater Spell Cascade 12-storm cap + Lv1 check
+        if any("firestorm of pelting" in nm for nm in mg_names_low) and any(
+            "greater spell cascade" in nm or "spell cascade" in nm for nm in mg_names_low
+        ):
+            gaps.append(
+                {
+                    "category": "Mechanic",
+                    "severity": "HIGH",
+                    "message": (
+                        f"Group #{mg_idx} links Firestorm of Pelting with Spell Cascade / Greater Spell Cascade: "
+                        "all cascades share Firestorm of Pelting's global 12-storm cap (hurts single-target DPS "
+                        "while adding Less Area Damage penalty)."
+                    ),
+                }
+            )
+
+        # Check under-leveled Lv1 support gems in main group (excluding Empower/Enlighten/Enhance/CwDT)
+        for gm in mg_gems:
+            if gm.get("fromItem") or not gm.get("support"):
+                continue
+            g_lvl = int(gm.get("level") or 0)
+            g_name = strip_pob_escapes(str(gm.get("name") or gm.get("nameSpec") or ""))
+            g_low = g_name.lower()
+            if g_lvl == 1 and not any(
+                ex in g_low
+                for ex in ("empower", "enlighten", "enhance", "cast when damage taken", "arcane surge", "culling strike", "invert the rules")
+            ):
+                gaps.append(
+                    {
+                        "category": "Skills",
+                        "severity": "MEDIUM",
+                        "message": f"Main Group #{mg_idx} has Level 1 support gem '{g_name}' (check if under-leveled).",
+                    }
+                )
+
+        # Check empty sockets on 5/6-socket main item
+        if mg_slot and mg_slot in raw_by_slot:
+            total_socks = _count_item_sockets(raw_by_slot[mg_slot])
+            if total_socks is not None and total_socks >= 5:
+                used_socks = sum(
+                    1
+                    for g in groups
+                    if g.get("slot") == mg_slot and not g.get("source")
+                    for gm in (g.get("gems") or [])
+                    if not gm.get("fromItem")
+                )
+                if used_socks < total_socks:
+                    gaps.append(
+                        {
+                            "category": "Skills",
+                            "severity": "HIGH",
+                            "message": (
+                                f"Main skill item '{mg_slot}' has {total_socks} sockets but only {used_socks} gem(s) socketed "
+                                f"({total_socks - used_socks} empty socket(s))!"
+                            ),
+                        }
+                    )
+
+    # 2. Orphan support gems in Weapon Swap
+    for g in groups:
+        g_slot = str(g.get("slot") or "")
+        if "Swap" not in g_slot:
+            continue
+        g_gems = [gm for gm in (g.get("gems") or []) if not gm.get("fromItem")]
+        if not g_gems:
+            continue
+        sup_gems = [gm for gm in g_gems if gm.get("support")]
+        act_gems = [gm for gm in g_gems if not gm.get("support")]
+        if sup_gems and not act_gems:
+            names_s = ", ".join(
+                strip_pob_escapes(str(gm.get("nameZh") or gm.get("name") or ""))
+                for gm in sup_gems
+            )
+            gaps.append(
+                {
+                    "category": "Skills",
+                    "severity": "HIGH",
+                    "message": (
+                        f"Orphan support gem(s) in '{g_slot}' (Group #{g.get('index')}: {names_s}) — "
+                        "inactive in weapon swap (check if mistakenly left out of main link)!"
+                    ),
+                }
+            )
+        elif any("archmage" in strip_pob_escapes(str(gm.get("name") or "")).lower() for gm in sup_gems):
+            names_s = ", ".join(
+                strip_pob_escapes(str(gm.get("nameZh") or gm.get("name") or ""))
+                for gm in g_gems
+            )
+            gaps.append(
+                {
+                    "category": "Skills",
+                    "severity": "HIGH",
+                    "message": (
+                        f"Core support gem (Archmage) sitting in '{g_slot}' (Group #{g.get('index')}: {names_s}) — "
+                        "inactive in weapon swap!"
+                    ),
+                }
+            )
+
+    # 3. The Sword of Ages (Temporal Mirage) 3.30 Live-vs-PoB Advisory & 0.033s Server Tick Cooldown Breakdown
+    if has_sword_of_ages:
+        tick_info = compute_server_tick_cooldown(0.50, global_cdr_pct)
+        has_43_comp = bool(re.search(r"4[23](?:\.\d+)?%\s+more\s+spell\s+damage", custom_mods_joined))
+        soa_block: dict[str, Any] = {
+            "equipped": True,
+            "baseCooldownSec": 0.50,
+            "globalCdrPct": global_cdr_pct,
+            "cdrSources": cdr_data["sources"],
+            "temporalMirageCooldown": tick_info,
+            "hasPerfectCrime": has_perfect_crime,
+            "hasTriggerbotCompensationCustomMod": has_43_comp,
+            "advisories": [
+                (
+                    "PoB 2.68.1 `other.lua` misses Temporal Mirage's 0.50s base cooldown AND wrongly applies Saboteur "
+                    "`Perfect Crime` (Triggerbots) `30% less` damage to clones. 3.30 live game verified: clones do NOT take "
+                    "`-30% less` (`43% more Spell Damage` in customMods is the exact PoB compensation"
+                    + ("; ALREADY PRESENT in customMods" if has_43_comp else ("; currently MISSING in customMods" if has_perfect_crime else ""))
+                    + ")."
+                ),
+                (
+                    "`on using a Movement Attack`: holding channelling `Cyclone` triggers ONLY ONCE on channel start "
+                    "(never continuously while held); requires tap-macro (interval >= "
+                    f"{tick_info['effectiveCdMs']}ms + jitter margin) or discrete movement attacks "
+                    "(`Leap Slam`/`Flicker Strike`/`Consecrated Path`)."
+                ),
+            ],
+        }
+        mechanics["swordOfAges"] = soa_block
+        if has_perfect_crime and not has_43_comp:
+            gaps.append(
+                {
+                    "category": "PoBModeling",
+                    "severity": "MEDIUM",
+                    "message": (
+                        "The Sword of Ages + Saboteur Perfect Crime: PoB 2.68.1 wrongly applies Triggerbots -30% less "
+                        "to Temporal Mirage clones (live 3.30 does NOT). Add `43% more Spell Damage` in customMods to model true live DPS."
+                    ),
+                }
+            )
+
+    # 3b. Universal PoE1 Trigger, Cooldown (0.033s Tick) & APS Overspeed Engine + CwC Fixed Interval
+    triggers_detected: list[dict[str, Any]] = []
+    seen_trigger_keys: set[str] = set()
+    main_speed = _finite_float(stats.get("Speed"), default=0.0)
+    eff_attack_aps = (
+        float(trigger_attack_aps)
+        if (trigger_attack_aps is not None and math.isfinite(float(trigger_attack_aps)) and float(trigger_attack_aps) > 0)
+        else (main_speed if main_speed > 0 else None)
+    )
+
+    for g in groups:
+        if not g.get("enabled", True) or "Swap" in str(g.get("slot") or ""):
+            continue
+        g_idx = g.get("index")
+        is_mg = bool(g.get("isMain")) or (main_idx is not None and g_idx == main_idx)
+        g_gems = [gm for gm in (g.get("gems") or []) if gm.get("enabled", True)]
+        act_gems_in_g = [gm for gm in g_gems if not gm.get("support")]
+
+        for gm in g_gems:
+            gnm = strip_pob_escapes(str(gm.get("name") or gm.get("nameSpec") or "")).strip()
+            glow = gnm.lower()
+            gsid = str(gm.get("skillId") or "")
+            glvl = int(gm.get("level") or 20)
+
+            # Cast On Critical Strike / Awakened CoC
+            if (
+                "cast on critical strike" in glow
+                or gsid in ("SupportCastOnCriticalStrike", "SupportAwakenedCastOnCriticalStrike")
+            ):
+                is_awk = "awakened" in glow or gsid == "SupportAwakenedCastOnCriticalStrike"
+                gem_cdr = _awakened_coc_gem_cdr(glvl) if is_awk else 0
+                total_cdr = round(global_cdr_pct + gem_cdr, 2)
+                num_spells = max(1, len(act_gems_in_g) - 1) if len(act_gems_in_g) >= 2 else 1
+                aps_for_group = eff_attack_aps if is_mg else None
+                tick = compute_server_tick_cooldown(0.15, total_cdr, aps=aps_for_group, triggered_spells=num_spells)
+                trig_entry: dict[str, Any] = {
+                    "kind": "cooldown_trigger",
+                    "name": gnm,
+                    "groupIndex": g_idx,
+                    "slot": g.get("slot") or "-",
+                    "baseCooldownSec": 0.15,
+                    "globalCdrPct": global_cdr_pct,
+                    "gemCdrPct": gem_cdr,
+                    "totalCdrPct": total_cdr,
+                    "cdrSources": cdr_data["sources"],
+                    "triggeredSpells": num_spells,
+                    "cooldown": tick,
+                }
+                triggers_detected.append(trig_entry)
+                if tick.get("overspeed") and aps_for_group is not None:
+                    nb = tick.get("nextBreakpoint") or {}
+                    next_hint = (
+                        f" or reach next CDR breakpoint ({nb['requiredCdrPct']}% CDR -> {nb['targetTicks']}t = "
+                        f"{nb['effectiveCdMs']}ms, cap {nb['effectiveCapPerSec']:.2f}/s)"
+                        if nb
+                        else ""
+                    )
+                    gaps.append(
+                        {
+                            "category": "TriggerOverspeed",
+                            "severity": "HIGH",
+                            "message": (
+                                f"Trigger Overspeed ({gnm}, Group #{g_idx}): Attack rate ({aps_for_group:.2f}/s) "
+                                f"exceeds CoC trigger cap ({tick['effectiveCapPerSec']:.2f}/s at {total_cdr:g}% CDR, "
+                                f"{tick['ticks']}t = {tick['effectiveCdMs']}ms) — attacks land inside cooldown and "
+                                f"HALVE effective trigger rate! Either lower APS <= {tick['effectiveCapPerSec']:.2f}/s{next_hint}."
+                            ),
+                        }
+                    )
+
+            # Cast while Channelling / Awakened CwC (FIXED INTERVAL — NOT a Cooldown!)
+            elif (
+                "cast while channelling" in glow
+                or gsid in ("SupportCastWhileChannelling", "SupportAwakenedCastWhileChannelling")
+            ):
+                is_awk = "awakened" in glow or gsid == "SupportAwakenedCastWhileChannelling"
+                iv_ms = _cwc_interval_ms(glvl, awakened=is_awk)
+                triggers_detected.append(
+                    {
+                        "kind": "fixed_interval_channelling",
+                        "name": gnm,
+                        "groupIndex": g_idx,
+                        "slot": g.get("slot") or "-",
+                        "level": glvl,
+                        "intervalMs": iv_ms,
+                        "intervalSec": round(iv_ms / 1000.0, 3),
+                        "scaledByCdr": False,
+                        "note": (
+                            f"`{gnm}` (Lv.{glvl}) uses a **fixed channelling trigger interval of {iv_ms}ms "
+                            f"({iv_ms / 1000.0:.2f}s)**, NOT a Cooldown — `Cooldown Recovery Rate (CDR)` has "
+                            "**ZERO effect** on CwC trigger rate!"
+                        ),
+                    }
+                )
+
+            # Spellslinger (0.60s base CD)
+            elif glow == "spellslinger" or gsid == "Spellslinger":
+                tkey = f"spellslinger:{g_idx}"
+                if tkey not in seen_trigger_keys:
+                    seen_trigger_keys.add(tkey)
+                    tick = compute_server_tick_cooldown(0.60, global_cdr_pct)
+                    triggers_detected.append(
+                        {
+                            "kind": "cooldown_trigger",
+                            "name": "Spellslinger",
+                            "groupIndex": g_idx,
+                            "slot": g.get("slot") or "-",
+                            "baseCooldownSec": 0.60,
+                            "globalCdrPct": global_cdr_pct,
+                            "totalCdrPct": global_cdr_pct,
+                            "cooldown": tick,
+                        }
+                    )
+
+            # Cast when Damage Taken (0.25s base CD, main group only to avoid CwDT-Molten-Shell noise)
+            elif is_mg and ("cast when damage taken" in glow or gsid == "SupportCastWhenDamageTaken"):
+                tick = compute_server_tick_cooldown(0.25, global_cdr_pct)
+                triggers_detected.append(
+                    {
+                        "kind": "cooldown_trigger",
+                        "name": gnm,
+                        "groupIndex": g_idx,
+                        "slot": g.get("slot") or "-",
+                        "baseCooldownSec": 0.25,
+                        "globalCdrPct": global_cdr_pct,
+                        "totalCdrPct": global_cdr_pct,
+                        "cooldown": tick,
+                    }
+                )
+
+    # Item-granted cooldown triggers (Cospri's Malice, Mjolner, Poet's Pen, Hidden Blade, Kitava's Thirst)
+    _ITEM_TRIGGER_SPECS: tuple[tuple[str, str, float, bool], ...] = (
+        ("cospri's malice", "Cospri's Malice", 0.25, True),
+        ("mjölner", "Mjölner", 0.25, True),
+        ("mjolner", "Mjölner", 0.25, True),
+        ("the poet's pen", "The Poet's Pen", 0.25, True),
+        ("the hidden blade", "The Hidden Blade", 0.50, False),
+        ("kitava's thirst", "Kitava's Thirst", 0.10, False),
+    )
+    for sname, it in active_items_by_slot.items():
+        nm_low = _item_names_low(it)
+        for pat, disp_name, b_cd, is_atk_trig in _ITEM_TRIGGER_SPECS:
+            if pat in nm_low and disp_name not in seen_trigger_keys:
+                seen_trigger_keys.add(disp_name)
+                aps_for_item = eff_attack_aps if is_atk_trig else None
+                tick = compute_server_tick_cooldown(b_cd, global_cdr_pct, aps=aps_for_item)
+                triggers_detected.append(
+                    {
+                        "kind": "item_cooldown_trigger",
+                        "name": disp_name,
+                        "slot": sname,
+                        "baseCooldownSec": b_cd,
+                        "globalCdrPct": global_cdr_pct,
+                        "totalCdrPct": global_cdr_pct,
+                        "cooldown": tick,
+                    }
+                )
+                if is_atk_trig and tick.get("overspeed") and aps_for_item is not None:
+                    nb = tick.get("nextBreakpoint") or {}
+                    next_hint = (
+                        f" or reach {nb['requiredCdrPct']}% CDR ({nb['targetTicks']}t={nb['effectiveCdMs']}ms, cap {nb['effectiveCapPerSec']:.2f}/s)"
+                        if nb
+                        else ""
+                    )
+                    gaps.append(
+                        {
+                            "category": "TriggerOverspeed",
+                            "severity": "HIGH",
+                            "message": (
+                                f"Trigger Overspeed ({disp_name}, {sname}): Attack rate ({aps_for_item:.2f}/s) "
+                                f"exceeds trigger cap ({tick['effectiveCapPerSec']:.2f}/s at {global_cdr_pct:g}% CDR, "
+                                f"{tick['ticks']}t = {tick['effectiveCdMs']}ms) — lower APS <= {tick['effectiveCapPerSec']:.2f}/s{next_hint}."
+                            ),
+                        }
+                    )
+
+    if triggers_detected:
+        mechanics["triggers"] = triggers_detected
+
+    # 4. Invert the Rules / Resistance Inversion Conflict Detector
+    invert_sources: list[str] = []
+    for g in groups:
+        if not g.get("enabled", True) or "Swap" in str(g.get("slot") or ""):
+            continue
+        for gm in g.get("gems") or []:
+            if not gm.get("enabled", True):
+                continue
+            gnm = strip_pob_escapes(str(gm.get("name") or gm.get("nameSpec") or ""))
+            if "invert the rules" in gnm.lower() or str(gm.get("skillId") or "") == "SupportInvertTheRules":
+                invert_sources.append(f"Group #{g.get('index')} Invert the Rules Support")
+    for sname, raw_txt in raw_by_slot.items():
+        if "Swap" in sname:
+            continue
+        for ln in _active_item_lines(raw_txt):
+            if "resistance values as inverted" in ln.lower() or "resistances as inverted" in ln.lower():
+                it_nm = _item_display(active_items_by_slot.get(sname) or {}) or sname
+                invert_sources.append(f"{sname} ({it_nm}): {strip_pob_escapes(ln)}")
+    for n_lbl, n_stats in alloc_node_stats or []:
+        for ln in n_stats:
+            if "resistance values as inverted" in str(ln).lower() or "resistances as inverted" in str(ln).lower():
+                invert_sources.append(f"Tree ({n_lbl}): {strip_pob_escapes(ln)}")
+
+    if invert_sources:
+        curse_hits_active: list[str] = []
+        curse_hits_swap: list[str] = []
+        for g in groups:
+            if not g.get("enabled", True):
+                continue
+            is_swap = "Swap" in str(g.get("slot") or "")
+            for gm in g.get("gems") or []:
+                if not gm.get("enabled", True):
+                    continue
+                gnm = strip_pob_escapes(str(gm.get("name") or gm.get("nameSpec") or ""))
+                if gnm.lower() in _ELE_CURSE_OR_EXPOSURE_NAMES:
+                    label = f"{gnm} (Group #{g.get('index')} {g.get('slot') or '-'})"
+                    if is_swap:
+                        curse_hits_swap.append(label)
+                    else:
+                        curse_hits_active.append(label)
+        mechanics["resistanceInversion"] = {
+            "sources": invert_sources,
+            "conflictingActiveCursesOrExposure": curse_hits_active,
+            "conflictingSwapCursesOrExposure": curse_hits_swap,
+            "note": (
+                "Lowering enemy elemental resistance via Curses/Exposure BEFORE inversion shrinks the inverted "
+                "negative-resistance bonus; Elemental Penetration applies AFTER inversion and still works fully."
+            ),
+        }
+        if curse_hits_active:
+            gaps.append(
+                {
+                    "category": "Mechanic",
+                    "severity": "HIGH",
+                    "message": (
+                        f"Resistance Inversion anti-synergy: {', '.join(invert_sources[:2])} is active alongside "
+                        f"resistance-lowering skill(s) {', '.join(curse_hits_active)} — lowering enemy resistance before "
+                        "inversion REDUCES inverted bonus (use Elemental Penetration instead, which applies after inversion)."
+                    ),
+                }
+            )
+        elif curse_hits_swap:
+            gaps.append(
+                {
+                    "category": "Mechanic",
+                    "severity": "LOW",
+                    "message": (
+                        f"Resistance Inversion note ({invert_sources[0]}): do NOT pair with elemental curses/exposure "
+                        f"(seen in swap: {', '.join(curse_hits_swap)}); Penetration still works after inversion."
+                    ),
+                }
+            )
+
+    # 5. Bloodsoaked Blade + Tinctures + Screams of the Desiccated Awareness
+    active_tinctures: list[str] = []
+    for s in slots_list:
+        if s.get("isFlask") and s.get("active") and s.get("selItemId"):
+            it = items_by_id.get(s["selItemId"], {})
+            if _is_tincture_item(it):
+                active_tinctures.append(f"{s['name']}: {_item_display(it)}")
+    belt_item = active_items_by_slot.get("Belt") or {}
+    has_screams_belt = "screams of the desiccated" in _item_display(belt_item).lower()
+    if has_bloodsoaked_blade or active_tinctures or has_screams_belt:
+        t_limit = int(_finite_float(stats.get("TinctureLimit"), default=1.0))
+        mechanics["tinctureSetup"] = {
+            "bloodsoakedBlade": has_bloodsoaked_blade,
+            "theLivingBlade": has_living_blade,
+            "toadsPrice": has_toads_price,
+            "screamsOfTheDesiccated": has_screams_belt,
+            "tinctureLimit": t_limit,
+            "activeTinctureCount": len(active_tinctures),
+            "activeTinctures": active_tinctures,
+            "note": (
+                f"Active Tinctures: {len(active_tinctures)}/{t_limit}"
+                + (" (valid +2 limit from Reliquarian 'The Living Blade' / 活木之刃)" if has_living_blade else "")
+                + ". CRITICAL PoE1 rule: **Tinctures are NOT Flasks** — `Screams of the Desiccated` "
+                "('while affected by no Flasks') works 100% with active Tinctures"
+                + (" (reinforced by `Toad's Price` disabling Utility Flasks)" if has_toads_price else "")
+                + (
+                    "; `Bloodsoaked Blade` sustains Tinctures via Life Regen against Weeping Wounds (not temporary flask water)."
+                    if has_bloodsoaked_blade
+                    else "."
+                )
+            ),
+        }
+
+    # 6. Dark Bargain / Dark Pact count > 1 with Greater Spell Echo / Spell Echo double-counting FullDPS
+    for g in groups:
+        if not g.get("enabled", True) or not g.get("includeInFullDPS"):
+            continue
+        g_gems = [gm for gm in (g.get("gems") or []) if gm.get("enabled", True)]
+        echo_gem = next(
+            (
+                strip_pob_escapes(str(gm.get("name") or gm.get("nameSpec") or ""))
+                for gm in g_gems
+                if gm.get("support")
+                and "spell echo" in strip_pob_escapes(str(gm.get("name") or gm.get("nameSpec") or "")).lower()
+            ),
+            None,
+        )
+        if not echo_gem:
+            continue
+        for gm in g_gems:
+            if gm.get("support"):
+                continue
+            gnm = strip_pob_escapes(str(gm.get("name") or gm.get("nameSpec") or ""))
+            cnt = int(gm.get("count") or 1)
+            if cnt > 1 and any(k in gnm.lower() for k in ("dark bargain", "dark pact")):
+                gaps.append(
+                    {
+                        "category": "PoBWater",
+                        "severity": "HIGH",
+                        "message": (
+                            f"Group #{g.get('index')} '{gnm}' has count={cnt} with '{echo_gem}' enabled (includeInFullDPS=True): "
+                            f"PoB already models Spell Echo repeats in skill DPS, so count={cnt} double-counts FullDPS by {cnt}x!"
+                        ),
+                    }
+                )
+
+    # 7. Universal Defensive & Sustain Brick Detectors
+    defensive_bricks: list[str] = []
+    life_val = _finite_float(stats.get("Life"), default=0.0)
+    life_unres = _finite_float(stats.get("LifeUnreserved"), default=life_val)
+    life_unres_pct = (
+        _finite_float(stats.get("LifeUnreservedPercent"), default=100.0)
+        if stats.get("LifeUnreservedPercent") is not None
+        else ((life_unres / life_val * 100.0) if life_val > 0 else 100.0)
+    )
+    mana_unres = _finite_float(stats.get("ManaUnreserved"), default=-1.0)
+    mana_unres_pct = (
+        _finite_float(stats.get("ManaUnreservedPercent"), default=100.0)
+        if stats.get("ManaUnreservedPercent") is not None
+        else 100.0
+    )
+    es_val = _finite_float(stats.get("EnergyShield"), default=0.0)
+    chaos_res = _finite_float(stats.get("ChaosResist"), default=0.0)
+    has_ci = ("chaos inoculation" in ks_lower) or (0.0 < life_val <= 1.0)
+    has_eb = "eldritch battery" in ks_lower
+
+    # 7a. EB + CI fatal brick
+    if has_eb and has_ci:
+        msg = (
+            "FATAL Keystone Brick — Eldritch Battery + Chaos Inoculation (EB + CI): "
+            "CI sets Maximum Life to 1 while EB moves Energy Shield to protect Mana instead of Life, "
+            "leaving 1 Life and 0 ES protecting your Life pool (instant death to any hit)!"
+        )
+        gaps.append({"category": "DefensiveBrick", "severity": "HIGH", "message": msg})
+        defensive_bricks.append(msg)
+
+    # 7b. Low-Life Chaos Bypass & Esh's Visage Brick
+    is_low_life = (not has_ci) and life_val > 1.0 and (
+        life_unres_pct <= 50.0 or (life_val > 0 and (life_unres / life_val) <= 0.50)
+    )
+    equipped_names_all = {sn: _item_names_low(it) for sn, it in active_items_by_slot.items()}
+    esh_slot = next(
+        (sn for sn, nl in equipped_names_all.items() if "esh's visage" in nl or "艾许之面" in nl),
+        None,
+    )
+    has_shavs = any("shavronne's wrappings" in nl or "薛朗的护身长袍" in nl for nl in equipped_names_all.values())
+    has_solaris = any("solaris lorica" in nl or "烈炎之袍" in nl for nl in equipped_names_all.values())
+    has_ivory = any("the ivory tower" in nl or "象牙之塔" in nl for nl in equipped_names_all.values())
+    has_active_coruscating = any(
+        s.get("isFlask")
+        and s.get("active")
+        and s.get("selItemId")
+        and ("coruscating elixir" in _item_names_low(items_by_id.get(s["selItemId"], {})) or "闪耀精华" in _item_names_low(items_by_id.get(s["selItemId"], {})))
+        for s in slots_list
+    )
+    has_unconditional_chaos_shield = False
+    for sn, raw_txt in raw_by_slot.items():
+        if "Swap" in sn or sn == esh_slot:
+            continue
+        for ln in _active_item_lines(raw_txt):
+            ll = ln.lower()
+            if "chaos damage" in ll and "does not bypass energy shield" in ll and "low life" not in ll:
+                has_unconditional_chaos_shield = True
+                break
+
+    if esh_slot is not None:
+        esh_raw = raw_by_slot.get(esh_slot, "")
+        esh_checks_low_mana = any("low mana" in ln.lower() for ln in _active_item_lines(esh_raw))
+        is_low_mana = mana_unres_pct <= 35.0
+        if is_low_life or (esh_checks_low_mana and is_low_mana):
+            reason = (
+                f"Low Life (LifeUnreserved={life_unres:.0f}/{life_val:.0f} = {life_unres_pct:.1f}% <= 50%)"
+                if is_low_life
+                else f"Low Mana (ManaUnreserved={mana_unres_pct:.1f}% <= 35%)"
+            )
+            msg = (
+                f"CRITICAL Low-Life Brick — Esh's Visage ({esh_slot}: 'Chaos Damage taken does not bypass ES "
+                f"while NOT on Low Life') is BROKEN because character is on {reason}! "
+                "Chaos damage bypasses Energy Shield completely and one-shots unreserved Life! "
+                "Fix: equip Shavronne's Wrappings, Solaris Lorica, The Ivory Tower (with unreserved Mana), "
+                "100%-uptime Coruscating Elixir, or switch to Chaos Inoculation (CI)."
+            )
+            gaps.append({"category": "DefensiveBrick", "severity": "HIGH", "message": msg})
+            defensive_bricks.append(msg)
+    elif (
+        is_low_life
+        and es_val > max(life_unres * 2.0, 500.0)
+        and not (has_shavs or has_solaris or has_ivory or has_active_coruscating or has_unconditional_chaos_shield)
+    ):
+        msg = (
+            f"Low-Life Chaos Bypass Risk: character is on Low Life ({life_unres:.0f}/{life_val:.0f} = "
+            f"{life_unres_pct:.1f}% unreserved, ES {es_val:.0f}, Chaos Res {chaos_res:.0f}%) with NO active "
+            "Chaos-bypass protection (Shavronne's Wrappings / Solaris Lorica / The Ivory Tower / Coruscating Elixir) — "
+            "Chaos damage bypasses ES directly into low unreserved Life!"
+        )
+        gaps.append({"category": "DefensiveBrick", "severity": "HIGH", "message": msg})
+        defensive_bricks.append(msg)
+
+    if has_ivory and is_low_life and mana_unres == 0.0:
+        msg = (
+            "The Ivory Tower Brick: 'Chaos Damage is taken from Mana before Life' provides ZERO protection "
+            "when Unreserved Mana is 0 — leave enough Unreserved Mana to absorb Chaos hits!"
+        )
+        gaps.append({"category": "DefensiveBrick", "severity": "HIGH", "message": msg})
+        defensive_bricks.append(msg)
+
+    # 7c. Dissolution of the Flesh + Life Sacrifice / Self-Damage / Lifetap conflict
+    has_dissolution = any(
+        "dissolution of the flesh" in nl or "血肉溶解" in nl for nl in equipped_names_all.values()
+    )
+    if has_dissolution:
+        diss_conflicts: list[str] = []
+        if any("righteous fire" in nm for nm in all_active_non_swap_low):
+            diss_conflicts.append("Righteous Fire (continuous self-burn prevents Dissolution 2s unreserve!)")
+        if any("rathpith globe" in nl or "拉斯皮斯之球" in nl for nl in equipped_names_all.values()):
+            diss_conflicts.append("Rathpith Globe (sacrifices 10% Life per cast)")
+        all_enabled_sups_low = {
+            _normalize_support_base_name(str(gm.get("name") or gm.get("nameSpec") or ""))
+            for g in groups
+            if g.get("enabled", True) and "Swap" not in str(g.get("slot") or "")
+            for gm in (g.get("gems") or [])
+            if gm.get("enabled", True) and gm.get("support")
+        }
+        if "sacrifice" in all_enabled_sups_low:
+            diss_conflicts.append("Sacrifice Support (sacrifices 20% current Life per cast)")
+        if "lifetap" in all_enabled_sups_low:
+            diss_conflicts.append("Lifetap Support (spends Life directly while Life pool is reserved)")
+        if diss_conflicts:
+            msg = (
+                "Dissolution of the Flesh conflict: reserves Life on damage (and removes all ES) until 2s "
+                f"with no Life damage taken — conflicts with {'; '.join(diss_conflicts)}!"
+            )
+            gaps.append({"category": "DefensiveBrick", "severity": "HIGH", "message": msg})
+            defensive_bricks.append(msg)
+
+    if defensive_bricks:
+        mechanics["defensiveBricks"] = defensive_bricks
+
+    # 7d. Crit Attack Accuracy Double-Roll Check
+    raw_hc = stats.get("HitChance")
+    crit_ch = _finite_float(stats.get("CritChance"), default=0.0)
+    mh_acc = _finite_float(stats.get("MainHandAccuracy"), default=0.0)
+    if raw_hc is not None:
+        hc_val = _finite_float(raw_hc, default=100.0)
+        if hc_val < 99.0 and crit_ch >= 25.0 and mh_acc > 0.0:
+            eff_hit_sq = (hc_val / 100.0) ** 2 * 100.0
+            gaps.append(
+                {
+                    "category": "Offence",
+                    "severity": "MEDIUM",
+                    "message": (
+                        f"Crit Attack Accuracy Double-Roll: Hit Chance is {hc_val:.1f}% (< 99%) with "
+                        f"{crit_ch:.1f}% Crit Chance — PoE1 rolls Accuracy TWICE to confirm critical strikes "
+                        f"(effective crit hit factor ~{eff_hit_sq:.1f}%). Cap Accuracy to 100%!"
+                    ),
+                }
+            )
+
+    return gaps, mechanics
+
+
 _KEEP_KEYWORDS = ("flasks", "custommods", "party")
 DEWATER_SENTINEL_TITLE = "pob-cli dewater"
 
@@ -324,6 +1626,8 @@ def dewater_build_in_place(
 def dewater_build_with_records(
     worker: BridgeWorker,
     keep: Iterable[str] | str | None = None,
+    *,
+    has_bloodsoaked_blade: bool | None = None,
 ) -> tuple[dict[str, list[str]], list[dict[str, Any]]]:
     """De-water in place (2 pipelined RPC batches) and return reversible per-item records.
 
@@ -488,13 +1792,24 @@ def dewater_build_with_records(
                 }
             )
 
-    # 2. Flask inflation (active flasks without Mageblood)
+    # 2. Flask inflation (active flasks without Mageblood; preserve sustained Bloodsoaked Blade Tinctures)
     has_mb = _has_mageblood_equipped(items_res)
     items_by_id = {it["id"]: it for it in items_res.get("items", [])}
     for slot in items_res.get("slots", []):
         if slot.get("isFlask") and slot.get("name"):
             known[str(slot["name"]).lower()] = str(slot["name"])
     if not has_mb:
+        has_active_tincture = any(
+            slot.get("isFlask")
+            and slot.get("active")
+            and _is_tincture_item(items_by_id.get(slot.get("selItemId") or 0))
+            for slot in items_res.get("slots", [])
+        )
+        bloodsoaked_active = (
+            bool(has_bloodsoaked_blade)
+            if has_bloodsoaked_blade is not None
+            else (_has_bloodsoaked_blade_keystone(worker) if has_active_tincture else False)
+        )
         for slot in items_res.get("slots", []):
             if slot.get("isFlask") and slot.get("active"):
                 slot_name = slot["name"]
@@ -502,6 +1817,11 @@ def dewater_build_with_records(
                 item_title = strip_pob_escapes(item.get("titleZh") or item.get("title") or item.get("name") or slot_name)
                 if "flasks" in keep_set or slot_name.lower() in keep_set:
                     stripped["kept"].append(f"{slot_name} ({item_title}) (kept)")
+                    continue
+                if bloodsoaked_active and _is_tincture_item(item):
+                    stripped["kept"].append(
+                        f"{slot_name} ({item_title}) (kept: Bloodsoaked Blade sustained Tincture; Tinctures != Flasks)"
+                    )
                     continue
                 stripped["flasks"].append(f"{slot_name} ({item_title}) -> active=False")
                 mutations.append(("set_slot_active", {"slotName": slot_name, "active": False}))
@@ -1095,7 +2415,10 @@ def audit_build(
                     )
 
             chaos_res = _finite_float(stats.get("ChaosResist"))
-            if chaos_res < 0:
+            life_val = _finite_float(stats.get("Life"))
+            chaos_mh_raw = _parse_numeric_or_none(stats.get("ChaosMaximumHitTaken"))
+            is_chaos_immune = (life_val <= 1.0 and chaos_mh_raw is not None and math.isinf(chaos_mh_raw)) or chaos_res >= 100
+            if chaos_res < 0 and not is_chaos_immune:
                 health_issues.append(
                     {
                         "category": "Resistance",
@@ -1220,6 +2543,22 @@ def audit_build(
                         }
                     )
 
+            # 8. Build mechanic & PoB-modeling pitfall checks (uses already-supported RPCs cleanly)
+            try:
+                skills_res_audit, cfg_res_audit = _call_batch(
+                    worker,
+                    [("list_skills", {}), ("list_config", {})],
+                )
+            except Exception:
+                skills_res_audit, cfg_res_audit = None, None
+            mech_gaps, _ = _detect_build_mechanics_and_pitfalls(
+                stats=stats,
+                skills_res=skills_res_audit,
+                items_res=items_res,
+                cfg_res=cfg_res_audit,
+            )
+            health_issues.extend(mech_gaps)
+
             # Run non-destructive de-watering snapshot
             try:
                 stripped, records = dewater_build_with_records(worker, keep=keep)
@@ -1281,11 +2620,24 @@ def resolve_slot_name(
     *,
     items_res: dict[str, Any] | None = None,
 ) -> str:
-    """Resolve user slot query (including '#1', '#2' jewel socket shorthand or Flask 1..5) to exact PoB slotName."""
-    q = slot_query.strip()
+    """Resolve user slot query (including '#1', '#2' jewel socket shorthand, 3.30 graft slots Head/Body/Arm/Leg, EN/ZH aliases, or Flask 1..5) to exact PoB slotName."""
+    from .guardrails import GuardrailScope, check_input, normalize_equipment_slot
+
+    raw_q = slot_query.strip()
+    check_input(raw_q, scope=GuardrailScope.SLOT, expected_game="poe1")
     if items_res is None:
         items_res = worker.call("list_items", {})
     slots = items_res.get("slots", [])
+
+    # Preserve exact PoE1 3.30 Wickerman Graft slot names (`Head`, `Body`, `Arm`, `Leg`)
+    # when explicitly capitalized and present/equipped on this build, avoiding collision with
+    # lowercase `body` -> `Body Armour` and `head` -> `Helmet` aliases.
+    if raw_q in ("Head", "Body", "Arm", "Leg"):
+        for s in slots:
+            if s.get("name") == raw_q and (s.get("selItemId") or s.get("shown")):
+                return s["name"]
+
+    q = normalize_equipment_slot(raw_q) or raw_q
 
     # Check '#1', '#2' jewel socket shorthand
     m_jewel = re.match(r"^#?(\d+)$", q)
@@ -1358,6 +2710,10 @@ def inspect_config(
     """
     effective_all = bool(show_all or include_defaults)
     search_clean = (search or "").strip()
+    if search_clean:
+        from .guardrails import GuardrailScope, check_input
+
+        check_input(search_clean, scope=GuardrailScope.CONFIG_VAR, expected_game="poe1")
     search_low = search_clean.lower()
 
     with worker.lock:
@@ -1482,6 +2838,10 @@ def inspect_items(
 ) -> dict[str, Any]:
     """List equipped items (pipelining all `item_raw` RPCs in ONE batch) or inspect one slot."""
     effective_slot = slot_selector if slot_selector is not None else slot_name
+    if effective_slot:
+        from .guardrails import GuardrailScope, check_input
+
+        check_input(effective_slot, scope=GuardrailScope.SLOT, expected_game="poe1")
     want_raw = bool(raw or include_raw or all_raw)
 
     with worker.lock:
@@ -2169,7 +3529,7 @@ def inspect_tree(
         for nid in sorted(allocated_ids):
             meta = _get_node_meta(nid)
             ntype = meta.get("type")
-            if meta.get("asc"):
+            if meta.get("asc") or meta.get("ascendancyName"):
                 if ntype not in ("AscendClassStart", "ClassStart"):
                     ascendancy_nodes.append(meta)
             elif ntype == "Keystone":
@@ -2368,6 +3728,12 @@ def search_calcs_breakdown(
     kw_list = _normalize_query_list(keyword, keywords)
     if not kw_list:
         kw_list = [""]
+    else:
+        from .guardrails import GuardrailScope, check_input
+
+        for kw in kw_list:
+            if kw.strip():
+                check_input(kw, scope=GuardrailScope.CALC_QUERY, expected_game="poe1")
 
     with worker.lock:
         # Ensure we have both English and Chinese labels regardless of current set_translate state.
@@ -2593,3 +3959,752 @@ def search_calcs_breakdown(
 
 
 inspect_calcs = search_calcs_breakdown
+
+
+_TRIGGER_ATTACK_HINTS = (
+    "cyclone",
+    "lancing steel",
+    "blast rain",
+    "barrage",
+    "kinetic blast",
+    "power siphon",
+    "frenzy",
+    "rain of arrows",
+    "split arrow",
+    "spectral throw",
+    "blade flurry",
+    "flicker strike",
+    "smite",
+    "lightning strike",
+    "molten strike",
+    "frost blades",
+    "double strike",
+    "reave",
+    "static strike",
+    "shield charge",
+    "whirling blades",
+    "leap slam",
+    "consecrated path",
+    "tornado shot",
+    "ice shot",
+    "lightning arrow",
+    "cobra lash",
+    "venom gyre",
+    "splitting steel",
+    "shattering steel",
+)
+
+
+def _extract_trigger_attack_aps(
+    worker: BridgeWorker,
+    skills_res: dict[str, Any],
+    items_res: dict[str, Any],
+    base_stats: dict[str, Any],
+) -> float | None:
+    """Measure the real PoB Attack Rate (`Speed`) of the trigger attack in CoC/Cospri/Mjolner/Poet's Pen setups."""
+    groups = skills_res.get("groups") or []
+    main_idx = skills_res.get("mainSocketGroup")
+    main_group = next(
+        (g for g in groups if g.get("isMain") or (main_idx is not None and g.get("index") == main_idx)),
+        None,
+    )
+    if not main_group or not main_group.get("enabled", True):
+        return None
+
+    mg_gems = [gm for gm in (main_group.get("gems") or []) if gm.get("enabled", True)]
+    has_coc = any(
+        "cast on critical strike" in strip_pob_escapes(str(gm.get("name") or gm.get("nameSpec") or "")).lower()
+        or str(gm.get("skillId") or "") in ("SupportCastOnCriticalStrike", "SupportAwakenedCastOnCriticalStrike")
+        for gm in mg_gems
+    )
+    items_by_id = {it["id"]: it for it in (items_res.get("items") or [])}
+    has_atk_trigger_item = False
+    for s in items_res.get("slots") or []:
+        if s.get("selItemId") and not s.get("inactive") and "Swap" not in str(s.get("name") or ""):
+            it = items_by_id.get(s["selItemId"], {})
+            nm = strip_pob_escapes(str(it.get("title") or it.get("name") or "")).lower()
+            if any(k in nm for k in ("cospri's malice", "mjölner", "mjolner", "the poet's pen")):
+                has_atk_trigger_item = True
+                break
+    if not has_coc and not has_atk_trigger_item:
+        return None
+
+    # Check if main_group has a `skills` list where we can identify the trigger attack skill
+    skills_list = main_group.get("skills") or []
+    orig_active = int(main_group.get("mainActiveSkill") or 1)
+    if skills_list and 1 <= orig_active <= len(skills_list):
+        cur_sk = skills_list[orig_active - 1]
+        cur_nm = strip_pob_escapes(str(cur_sk.get("name") or cur_sk.get("skillId") or "")).lower()
+        if any(h in cur_nm for h in _TRIGGER_ATTACK_HINTS):
+            sp = _finite_float(base_stats.get("Speed"), default=0.0)
+            return sp if sp > 0 else None
+        # Look for trigger attack in the same skill group
+        for idx_0, sk in enumerate(skills_list):
+            sk_nm = strip_pob_escapes(str(sk.get("name") or sk.get("skillId") or "")).lower()
+            if any(h in sk_nm for h in _TRIGGER_ATTACK_HINTS):
+                atk_idx = idx_0 + 1
+                g_idx = int(main_group["index"])
+                try:
+                    with worker.lock:
+                        res_list = _call_batch(
+                            worker,
+                            [
+                                ("set_group", {"index": g_idx, "mainActiveSkill": atk_idx}),
+                                ("get_stats", {}),
+                                ("set_group", {"index": g_idx, "mainActiveSkill": orig_active}),
+                            ],
+                            raise_on_error=False,
+                        )
+                    if len(res_list) >= 2 and isinstance(res_list[1], dict) and isinstance(res_list[1].get("stats"), dict):
+                        sp = _finite_float(res_list[1]["stats"].get("Speed"), default=0.0)
+                        if sp > 0:
+                            return sp
+                except Exception:
+                    try:
+                        worker.call("set_group", {"index": g_idx, "mainActiveSkill": orig_active})
+                    except Exception:
+                        pass
+                break
+
+    # Fallback: for Cospri/Mjolner/Poet's Pen where attack is in a separate skill group
+    if has_atk_trigger_item:
+        orig_main_idx = int(main_group["index"])
+        for g in groups:
+            if not g.get("enabled", True) or "Swap" in str(g.get("slot") or "") or int(g.get("index") or 0) == orig_main_idx:
+                continue
+            for gm in g.get("gems") or []:
+                if gm.get("enabled", True) and not gm.get("support"):
+                    gnm = strip_pob_escapes(str(gm.get("name") or gm.get("nameSpec") or "")).lower()
+                    if any(h in gnm for h in _TRIGGER_ATTACK_HINTS):
+                        try:
+                            with worker.lock:
+                                res_list = _call_batch(
+                                    worker,
+                                    [
+                                        ("set_build_field", {"field": "mainSocketGroup", "value": int(g["index"])}),
+                                        ("get_stats", {}),
+                                        ("set_build_field", {"field": "mainSocketGroup", "value": orig_main_idx}),
+                                    ],
+                                    raise_on_error=False,
+                                )
+                            if len(res_list) >= 2 and isinstance(res_list[1], dict) and isinstance(res_list[1].get("stats"), dict):
+                                sp = _finite_float(res_list[1]["stats"].get("Speed"), default=0.0)
+                                if sp > 0:
+                                    return sp
+                        except Exception:
+                            try:
+                                worker.call("set_build_field", {"field": "mainSocketGroup", "value": orig_main_idx})
+                            except Exception:
+                                pass
+                        break
+    return None
+
+
+def _detect_dead_main_supports(
+    worker: BridgeWorker,
+    main_group: dict[str, Any] | None,
+    base_stats: dict[str, Any],
+) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
+    """Engine-verified 0% dead support detector on `mainGroup` via one batched toggle+restore pass."""
+    if not main_group or not main_group.get("enabled", True):
+        return [], []
+    mg_idx = main_group.get("index")
+    if mg_idx is None:
+        return [], []
+
+    base_comb = _finite_float(base_stats.get("CombinedDPS"), default=0.0)
+    base_full = _finite_float(base_stats.get("FullDPS"), default=0.0)
+    base_tot = _finite_float(base_stats.get("TotalDPS"), default=0.0)
+    base_ehp = _finite_float(base_stats.get("TotalEHP"), default=0.0)
+    base_mana_cost = _finite_float(base_stats.get("ManaCost"), default=-1.0)
+    if base_comb <= 0.0 and base_full <= 0.0 and base_tot <= 0.0:
+        return [], []
+
+    candidates: list[dict[str, Any]] = []
+    for gm in main_group.get("gems") or []:
+        if not gm.get("enabled", True) or not gm.get("support"):
+            continue
+        if gm.get("fromItem") or gm.get("fromNode"):
+            continue
+        if gm.get("index") is None:
+            continue
+        gnm = strip_pob_escapes(str(gm.get("name") or gm.get("nameSpec") or "")).strip()
+        norm = _normalize_support_base_name(gnm)
+        if not norm or norm in _DEAD_SUPPORT_EXEMPT_NAMES:
+            continue
+        # Exempt Inspiration ONLY when ManaCost > 0 (0-mana Inspiration is already flagged as HIGH gap!)
+        if norm == "inspiration" and base_mana_cost > 0.0:
+            continue
+        candidates.append(gm)
+
+    if not candidates:
+        return [], []
+
+    batch_calls: list[tuple[str, dict[str, Any]]] = []
+    for gm in candidates:
+        g_ref = {"group": int(mg_idx), "index": int(gm["index"])}
+        batch_calls.append(("set_gem", {**g_ref, "enabled": False}))
+        batch_calls.append(("get_stats", {}))
+        batch_calls.append(("set_gem", {**g_ref, "enabled": True}))
+
+    try:
+        with worker.lock:
+            responses = _call_batch(worker, batch_calls, raise_on_error=False)
+    except Exception:
+        # Best-effort restore all candidate supports
+        for gm in candidates:
+            try:
+                worker.call("set_gem", {"group": int(mg_idx), "index": int(gm["index"]), "enabled": True})
+            except Exception:
+                pass
+        return [], []
+
+    def _unchanged(a: float, b: float) -> bool:
+        return abs(a - b) <= 1e-5 * max(1.0, abs(b))
+
+    dead_gaps: list[dict[str, str]] = []
+    dead_records: list[dict[str, Any]] = []
+    for i, gm in enumerate(candidates):
+        res_off = responses[i * 3] if (i * 3) < len(responses) else None
+        res_stats = responses[i * 3 + 1] if (i * 3 + 1) < len(responses) else None
+        if not isinstance(res_off, dict) or res_off.get("_error") or res_off.get("ok") is False:
+            continue
+        if not isinstance(res_stats, dict) or res_stats.get("_error") or not isinstance(res_stats.get("stats"), dict):
+            continue
+        st_off = res_stats["stats"]
+        off_comb = _finite_float(st_off.get("CombinedDPS"), default=base_comb)
+        off_full = _finite_float(st_off.get("FullDPS"), default=base_full)
+        off_tot = _finite_float(st_off.get("TotalDPS"), default=base_tot)
+        off_ehp = _finite_float(st_off.get("TotalEHP"), default=base_ehp)
+
+        if (
+            _unchanged(off_comb, base_comb)
+            and _unchanged(off_full, base_full)
+            and _unchanged(off_tot, base_tot)
+            and _unchanged(off_ehp, base_ehp)
+        ):
+            gnm = strip_pob_escapes(str(gm.get("name") or gm.get("nameSpec") or "")).strip()
+            gnm_zh = strip_pob_escapes(str(gm.get("nameZh") or "")).strip()
+            disp = f"{gnm_zh} ({gnm})" if (gnm_zh and gnm_zh != gnm) else gnm
+            norm = _normalize_support_base_name(gnm)
+            hint = ""
+            if norm == "hypothermia":
+                hint = " (requires Enemy Chilled — blocked by Elemental Focus or missing Chill source)"
+            elif norm == "immolate":
+                hint = " (requires Enemy Burning/Ignited)"
+            elif norm == "inspiration":
+                hint = " (0-mana group generates 0 Inspiration Charges)"
+            dead_records.append(
+                {
+                    "groupIndex": int(mg_idx),
+                    "gemIndex": int(gm["index"]),
+                    "name": gnm,
+                    "nameZh": gnm_zh or None,
+                    "deltaCombinedDpsPct": 0.0,
+                    "deltaFullDpsPct": 0.0,
+                    "deltaTotalEhpPct": 0.0,
+                }
+            )
+            dead_gaps.append(
+                {
+                    "category": "DeadSupport",
+                    "severity": "HIGH",
+                    "message": (
+                        f"Engine-Verified 0% Dead Support in Group #{mg_idx}: '{disp}' contributes 0.0% "
+                        f"CombinedDPS, 0.0% FullDPS, and 0.0% TotalEHP when toggled off{hint} — replace with an active damage support!"
+                    ),
+                }
+            )
+
+    return dead_gaps, dead_records
+
+
+def diagnose_build(
+    worker: BridgeWorker,
+    *,
+    keep: Iterable[str] | str | None = None,
+    top: int = 5,
+    no_rank: bool = False,
+    ask: str | None = None,
+    pob_dir: Any = None,
+    runtime_dir: Any = None,
+    target: str = "main",
+) -> dict[str, Any]:
+    """One-shot comprehensive build diagnosis for fast/weak LLM agents (`pob diagnose`).
+
+    Combines in ONE call:
+      1. Environment grounding metadata (`game`, `patch`, `pobVersion`, `dataVersion`, `treeVersion`, `slot`)
+      2. Build identity + main skill group (`extract_summary`)
+      3. Original vs Pinnacle Dewatered DPS / EHP / MaxHit + per-item water attribution (`audit_build`)
+      4. Hard defensive, dead-support, trigger-overspeed, & mechanical gaps
+      5. Live 3.30 Fact Cards for main skill + support gems + equipped Unique items (`game_data.sqlite`)
+         + optional player question grounding (`--ask`) + triggered PoE1 patch/false-friend advisories
+      6. Top N ROI passive nodes (`rank_nodes`) & candidate support gem swaps (`rank_gems`), unless `no_rank=True`.
+    """
+    from .comparator import rank_gems, rank_nodes
+    from .game_data import ground_text_entities, lookup_fact_cards_for_build
+    from .guardrails import scan_text_traps
+
+    top = max(1, int(top))
+    summary = extract_summary(worker)
+    audit = audit_build(worker, keep=keep, attribution=True)
+    items_info = inspect_items(worker, all_raw=True)
+    with worker.lock:
+        all_skills_res, cfg_res_diag, items_raw_res, tree_state_diag = _call_batch(
+            worker,
+            [
+                ("list_skills", {}),
+                ("list_config", {}),
+                ("list_items", {}),
+                ("get_tree_state", {}),
+            ],
+            raise_on_error=False,
+        )
+    if not isinstance(all_skills_res, dict) or all_skills_res.get("_error"):
+        all_skills_res = {"groups": [summary["mainGroup"]] if summary.get("mainGroup") else []}
+    if not isinstance(cfg_res_diag, dict) or cfg_res_diag.get("_error"):
+        cfg_res_diag = {}
+    if not isinstance(items_raw_res, dict) or items_raw_res.get("_error"):
+        items_raw_res = {"items": [], "slots": []}
+
+    info = summary.get("buildInfo") or {}
+    pts = info.get("points") or {}
+    used_pts = int(pts.get("used") or 0)
+    used_max = int(pts.get("usedMax") or 0)
+
+    # Copy healthIssues and add unallocated regular passive points notice if applicable
+    gaps = list(audit.get("healthIssues") or [])
+    if used_max > 0 and used_pts < used_max:
+        gaps.append(
+            {
+                "category": "Points",
+                "severity": "LOW",
+                "message": f"Unallocated passive points: {used_pts}/{used_max} ({used_max - used_pts} remaining)",
+            }
+        )
+
+    # Extract main skill + support gem names and equipped Unique names for live 3.30 Fact Cards
+    mg = summary.get("mainGroup") or {}
+    main_gems_raw = [
+        strip_pob_escapes(g.get("name") or g.get("nameSpec") or "")
+        for g in (mg.get("gems") or [])
+        if g.get("enabled", True) and (g.get("name") or g.get("nameSpec"))
+    ]
+    unique_names: list[str] = []
+    equipped_uniques_meta: list[dict[str, Any]] = []
+    equipped_items_compact: list[dict[str, Any]] = []
+    for s in items_info.get("equippedSlots") or []:
+        it = s.get("item")
+        if not isinstance(it, dict):
+            continue
+        uname = strip_pob_escapes(it.get("title") or it.get("name") or "")
+        uname_zh = strip_pob_escapes(it.get("titleZh") or it.get("nameZh") or "") or None
+        base_nm = strip_pob_escapes(it.get("baseName") or "") or None
+        rarity = str(it.get("rarity") or "").upper()
+        slot_nm = str(s.get("slotName") or "")
+        if "Swap" not in slot_nm:
+            eq_entry: dict[str, Any] = {
+                "slot": slot_nm,
+                "name": uname,
+                "nameZh": uname_zh,
+                "base": base_nm,
+                "rarity": rarity or "-",
+                "type": it.get("type") or "-",
+            }
+            if s.get("isFlask"):
+                eq_entry["isFlask"] = True
+                eq_entry["active"] = bool(s.get("active"))
+                if _is_tincture_item(it):
+                    eq_entry["isTincture"] = True
+            if s.get("nodeId") is not None:
+                eq_entry["nodeId"] = s.get("nodeId")
+                eq_entry["socketIndex"] = s.get("socketIndex")
+            equipped_items_compact.append(eq_entry)
+        if rarity in ("UNIQUE", "RELIC") and uname and "Swap" not in slot_nm:
+            unique_names.append(uname)
+            equipped_uniques_meta.append(
+                {
+                    "slot": slot_nm,
+                    "name": uname,
+                    "nameZh": uname_zh,
+                    "base": base_nm,
+                }
+            )
+
+    fact_cards: dict[str, Any] = {"pobVersion": "unknown", "dataVersion": "unknown", "gems": [], "uniques": []}
+    try:
+        fact_cards = lookup_fact_cards_for_build(
+            main_gems_raw,
+            unique_names,
+            pob_dir=pob_dir,
+            runtime_dir=runtime_dir,
+        )
+    except Exception:
+        pass
+
+    # Scan active gems, uniques, ascendancy/bloodline nodes, and allocated keystones
+    tree_summary: dict[str, Any] = {}
+    try:
+        tree_summary = inspect_tree(worker)
+    except Exception:
+        tree_summary = {}
+
+    # Collect stats of ALL allocated passive/ascendancy/bloodline nodes for exact global CDR & mechanic detection
+    alloc_node_stats: list[tuple[str, list[str]]] = []
+    if isinstance(tree_state_diag, dict) and not tree_state_diag.get("_error"):
+        try:
+            tv_diag = tree_state_diag.get("treeVersion")
+            nodes_db_diag = worker.get_cached_tree_data(tv_diag).get("nodes", {})
+            ov_diag = tree_state_diag.get("overrides") or {}
+            dyn_diag = {str(n["id"]): n for n in (tree_state_diag.get("dynamicNodes") or []) if isinstance(n, dict) and "id" in n}
+            for raw_nid in tree_state_diag.get("allocatedNodes") or []:
+                sid = str(int(raw_nid))
+                nd = dict(nodes_db_diag.get(sid) or {})
+                if sid in dyn_diag:
+                    nd.update(dyn_diag[sid])
+                if sid in ov_diag and isinstance(ov_diag[sid], dict):
+                    if ov_diag[sid].get("stats"):
+                        nd["stats"] = ov_diag[sid]["stats"]
+                    if ov_diag[sid].get("name"):
+                        nd["name"] = ov_diag[sid]["name"]
+                st_lines = [str(x) for x in (nd.get("stats") or []) if str(x).strip()]
+                if st_lines:
+                    lbl = strip_pob_escapes(str(nd.get("name") or sid))
+                    alloc_node_stats.append((lbl, st_lines))
+        except Exception:
+            pass
+
+    # Allocated Ascendancy & Bloodline nodes WITH stats (includes type="Normal" nodes with asc/ascendancyName!)
+    ascendancy_nodes_compact: list[dict[str, Any]] = []
+    for an in tree_summary.get("ascendancyNodes") or []:
+        if not isinstance(an, dict):
+            continue
+        an_type = str(an.get("type") or "Normal")
+        if an_type in ("AscendClassStart", "ClassStart"):
+            continue
+        an_name = strip_pob_escapes(str(an.get("name") or "")).strip()
+        an_name_zh = strip_pob_escapes(str(an.get("nameZh") or "")).strip() or None
+        an_stats = [strip_pob_escapes(str(x)).strip() for x in (an.get("stats") or []) if str(x).strip()]
+        an_stats_zh = [strip_pob_escapes(str(x)).strip() for x in (an.get("statsZh") or []) if str(x).strip()]
+        if an_name == "Passive Point" and an_stats == ["Grants 1 Passive Skill Point"]:
+            continue
+        if not an_stats and not an_stats_zh and an_type != "Notable":
+            continue
+        if not an_stats and not an_stats_zh:
+            continue
+        ascendancy_nodes_compact.append(
+            {
+                "id": an.get("id"),
+                "name": an_name,
+                "nameZh": an_name_zh,
+                "asc": an.get("asc") or an.get("ascendancyName"),
+                "type": an_type,
+                "stats": an_stats,
+                "statsZh": an_stats_zh or None,
+            }
+        )
+
+    # Compact All Skill Groups overview (including disabled gems, swap groups, counts)
+    skill_groups_compact: list[dict[str, Any]] = []
+    all_active_skill_names: list[str] = []
+    for g in all_skills_res.get("groups") or []:
+        if not isinstance(g, dict):
+            continue
+        g_gems_compact: list[dict[str, Any]] = []
+        for gm in g.get("gems") or []:
+            if not isinstance(gm, dict):
+                continue
+            gnm = strip_pob_escapes(str(gm.get("name") or gm.get("nameSpec") or "")).strip()
+            gnm_zh = strip_pob_escapes(str(gm.get("nameZh") or "")).strip() or None
+            g_en = bool(gm.get("enabled", True))
+            if g_en and not gm.get("support") and gnm:
+                all_active_skill_names.append(gnm)
+            g_entry: dict[str, Any] = {
+                "name": gnm,
+                "nameZh": gnm_zh,
+                "level": gm.get("level"),
+                "quality": gm.get("quality"),
+                "enabled": g_en,
+                "support": bool(gm.get("support")),
+            }
+            if gm.get("fromItem"):
+                g_entry["fromItem"] = True
+            cnt = int(gm.get("count") or 1)
+            if cnt > 1:
+                g_entry["count"] = cnt
+            g_gems_compact.append(g_entry)
+        skill_groups_compact.append(
+            {
+                "index": g.get("index"),
+                "isMain": bool(g.get("isMain")),
+                "slot": g.get("slot") or "-",
+                "enabled": bool(g.get("enabled", True)),
+                "includeInFullDPS": bool(g.get("includeInFullDPS")),
+                "source": bool(g.get("source")),
+                "gems": g_gems_compact,
+            }
+        )
+
+    # Run full build mechanics & pitfall detector (with tree_summary + equipped raw items + all alloc stats + trigger APS!)
+    stats_full: dict[str, Any] = {}
+    stats_full.update(summary.get("offence") or {})
+    stats_full.update(summary.get("defence") or {})
+    try:
+        raw_stats_res = worker.call("get_stats", {})
+        if isinstance(raw_stats_res, dict) and isinstance(raw_stats_res.get("stats"), dict):
+            stats_full.update(raw_stats_res["stats"])
+    except Exception:
+        pass
+
+    trig_aps = _extract_trigger_attack_aps(worker, all_skills_res, items_raw_res, stats_full)
+    diag_mech_gaps, build_mechanics = _detect_build_mechanics_and_pitfalls(
+        stats=stats_full,
+        skills_res=all_skills_res,
+        items_res=items_raw_res,
+        cfg_res=cfg_res_diag,
+        tree_summary=tree_summary,
+        equipped_slots_raw=items_info.get("equippedSlots") or [],
+        alloc_node_stats=alloc_node_stats,
+        trigger_attack_aps=trig_aps,
+    )
+    dead_sup_gaps, dead_sup_records = _detect_dead_main_supports(worker, mg, stats_full)
+    if dead_sup_records:
+        build_mechanics["deadSupports"] = dead_sup_records
+
+    existing_gap_msgs = {str(g.get("message") or "") for g in gaps}
+    for mgap in (*diag_mech_gaps, *dead_sup_gaps):
+        if mgap["message"] not in existing_gap_msgs:
+            existing_gap_msgs.add(mgap["message"])
+            gaps.append(mgap)
+
+    keystone_names = [
+        strip_pob_escapes(k.get("name") or "")
+        for k in (tree_summary.get("keystones") or [])
+        if isinstance(k, dict) and k.get("name")
+    ]
+    asc_class_token = strip_pob_escapes(str(info.get("ascendClassName") or ""))
+    asc_node_names = [an["name"] for an in ascendancy_nodes_compact if an.get("name")]
+    scan_corpus = " ; ".join(
+        main_gems_raw
+        + all_active_skill_names
+        + unique_names
+        + keystone_names
+        + asc_node_names
+        + ([asc_class_token] if asc_class_token else [])
+    )
+    trap_scan = scan_text_traps(scan_corpus)
+    advisories_merged: list[dict[str, Any]] = []
+    seen_adv_rules: set[str] = set()
+    for w in trap_scan.get("warnings") or []:
+        rid = str(w.get("ruleId") or w.get("trigger") or "")
+        if rid and rid in seen_adv_rules:
+            continue
+        if rid:
+            seen_adv_rules.add(rid)
+        advisories_merged.append(w)
+
+    # Optional pre-turn player question grounding (`--ask` / `-q`) merged & deduplicated into report
+    ask_grounding: dict[str, Any] | None = None
+    ask_clean = str(ask or "").strip()
+    if ask_clean:
+        try:
+            g_ask = ground_text_entities(ask_clean, limit=8, pob_dir=pob_dir, runtime_dir=runtime_dir)
+            for w in g_ask.get("warnings") or []:
+                rid = str(w.get("ruleId") or w.get("trigger") or "")
+                if rid and rid in seen_adv_rules:
+                    continue
+                if rid:
+                    seen_adv_rules.add(rid)
+                advisories_merged.append(w)
+            gem_cards = list(fact_cards.get("gems") or [])
+            uniq_cards = list(fact_cards.get("uniques") or [])
+            seen_gem_names = {str(c.get("name") or "").lower() for c in gem_cards}
+            seen_uniq_names = {str(c.get("name") or "").lower() for c in uniq_cards}
+            added_entities: list[str] = []
+            for ent in g_ask.get("entities") or []:
+                enm = str(ent.get("name") or "")
+                elow = enm.lower()
+                if ent.get("kind") == "gem" and elow and elow not in seen_gem_names:
+                    seen_gem_names.add(elow)
+                    gem_cards.append(ent)
+                    added_entities.append(enm)
+                elif ent.get("kind") == "unique" and elow and elow not in seen_uniq_names:
+                    seen_uniq_names.add(elow)
+                    uniq_cards.append(ent)
+                    added_entities.append(enm)
+            fact_cards["gems"] = gem_cards
+            fact_cards["uniques"] = uniq_cards
+            ask_grounding = {
+                "query": ask_clean,
+                "resolvedSlang": g_ask.get("resolvedSlang") or [],
+                "hasAlerts": bool(g_ask.get("hasAlerts")),
+                "addedEntities": added_entities,
+                "elapsedMs": g_ask.get("elapsedMs"),
+            }
+        except Exception:
+            ask_grounding = {"query": ask_clean, "resolvedSlang": [], "hasAlerts": False, "addedEntities": []}
+
+    # Rank top ROI water sources by absolute DPS or EHP impact
+    raw_attr = [r for r in (audit.get("waterAttribution") or []) if not r.get("error")]
+    top_water = sorted(
+        raw_attr,
+        key=lambda r: (abs(float(r.get("dpsPct") or 0.0)) + abs(float(r.get("totalEhpPct") or 0.0))),
+        reverse=True,
+    )[:6]
+
+    top_nodes: dict[str, Any] | None = None
+    top_gems: dict[str, Any] | None = None
+    rank_errors: list[str] = []
+    if not no_rank:
+        primary_key = str((audit.get("original") or {}).get("primaryDpsKey") or "CombinedDPS")
+        node_stat = "CombinedDPS" if primary_key in ("CombinedDPS", "TotalDPS", "TotalDotDPS", "FullDPS") else primary_key
+        gem_field = "FullDPS" if primary_key == "FullDPS" else "CombinedDPS"
+        try:
+            top_nodes = rank_nodes(worker, stat=node_stat, max_dist=5, top=top)
+        except Exception as exc:  # noqa: BLE001
+            rank_errors.append(f"rank_nodes: {exc}")
+        try:
+            if mg and (mg.get("gems") or []):
+                top_gems = rank_gems(
+                    worker,
+                    group_selector="main",
+                    slot_idx=None,
+                    add_link=True,
+                    field=gem_field,
+                    top=top,
+                    exclude_archetype_swaps=True,
+                )
+        except Exception as exc:  # noqa: BLE001
+            rank_errors.append(f"rank_gems: {exc}")
+
+    hello = getattr(worker, "hello_info", None) or {}
+    pob_ver = fact_cards.get("pobVersion")
+    if not pob_ver or pob_ver == "unknown":
+        pob_ver = hello.get("pobVersion") or "unknown"
+    tree_ver = info.get("treeVersion") or "3_30"
+    patch_str = str(tree_ver).replace("_", ".") if str(tree_ver).startswith("3_") else "3.30"
+
+    worker_rev = getattr(worker, "rev", None)
+    env: dict[str, Any] = {
+        "game": "poe1",
+        "patch": patch_str,
+        "pobVersion": pob_ver,
+        "dataVersion": fact_cards.get("dataVersion", "unknown"),
+        "treeVersion": tree_ver,
+        "slot": target,
+    }
+    if isinstance(worker_rev, int) and not isinstance(worker_rev, bool):
+        env["rev"] = worker_rev
+
+    out_diag: dict[str, Any] = {
+        "env": env,
+        "buildInfo": info,
+        "mainGroup": mg,
+        "keystones": keystone_names,
+        "ascendancyNodes": ascendancy_nodes_compact,
+        "skillGroups": skill_groups_compact,
+        "equippedItems": equipped_items_compact,
+        "buildMechanics": build_mechanics,
+        "offence": summary.get("offence"),
+        "minionOffence": summary.get("minionOffence"),
+        "defence": summary.get("defence"),
+        "original": audit.get("original"),
+        "dewateredPinnacle": audit.get("dewateredPinnacle"),
+        "inflationStripped": audit.get("inflationStripped"),
+        "topWaterSources": top_water,
+        "healthGaps": gaps,
+        "factCards": {
+            "gems": fact_cards.get("gems", []),
+            "uniques": fact_cards.get("uniques", []),
+            "equippedUniques": equipped_uniques_meta,
+        },
+        "advisories": advisories_merged,
+        "topNodes": top_nodes,
+        "topGems": top_gems,
+        "rankErrors": rank_errors,
+        "restoreCheck": audit.get("restoreCheck"),
+    }
+    if ask_grounding is not None:
+        out_diag["askGrounding"] = ask_grounding
+    return out_diag
+
+
+def diagnose_compare_builds(
+    main_worker: BridgeWorker,
+    ref_worker: BridgeWorker,
+    *,
+    source: str | None = None,
+    xml_code: str | None = None,
+    compare_source: str | None = None,
+    compare_xml_code: str | None = None,
+    keep: Iterable[str] | str | None = None,
+    top: int = 5,
+    no_rank: bool = True,
+    ask: str | None = None,
+    pob_dir: Any = None,
+    runtime_dir: Any = None,
+    target: str = "main",
+    ref_target: str = "ref",
+) -> dict[str, Any]:
+    """One-shot dual-build 3-baseline A/B comparison + concurrent Pinnacle diagnosis of both builds."""
+    from .comparator import _run_worker_pair, compare_builds
+    from .importers import load_build_into_worker
+
+    # Phase 1: Load both builds concurrently if sources were provided
+    def _load_main() -> None:
+        if source or xml_code:
+            load_build_into_worker(main_worker, source=source, xml_code=xml_code)
+            if hasattr(main_worker, "bump_rev"):
+                main_worker.bump_rev()
+                if hasattr(main_worker, "save_slot_state"):
+                    main_worker.save_slot_state()
+
+    def _load_ref() -> None:
+        if compare_source or compare_xml_code:
+            load_build_into_worker(ref_worker, source=compare_source, xml_code=compare_xml_code)
+            if hasattr(ref_worker, "bump_rev"):
+                ref_worker.bump_rev()
+                if hasattr(ref_worker, "save_slot_state"):
+                    ref_worker.save_slot_state()
+
+    _run_worker_pair(main_worker, ref_worker, _load_main, _load_ref)
+
+    # Phase 2: 3-baseline comparison (already internally parallel across main & ref!)
+    comparison = compare_builds(main_worker, ref_worker)
+
+    # Phase 3: Concurrent Pinnacle diagnostics for both builds
+    def _diag_a() -> dict[str, Any]:
+        return diagnose_build(
+            main_worker,
+            keep=keep,
+            top=top,
+            no_rank=no_rank,
+            ask=ask,
+            pob_dir=pob_dir,
+            runtime_dir=runtime_dir,
+            target=target,
+        )
+
+    def _diag_b() -> dict[str, Any]:
+        return diagnose_build(
+            ref_worker,
+            keep=keep,
+            top=top,
+            no_rank=no_rank,
+            ask=None,
+            pob_dir=pob_dir,
+            runtime_dir=runtime_dir,
+            target=ref_target,
+        )
+
+    diag_a, diag_b = _run_worker_pair(main_worker, ref_worker, _diag_a, _diag_b)
+    return {
+        "mode": "compare",
+        "target": target,
+        "refTarget": ref_target,
+        "env": diag_a.get("env"),
+        "comparison": comparison,
+        "buildA": diag_a,
+        "buildB": diag_b,
+        "askGrounding": diag_a.get("askGrounding"),
+    }

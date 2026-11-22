@@ -992,9 +992,13 @@ def query_poedb(
     limit_mods: int = 80,
 ) -> dict[str, Any]:
     """Search PoEDB autocomplete index (CN+US) and parse page + optional mod pool into compact JSON."""
+    from .guardrails import GuardrailScope, check_input, validate_url
+
     q = query.strip()
     if not q:
         raise ValueError("PoEDB query cannot be empty.")
+    validate_url(q, expected_game="poe1", cli_subcommand="poedb")
+    check_input(q, scope=GuardrailScope.DATA_QUERY, expected_game="poe1")
 
     norm_lang = "us" if lang.strip().lower() in ("us", "en") else "cn"
     _LAST_STALE.value = False
@@ -1023,9 +1027,14 @@ def query_poedb_multi(
     max_workers: int = 4,
 ) -> dict[str, Any]:
     """Query multiple PoEDB entities concurrently with a shared HTTP client and stale-cache fallback."""
+    from .guardrails import GuardrailScope, check_input, validate_url
+
     clean_queries = [q.strip() for q in queries if isinstance(q, str) and q.strip()]
     if not clean_queries:
         raise ValueError("PoEDB queries cannot be empty.")
+    for q_item in clean_queries:
+        validate_url(q_item, expected_game="poe1", cli_subcommand="poedb")
+        check_input(q_item, scope=GuardrailScope.DATA_QUERY, expected_game="poe1")
 
     norm_lang = "us" if lang.strip().lower() in ("us", "en") else "cn"
     _LAST_STALE.value = False

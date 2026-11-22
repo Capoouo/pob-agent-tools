@@ -10,8 +10,16 @@ from typing import Any, Iterable
 
 from .analyzer import resolve_skill_group_index, resolve_slot_name
 from .bridge_client import BridgeWorker
-from .errors import DaemonRequestError
+from .errors import CrossGameHallucinationError, DaemonRequestError
 from .formatters import _parse_numeric_or_none, fmt_num, strip_pob_escapes
+from .guardrails import (
+    GuardrailScope,
+    check_input,
+    check_input_item_raw,
+    check_poe2_class_or_ascendancy,
+    normalize_equipment_slot,
+    validate_url,
+)
 from .snapshot import capture_digest, diff_digest, run_mutation
 
 # ---------------------------------------------------------------------------
@@ -86,7 +94,7 @@ def _fold_no_apos(text: str | None) -> str:
 
 def _resolve_slot_from_items(items_res: dict[str, Any], slot_query: str) -> str:
     """Resolve slot query against an already-fetched `list_items` response (avoids duplicate RPCs)."""
-    q = slot_query.strip()
+    q = normalize_equipment_slot(slot_query) or slot_query.strip()
     slots = items_res.get("slots", [])
 
     m_jewel = re.match(r"^#?(\d+)$", q)
@@ -271,6 +279,9 @@ def try_item(
     raw_clean = raw_text.strip()
     if not raw_clean:
         raise ValueError("Item raw text cannot be empty.")
+    if slot_name:
+        check_input(slot_name, scope=GuardrailScope.SLOT, expected_game="poe1")
+    check_input_item_raw(raw_clean, expected_game="poe1")
 
     with worker.lock:
         resolved_slot = resolve_slot_name(worker, slot_name) if slot_name else None
@@ -376,6 +387,7 @@ def unequip_item(
     target_slot = (slot if slot is not None else slot_name or "").strip()
     if not target_slot:
         raise ValueError("Specify a slot name to unequip.")
+    check_input(target_slot, scope=GuardrailScope.SLOT, expected_game="poe1")
 
     def _do_unequip(w: BridgeWorker) -> dict[str, Any]:
         items_res = w.call("list_items", {})
@@ -431,6 +443,8 @@ def _apply_anoint_in_place(
 ) -> dict[str, Any]:
     if anoint_index < 1 or anoint_index > 4:
         raise ValueError("anoint_index must be between 1 and 4.")
+    check_input(slot_name, scope=GuardrailScope.SLOT, expected_game="poe1")
+    check_input(notable_query, scope=GuardrailScope.NOTABLE_OR_OIL, expected_game="poe1")
     action_key = "anoint" if anoint_index == 1 else f"anoint{anoint_index}"
 
     items_res = cache.get_items() if cache is not None else w.call("list_items", {})
@@ -547,6 +561,8 @@ def anoint_item(
     """Anoint an equipped item (default Amulet) using PoB's native `item_edit_*` popup workflow."""
     if anoint_index < 1 or anoint_index > 4:
         raise ValueError("anoint_index must be between 1 and 4.")
+    check_input(slot_name, scope=GuardrailScope.SLOT, expected_game="poe1")
+    check_input(notable_query, scope=GuardrailScope.NOTABLE_OR_OIL, expected_game="poe1")
 
     def _do_anoint(w: BridgeWorker) -> dict[str, Any]:
         return _apply_anoint_in_place(
@@ -896,8 +912,14 @@ def _apply_add_group_in_place(
 ) -> dict[str, Any]:
     resolved_slot: str | None = None
     if slot is not None and str(slot).strip():
+        check_input(str(slot), scope=GuardrailScope.SLOT, expected_game="poe1")
         items_res = cache.get_items() if cache is not None else w.call("list_items", {})
         resolved_slot = _resolve_slot_from_items(items_res, str(slot))
+    if gems:
+        for g_entry in gems:
+            g_name = g_entry if isinstance(g_entry, str) else str(g_entry.get("name") or g_entry.get("nameSpec") or g_entry.get("gem") or "")
+            if g_name:
+                check_input(g_name, scope=GuardrailScope.GEM_NAME, expected_game="poe1", block_legacy_gems=True)
 
     add_params: dict[str, Any] = {}
     if label is not None:
@@ -999,7 +1021,12 @@ def _apply_replace_group_in_place(
         raise ValueError(f"Skill group #{g_idx} not found in build.")
     _guard_source_skill_group(grp, action="replace gems")
 
+    if slot is not None and str(slot).strip():
+        check_input(str(slot), scope=GuardrailScope.SLOT, expected_game="poe1")
     norm_specs = [_normalize_gem_spec(g) for g in (gems or [])]
+    for sp in norm_specs:
+        if sp.get("name"):
+            check_input(str(sp["name"]), scope=GuardrailScope.GEM_NAME, expected_game="poe1", block_legacy_gems=True)
     resolved_specs = _resolve_gem_specs_batch(w, g_idx, norm_specs)
 
     old_gems = list(grp.get("gems", []))
@@ -1088,6 +1115,9 @@ def modify_skill(
     apply: bool = False,
 ) -> dict[str, Any]:
     """Modify a skill group or a specific gem within a skill group."""
+    if new_gem:
+        check_input(new_gem, scope=GuardrailScope.GEM_NAME, expected_game="poe1", block_legacy_gems=True)
+
     def _do_skill_set(w: BridgeWorker) -> dict[str, Any]:
         skills_res = w.call("list_skills", {})
         g_idx = resolve_skill_group_index(skills_res, group_selector)
@@ -1143,6 +1173,8 @@ def add_skill_gem(
     apply: bool = False,
 ) -> dict[str, Any]:
     """Add a gem (resolved via `gem_search` if needed) to a skill group."""
+    check_input(gem_name, scope=GuardrailScope.GEM_NAME, expected_game="poe1", block_legacy_gems=True)
+
     def _do_add(w: BridgeWorker) -> dict[str, Any]:
         skills_res = w.call("list_skills", {})
         g_idx = resolve_skill_group_index(skills_res, group_selector)
@@ -1605,6 +1637,11 @@ def _apply_edit_item_mods_in_place(
     remove_mods: list[str] | None = None,
     cache: _BatchCache | None = None,
 ) -> dict[str, Any]:
+    check_input(slot_name, scope=GuardrailScope.SLOT, expected_game="poe1")
+    for _, new_line in replace_mods or []:
+        check_input(str(new_line), scope=GuardrailScope.ITEM_RAW, expected_game="poe1")
+    for new_mod in add_mods or []:
+        check_input(str(new_mod), scope=GuardrailScope.ITEM_RAW, expected_game="poe1")
     items_res = cache.get_items() if cache is not None else w.call("list_items", {})
     resolved_slot = _resolve_slot_from_items(items_res, slot_name)
     slot_obj = next((s for s in items_res.get("slots", []) if s["name"] == resolved_slot), None)
@@ -1643,6 +1680,11 @@ def edit_item_mods(
     apply: bool = False,
 ) -> dict[str, Any]:
     """Edit mod lines on an equipped item in place (replace/add/remove) with 0-residue what-if or --apply."""
+    check_input(slot_name, scope=GuardrailScope.SLOT, expected_game="poe1")
+    for _, new_line in replace_mods or []:
+        check_input(str(new_line), scope=GuardrailScope.ITEM_RAW, expected_game="poe1")
+    for new_mod in add_mods or []:
+        check_input(str(new_mod), scope=GuardrailScope.ITEM_RAW, expected_game="poe1")
     with worker.lock:
         items_res = worker.call("list_items", {})
         resolved_slot = _resolve_slot_from_items(items_res, slot_name)
@@ -1695,6 +1737,7 @@ def _search_item_db_items(
     q = (query or "").strip()
     if not q:
         raise ValueError("Item DB search query cannot be empty.")
+    check_input(q, scope=GuardrailScope.DATA_QUERY, expected_game="poe1")
     kind = "rare" if str(db_type or "UNIQUE").strip().lower() == "rare" else "unique"
     limit = max(1, min(200, int(limit)))
 
@@ -1778,6 +1821,10 @@ def search_and_try_item_db(
     and strips bulky `raw` from listing entries unless `with_raw=True`.
     """
     limit = max(1, min(200, int(limit)))
+    if slot_name:
+        check_input(slot_name, scope=GuardrailScope.SLOT, expected_game="poe1")
+    if query:
+        check_input(query, scope=GuardrailScope.DATA_QUERY, expected_game="poe1")
 
     with worker.lock:
         kind, items, total_hits = _search_item_db_items(
@@ -1922,6 +1969,10 @@ def _apply_class_ascendancy_in_place(
     secondary_ascendancy_name: str | None = None,
     cache: _BatchCache | None = None,
 ) -> dict[str, Any]:
+    check_poe2_class_or_ascendancy(class_name, field="class")
+    check_poe2_class_or_ascendancy(ascendancy_name, field="ascendancy")
+    check_poe2_class_or_ascendancy(secondary_ascendancy_name, field="secondary_ascendancy")
+
     lc = cache.get_classes() if cache is not None else w.call("list_classes", {})
     classes = lc.get("classes", [])
     secondary = lc.get("secondary", [])
@@ -2040,6 +2091,9 @@ def set_class_ascendancy(
     """Change character class, primary ascendancy, and/or secondary ascendancy (Bloodline) in a snapshot transaction."""
     if not any(x is not None and str(x).strip() != "" for x in (class_name, ascendancy_name, secondary_ascendancy_name)):
         raise ValueError("Specify at least one of class_name, ascendancy_name, or secondary_ascendancy_name.")
+    check_poe2_class_or_ascendancy(class_name, field="class")
+    check_poe2_class_or_ascendancy(ascendancy_name, field="ascendancy")
+    check_poe2_class_or_ascendancy(secondary_ascendancy_name, field="secondary_ascendancy")
 
     def _do_set_class(w: BridgeWorker) -> dict[str, Any]:
         return _apply_class_ascendancy_in_place(
@@ -2062,6 +2116,10 @@ def _apply_new_build_in_place(
     name: str | None = None,
     cache: _BatchCache | None = None,
 ) -> dict[str, Any]:
+    check_poe2_class_or_ascendancy(class_name, field="class")
+    check_poe2_class_or_ascendancy(ascendancy, field="ascendancy")
+    check_poe2_class_or_ascendancy(secondary_ascendancy, field="secondary_ascendancy")
+
     nb_params: dict[str, Any] = {}
     if name and str(name).strip():
         nb_params["name"] = str(name).strip()
@@ -2116,6 +2174,9 @@ def create_new_build(
     """Create a fresh blank PoB build with optional class, ascendancy, bloodline, and character level."""
     eff_asc = ascendancy if ascendancy is not None else ascendancy_name
     eff_sec = secondary_ascendancy if secondary_ascendancy is not None else secondary_ascendancy_name
+    check_poe2_class_or_ascendancy(class_name, field="class")
+    check_poe2_class_or_ascendancy(eff_asc, field="ascendancy")
+    check_poe2_class_or_ascendancy(eff_sec, field="secondary_ascendancy")
 
     def _do_new_build(w: BridgeWorker) -> dict[str, Any]:
         return _apply_new_build_in_place(
@@ -2182,6 +2243,13 @@ def _apply_config_in_place(
 ) -> dict[str, Any]:
     applied_vars: list[dict[str, Any]] = []
     touched_boss = False
+
+    for raw_var, _ in assignments:
+        check_input(str(raw_var), scope=GuardrailScope.CONFIG_VAR, expected_game="poe1")
+    if custom_mods is not None and custom_mods.strip().lower() not in ("clear", "reset", "none", "disable", "disabled", ""):
+        check_input(custom_mods, scope=GuardrailScope.CONFIG_VAR, expected_game="poe1")
+    if append_custom_mods is not None:
+        check_input(append_custom_mods, scope=GuardrailScope.CONFIG_VAR, expected_game="poe1")
 
     known_items: dict[str, dict[str, Any]] = {}
     if assignments:
@@ -2610,6 +2678,9 @@ def _execute_batch_ops(
             if not raw_text:
                 raise ValueError(f"Batch op 'item' at step {idx} requires non-empty 'raw'.")
             slot_query = op.get("slot") or op.get("slotName")
+            if slot_query:
+                check_input(str(slot_query), scope=GuardrailScope.SLOT, expected_game="poe1")
+            check_input_item_raw(raw_text, expected_game="poe1")
             slot_name = _resolve_slot_from_items(cache.get_items(), str(slot_query)) if slot_query else None
             params: dict[str, Any] = {"raw": raw_text, "equip": True}
             if slot_name:
@@ -2625,6 +2696,10 @@ def _execute_batch_ops(
             db_type = str(op.get("dbType") or op.get("db_type") or op.get("kind") or "UNIQUE")
             item_index = op.get("index") if op.get("index") is not None else op.get("itemIndex", op.get("item_index"))
             slot_query = op.get("slot") or op.get("slotName")
+            if slot_query:
+                check_input(str(slot_query), scope=GuardrailScope.SLOT, expected_game="poe1")
+            if query:
+                check_input(query, scope=GuardrailScope.DATA_QUERY, expected_game="poe1")
             resolved_slot = _resolve_slot_from_items(cache.get_items(), str(slot_query)) if slot_query else None
             db_kind, items, _ = _search_item_db_items(
                 w,
@@ -2683,6 +2758,7 @@ def _execute_batch_ops(
             slot_query = str(op.get("slot") or op.get("slotName") or "").strip()
             if not slot_query:
                 raise ValueError(f"Batch op '{kind}' at step {idx} requires 'slot'.")
+            check_input(slot_query, scope=GuardrailScope.SLOT, expected_game="poe1")
             items_res = cache.get_items()
             resolved_slot = _resolve_slot_from_items(items_res, slot_query)
             w.call("unequip_slot", {"slotName": resolved_slot})
@@ -2757,6 +2833,7 @@ def _execute_batch_ops(
             title = str(op.get("title") or op.get("name") or "Imported Tree").strip()
             if not url:
                 raise ValueError(f"Batch op 'import_tree_url' at step {idx} requires 'url'.")
+            validate_url(url, expected_game="poe1", cli_subcommand="batch")
             specs_res = w.call("import_tree_url", {"url": url, "title": title})
             cache.invalidate("tree", "classes", "items", "skills")
             cache.specs = specs_res
@@ -2900,6 +2977,8 @@ def _execute_batch_ops(
                 sg_params["includeInFullDPS"] = bool(full_dps_val)
             if "slot" in op and op["slot"] is not None:
                 s_clean = str(op["slot"]).strip()
+                if s_clean:
+                    check_input(s_clean, scope=GuardrailScope.SLOT, expected_game="poe1")
                 sg_params["slot"] = _resolve_slot_from_items(cache.get_items(), s_clean) if s_clean else ""
             if "mainActiveSkill" in op or "main_active_skill" in op:
                 mas = op.get("mainActiveSkill", op.get("main_active_skill"))
@@ -2961,6 +3040,7 @@ def _execute_batch_ops(
             remove_gem_sel = op.get("removeGem") if "removeGem" in op else op.get("remove_gem")
             if add_gem_name:
                 gem_name = str(add_gem_name).strip()
+                check_input(gem_name, scope=GuardrailScope.GEM_NAME, expected_game="poe1")
                 cand = _resolve_gem_candidate(w, g_idx, gem_name)
                 raw_level = op.get("level")
                 raw_quality = op.get("quality")
@@ -2989,6 +3069,7 @@ def _execute_batch_ops(
                 gem_params: dict[str, Any] = {"group": g_idx, "index": t_gem["index"]}
                 new_gem_name = op.get("newGem") or op.get("new_gem")
                 if new_gem_name:
+                    check_input(str(new_gem_name), scope=GuardrailScope.GEM_NAME, expected_game="poe1")
                     cand = _resolve_gem_candidate(w, g_idx, str(new_gem_name))
                     if cand and cand.get("gemId"):
                         gem_params["gemId"] = cand["gemId"]
@@ -3384,6 +3465,8 @@ def run_sweep(
         kw_list = [k.strip() for k in calc_keywords.split(",") if k.strip()]
     elif calc_keywords:
         kw_list = [str(k).strip() for k in calc_keywords if str(k).strip()]
+    for kw in kw_list:
+        check_input(kw, scope=GuardrailScope.CALC_QUERY, expected_game="poe1")
 
     merged_keep: list[str] = []
     for tok in _normalize_keep_list(keep):
@@ -3481,6 +3564,9 @@ def run_sweep(
                         if v_calcs is not None:
                             entry["calcs"] = v_calcs
                         results.append(entry)
+                    except CrossGameHallucinationError:
+                        dirty = True
+                        raise
                     except Exception as exc:  # noqa: BLE001
                         dirty = True
                         results.append(

@@ -155,6 +155,7 @@ class BridgeWorker:
         self.last_used: float = time.time()
         self.source_label: str | None = None
         self.last_good_code: str | None = None
+        self.rev: int = 0
 
         # Undo / Redo stacks holding lossless export_code strings (max 30 steps)
         self.undo_stack: list[str] = []
@@ -359,6 +360,28 @@ class BridgeWorker:
     def slot_state_path(self) -> Path:
         return get_runtime_dir(self.runtime_dir) / f"slot_{self.slot_name}.json"
 
+    @staticmethod
+    def _compact_source_label(label: Any) -> str | None:
+        if not label:
+            return None
+        s = str(label).strip()
+        if (
+            len(s) > 120
+            and not s.startswith(("http://", "https://", "<", "@"))
+            and "://" not in s
+            and "/" not in s
+            and "\\" not in s
+            and not any(ch.isspace() for ch in s)
+        ):
+            return f"share_code({len(s)} chars)"
+        return s
+
+    def bump_rev(self) -> int:
+        """Increment and return the monotonic build-state revision counter for this slot."""
+        with self._lock:
+            self.rev = int(self.rev) + 1
+            return self.rev
+
     def save_slot_state(self) -> None:
         """Persist slot build code and undo/redo stacks so daemon restarts never lose state."""
         if self.slot_name == "test":
@@ -366,12 +389,14 @@ class BridgeWorker:
         try:
             state_path = self.slot_state_path
             state_path.parent.mkdir(parents=True, exist_ok=True)
+            self.source_label = self._compact_source_label(self.source_label)
             payload = {
                 "slot": self.slot_name,
                 "last_good_code": self.last_good_code,
                 "undo_stack": self.undo_stack[-MAX_UNDO_STEPS:],
                 "redo_stack": self.redo_stack[-MAX_UNDO_STEPS:],
                 "source_label": self.source_label,
+                "rev": int(self.rev),
                 "updated_at": time.time(),
             }
             state_path.write_text(json.dumps(payload), encoding="utf-8")
@@ -387,7 +412,10 @@ class BridgeWorker:
             self.last_good_code = data.get("last_good_code")
             self.undo_stack = list(data.get("undo_stack") or [])
             self.redo_stack = list(data.get("redo_stack") or [])
-            self.source_label = data.get("source_label")
+            self.source_label = self._compact_source_label(data.get("source_label"))
+            raw_rev = data.get("rev")
+            if isinstance(raw_rev, int) and raw_rev >= 0:
+                self.rev = raw_rev
         except Exception:
             pass
 
@@ -573,7 +601,13 @@ class BridgeWorker:
             for idx, (method, raw_params) in enumerate(calls):
                 params = raw_params or {}
                 if method == "import_code":
-                    tv_mismatch = self._check_tree_version_mismatch(str(params.get("code") or ""))
+                    code_str = str(params.get("code") or "")
+                    xml_text = _decode_share_code_xml(code_str)
+                    if xml_text:
+                        from .guardrails import validate_build_xml
+
+                        validate_build_xml(xml_text, expected_game="poe1")
+                    tv_mismatch = self._check_tree_version_mismatch(code_str)
                     if tv_mismatch:
                         err_msg = f"RPC 'import_code' failed: {tv_mismatch}"
                         if raise_on_error:
@@ -738,6 +772,11 @@ class BridgeWorker:
         with self._lock:
             if method == "import_code":
                 code = str((params or {}).get("code") or "")
+                xml_text = _decode_share_code_xml(code)
+                if xml_text:
+                    from .guardrails import validate_build_xml
+
+                    validate_build_xml(xml_text, expected_game="poe1")
                 tv_mismatch = self._check_tree_version_mismatch(code)
                 if tv_mismatch:
                     raise BridgeError(f"RPC 'import_code' failed: {tv_mismatch}")

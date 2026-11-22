@@ -107,6 +107,114 @@ class LazyGroup(click.Group):
                 formatter.write_dl(rows)
 
 
+def _ctx_wants_json(ctx: click.Context | None) -> bool:
+    """Return True if the active CLI invocation requested `--json` (works in Click CliRunner and real argv)."""
+    if ctx is not None:
+        if ctx.params.get("as_json"):
+            return True
+        root = ctx.find_root()
+        raw_args = root.meta.get("pob_raw_args")
+        if isinstance(raw_args, (list, tuple)) and "--json" in raw_args:
+            return True
+    return "--json" in sys.argv[1:]
+
+
+def _augment_click_usage_error(exc: click.UsageError, fallback_ctx: click.Context | None = None) -> None:
+    """Append actionable `Did you mean` / `Suggested command` hints onto Click UsageError/NoSuchOption."""
+    import difflib
+
+    msg = str(exc.message or "")
+    if "Did you mean" in msg or "Suggested command" in msg:
+        return
+    ctx = exc.ctx or fallback_ctx
+    cmd = ctx.command if ctx is not None else None
+    cmd_path = ctx.command_path if ctx is not None else "pob"
+
+    if isinstance(exc, click.NoSuchOption):
+        bad_opt = str(exc.option_name or "")
+        all_opts: list[str] = []
+        if cmd is not None:
+            for p in getattr(cmd, "params", ()):
+                all_opts.extend(getattr(p, "opts", ()))
+                all_opts.extend(getattr(p, "secondary_opts", ()))
+        all_opts = sorted(set(o for o in all_opts if o.startswith("-")))
+        matches = difflib.get_close_matches(bad_opt, all_opts, n=3, cutoff=0.45)
+        if matches:
+            exc.message = f"{msg}\nDid you mean: {', '.join(matches)}? (Run `{cmd_path} --help` for valid options.)"
+        else:
+            exc.message = f"{msg}\nSuggested command: `{cmd_path} --help`"
+        return
+
+    # Generic UsageError: if missing required option or unknown subcommand, add help pointer
+    if "No such command" in msg and isinstance(cmd, click.Group) and ctx is not None:
+        m = re.search(r"No such command ['\"]([^'\"]+)['\"]", msg)
+        if m:
+            bad_cmd = m.group(1)
+            known_cmds = cmd.list_commands(ctx)
+            matches = difflib.get_close_matches(bad_cmd, known_cmds, n=3, cutoff=0.45)
+            if matches:
+                exc.message = (
+                    f"{msg}\nDid you mean: {', '.join(matches)}? "
+                    f"Suggested command: `{cmd_path} {matches[0]} --help`"
+                )
+                return
+    if cmd_path:
+        exc.message = f"{msg}\nSuggested command: `{cmd_path} --help`"
+
+
+class GuardrailGroup(LazyGroup):
+    """LazyGroup catching CrossGameHallucinationError / LegacyPatchTrapError (-> exit 1) & enriching Click errors."""
+
+    def resolve_command(
+        self,
+        ctx: click.Context,
+        args: list[str],
+    ) -> tuple[str | None, click.Command | None, list[str]]:
+        try:
+            return super().resolve_command(ctx, args)
+        except click.UsageError as exc:
+            _augment_click_usage_error(exc, fallback_ctx=ctx)
+            raise
+
+    def make_context(
+        self,
+        info_name: str | None,
+        args: list[str],
+        parent: click.Context | None = None,
+        **extra: Any,
+    ) -> click.Context:
+        raw_args_copy = list(args)
+        try:
+            ctx = super().make_context(info_name, args, parent=parent, **extra)
+        except click.UsageError as exc:
+            _augment_click_usage_error(exc, fallback_ctx=parent)
+            raise
+        ctx.meta["pob_raw_args"] = raw_args_copy
+        return ctx
+
+    def invoke(self, ctx: click.Context) -> Any:
+        from .errors import CrossGameHallucinationError, LegacyPatchTrapError
+        from .guardrails import reset_cli_warnings, warning_context
+
+        reset_cli_warnings()
+        with warning_context():
+            try:
+                return super().invoke(ctx)
+            except (CrossGameHallucinationError, LegacyPatchTrapError) as exc:
+                as_json = _ctx_wants_json(ctx)
+                _echo_stderr_utf8(exc.format_human())
+                if as_json:
+                    raw_args = ctx.find_root().meta.get("pob_raw_args") or ()
+                    eff_compact, eff_out = _resolve_output_flags(compact="--compact" in raw_args)
+                    from .formatters import emit_json
+
+                    emit_json(exc.to_dict(), compact=eff_compact, out=eff_out, sanitize=False)
+                ctx.exit(1)
+            except click.UsageError as exc:
+                _augment_click_usage_error(exc, fallback_ctx=ctx)
+                raise
+
+
 def _target_option(*, allow_slot_alias: bool = True) -> Any:
     """Attach named multi-slot `--target` (plus `--slot` alias when non-conflicting)."""
     decls = ("--target", "--slot", "target") if allow_slot_alias else ("--target", "target")
@@ -252,10 +360,13 @@ def _daemon_call(
     import http.client
 
     from .daemon import BootstrapMissingError, DaemonRequestError, call_daemon
+    from .errors import CrossGameHallucinationError, LegacyPatchTrapError
     from .updater import format_stderr_update_alert
 
     try:
         return call_daemon(action, params, auto_start=auto_start, timeout=timeout)
+    except (CrossGameHallucinationError, LegacyPatchTrapError):
+        raise
     except BootstrapMissingError as exc:
         alert = format_stderr_update_alert(exc.update_status) or str(exc)
         _echo_stderr_utf8(alert)
@@ -315,10 +426,11 @@ def _prepend_warning(body: str, res: dict[str, Any]) -> str:
     return f"{banner}{body}" if banner else body
 
 
-def _render_mutation_report(title: str, res: dict[str, Any]) -> str:
-    from .formatters import fmt_delta, fmt_num, render_table
+def _render_mutation_report(title: str, res: dict[str, Any], *, target: str | None = None) -> str:
+    from .formatters import fmt_delta, fmt_num, format_recency_stamp, render_table
 
-    lines = [f"### {title} — `{res.get('mode', '')}`"]
+    stamp = format_recency_stamp(res, slot=target or res.get("targetSlot"))
+    lines = [stamp, f"### {title} — `{res.get('mode', '')}`"]
     before = res.get("before") or {}
     after = res.get("after") or {}
     no_undo = bool(res.get("noUndo")) or (not before and bool(after))
@@ -412,7 +524,7 @@ def _call_with_supported_kwargs(fn: Any, *args: Any, **kwargs: Any) -> Any:
 
 
 @click.group(
-    cls=LazyGroup,
+    cls=GuardrailGroup,
     lazy_subcommands=_LAZY_SUBCOMMANDS,
     context_settings={"help_option_names": ["-h", "--help"]},
 )
@@ -477,6 +589,7 @@ def cmd_serve(
     from pathlib import Path
 
     from . import daemon as daemon_mod
+    from .errors import CrossGameHallucinationError
     from .updater import format_stderr_update_alert
 
     runner = getattr(daemon_mod, "run_daemon_forever", None) or daemon_mod.run_daemon_server
@@ -489,6 +602,8 @@ def cmd_serve(
             proxy=proxy,
             mirror=mirror,
         )
+    except CrossGameHallucinationError:
+        raise
     except daemon_mod.BootstrapMissingError as exc:
         alert = format_stderr_update_alert(exc.update_status) or str(exc)
         _echo_stderr_utf8(alert)
@@ -529,6 +644,7 @@ def cmd_bootstrap(
     from pathlib import Path
 
     from .daemon import call_daemon, emit_stderr_update_alert, read_daemon_state
+    from .errors import CrossGameHallucinationError
     from .formatters import render_table
     from .updater import (
         STATE_BOOTSTRAP_MISSING,
@@ -544,6 +660,8 @@ def cmd_bootstrap(
             deadline = time.monotonic() + 2.0
             while read_daemon_state() is not None and time.monotonic() < deadline:
                 time.sleep(0.1)
+        except CrossGameHallucinationError:
+            raise
         except Exception:
             pass
 
@@ -615,6 +733,7 @@ def cmd_update(
     import http.client
 
     from .daemon import DaemonRequestError, call_daemon, emit_stderr_update_alert, read_daemon_state
+    from .errors import CrossGameHallucinationError
     from .formatters import render_table
     from .updater import STATE_BOOTSTRAP_MISSING, check_and_apply_updates, get_update_warning
 
@@ -634,6 +753,8 @@ def cmd_update(
                 auto_start=False,
                 timeout=180.0,
             )
+        except CrossGameHallucinationError:
+            raise
         except DaemonRequestError as exc:
             msg = str(exc).strip() or "Daemon rejected 'update'."
             raise click.ClickException(msg) from exc
@@ -760,9 +881,12 @@ def cmd_stop(as_json: bool, compact: bool, out_path: str | None) -> None:
     import http.client
 
     from .daemon import DaemonRequestError, call_daemon
+    from .errors import CrossGameHallucinationError
 
     try:
         res = call_daemon("stop", auto_start=False)
+    except CrossGameHallucinationError:
+        raise
     except DaemonRequestError as exc:
         msg = str(exc).strip() or "Daemon rejected 'stop'."
         raise click.ClickException(msg) from exc
@@ -803,6 +927,11 @@ def cmd_new(
 ) -> None:
     """Create a fresh empty build in the target slot with optional class, ascendancy, and level."""
     from .formatters import render_table
+    from .guardrails import check_poe2_class_or_ascendancy
+
+    check_poe2_class_or_ascendancy(class_name, field="class")
+    check_poe2_class_or_ascendancy(ascendancy, field="ascendancy")
+    check_poe2_class_or_ascendancy(secondary_asc, field="secondary_ascendancy")
 
     res = _daemon_call(
         "new_build",
@@ -846,6 +975,8 @@ def _prepare_load_source(source: str) -> tuple[str | None, str | None]:
     """
     from pathlib import Path
 
+    from .guardrails import validate_build_xml, validate_url
+
     raw = source.lstrip("\ufeff").strip()
     candidate_path = raw[1:].lstrip("\ufeff").strip() if raw.startswith("@") else raw
     is_local_file = False
@@ -859,18 +990,34 @@ def _prepare_load_source(source: str) -> tuple[str | None, str | None]:
     if is_local_file:
         text = Path(candidate_path).read_text(encoding="utf-8-sig", errors="replace").lstrip("\ufeff").strip()
         if text.lstrip().startswith("<"):
+            validate_build_xml(text, expected_game="poe1", source_hint=candidate_path)
             from .importers import xml_to_share_code
 
             return None, xml_to_share_code(text)
+        validate_url(text, expected_game="poe1", cli_subcommand="load")
+        from .bridge_client import _decode_share_code_xml
+
+        decoded_file_xml = _decode_share_code_xml(text)
+        if decoded_file_xml:
+            validate_build_xml(decoded_file_xml, expected_game="poe1", source_hint=candidate_path)
         return text, None
 
     if raw.startswith("@"):
         raise click.ClickException(f"Build file not found: {candidate_path or raw}")
 
     if raw.lstrip().startswith("<"):
+        validate_build_xml(raw, expected_game="poe1")
         from .importers import xml_to_share_code
 
         return None, xml_to_share_code(raw)
+
+    validate_url(raw, expected_game="poe1", cli_subcommand="load")
+    if not raw.startswith(("http://", "https://")):
+        from .bridge_client import _decode_share_code_xml
+
+        decoded_xml = _decode_share_code_xml(raw)
+        if decoded_xml:
+            validate_build_xml(decoded_xml, expected_game="poe1")
 
     return raw, None
 
@@ -883,6 +1030,7 @@ def _prepare_load_source(source: str) -> tuple[str | None, str | None]:
 def cmd_load(source: str, target: str, as_json: bool, compact: bool, out_path: str | None) -> None:
     """Load a build from local .xml/.txt file (or @file), share URL (pobb.in/poedb/poe.ninja/...), or Base64 code."""
     from .daemon import emit_stderr_update_alert
+    from .errors import CrossGameHallucinationError
     from .formatters import render_table, strip_pob_escapes
     from .updater import load_update_state
 
@@ -895,6 +1043,8 @@ def cmd_load(source: str, target: str, as_json: bool, compact: bool, out_path: s
 
     try:
         res = _daemon_call("load", params)
+    except CrossGameHallucinationError:
+        raise
     except click.exceptions.Exit:
         raise
     except click.ClickException:
@@ -1081,7 +1231,7 @@ def cmd_redo(target: str, as_json: bool, compact: bool, out_path: str | None) ->
 @_output_options
 def cmd_summary(target: str, as_json: bool, compact: bool, out_path: str | None) -> None:
     """Display comprehensive build identity, offence, minion offence, defence, and warnings."""
-    from .formatters import fmt_num, render_table, strip_pob_escapes
+    from .formatters import fmt_num, format_recency_stamp, render_table, strip_pob_escapes
 
     res = _daemon_call("summary", {"target": target})
     if as_json:
@@ -1098,6 +1248,7 @@ def cmd_summary(target: str, as_json: bool, compact: bool, out_path: str | None)
     )
 
     lines = [
+        format_recency_stamp(res, slot=target),
         f"### Build Summary (`{target}`): Lv.{info.get('level')} {info.get('classNameZh') or info.get('className')} / {info.get('ascendClassNameZh') or info.get('ascendClassName')}",
         f"- **Points**: `{pts.get('used', 0)}/{pts.get('usedMax', 0)}` | **Ascendancy**: `{pts.get('ascUsed', 0)}/{pts.get('ascMax', 0)}` | **Tree**: `{info.get('treeVersion')}`",
         f"- **Main Skill Group**: `#{mg.get('index', '-')} {strip_pob_escapes(mg.get('displayLabelZh') or mg.get('displayLabel') or '-')}` (`{mg.get('slot') or 'Unassigned'}`)",
@@ -1151,6 +1302,124 @@ def cmd_summary(target: str, as_json: bool, compact: bool, out_path: str | None)
     _emit_text(_prepend_warning("\n".join(lines), res), out_path=out_path)
 
 
+@main.command("diagnose")
+@click.argument("source", required=False)
+@click.option(
+    "-c",
+    "--compare",
+    "compare_source",
+    default=None,
+    help="Second build source (@file.xml/@file.code/URL/code) for one-shot 3-baseline A/B comparison + Pinnacle audit of both builds.",
+)
+@click.option(
+    "-q",
+    "--ask",
+    "ask_text",
+    default=None,
+    help="Player question text to ground (<15ms 3.30 fact cards + PoE2/patch trap alerts) and merge into the diagnosis.",
+)
+@click.option(
+    "--keep",
+    "keep",
+    multiple=True,
+    help="Keep build-guaranteed config/flask/skill/customMods/party items during dewatering (repeatable or comma-separated).",
+)
+@click.option("--top", type=int, default=5, show_default=True, help="Top N passive nodes & candidate support gems.")
+@click.option("--no-rank", "no_rank", is_flag=True, help="Skip passive node & support gem ROI rankings (faster; default when --compare is set).")
+@_target_option(allow_slot_alias=True)
+@click.option(
+    "--ref-target",
+    "ref_target",
+    type=_SLOT_SLUG_TYPE,
+    default=None,
+    help="Reference build slot slug for --compare (defaults to 'ref' when target=='main', else '<target>_ref').",
+)
+@click.option("--json", "as_json", is_flag=True, help="Output raw JSON.")
+@_output_options
+@click.pass_context
+def cmd_diagnose(
+    ctx: click.Context,
+    source: str | None,
+    compare_source: str | None,
+    ask_text: str | None,
+    keep: tuple[str, ...],
+    top: int,
+    no_rank: bool,
+    target: str,
+    ref_target: str | None,
+    as_json: bool,
+    compact: bool,
+    out_path: str | None,
+) -> None:
+    """One-shot comprehensive build diagnosis (and optional dual-build --compare & --ask question grounding)."""
+    from click.core import ParameterSource
+
+    from .formatters import format_diagnose_markdown
+
+    # In --compare mode, default to no_rank=True (<8KB compact report) unless --top was explicitly passed.
+    eff_no_rank = bool(no_rank)
+    if compare_source and not no_rank:
+        top_src = ctx.get_parameter_source("top")
+        if top_src != ParameterSource.COMMANDLINE:
+            eff_no_rank = True
+
+    params: dict[str, Any] = {
+        "target": target,
+        "top": top,
+        "no_rank": eff_no_rank,
+    }
+    if keep:
+        params["keep"] = list(keep)
+    if ask_text and ask_text.strip():
+        params["ask"] = ask_text.strip()
+    if source:
+        resolved_src, resolved_xml_code = _prepare_load_source(source)
+        if resolved_xml_code is not None:
+            params["xml_code"] = resolved_xml_code
+        else:
+            params["source"] = resolved_src
+    if compare_source:
+        eff_ref = ref_target or ("ref" if target == "main" else f"{target}_ref")
+        params["ref_target"] = eff_ref
+        cmp_src, cmp_xml_code = _prepare_load_source(compare_source)
+        if cmp_xml_code is not None:
+            params["compare_xml_code"] = cmp_xml_code
+        else:
+            params["compare_source"] = cmp_src
+
+    res = _daemon_call("diagnose", params, timeout=240.0 if compare_source else 180.0)
+    if as_json:
+        _emit_json(res, compact=compact, out_path=out_path)
+        return
+    _emit_text(format_diagnose_markdown(res), out_path=out_path)
+
+
+@main.command("ground")
+@click.argument("text", nargs=-1, required=True)
+@click.option("--limit", type=int, default=8, show_default=True, help="Maximum live gem/unique fact cards to attach.")
+@click.option("--json", "as_json", is_flag=True, help="Output raw JSON.")
+@_output_options
+def cmd_ground(
+    text: tuple[str, ...],
+    limit: int,
+    as_json: bool,
+    compact: bool,
+    out_path: str | None,
+) -> None:
+    """Fast (<15ms, daemon-free) entity & PoE2/legacy-patch trap grounder for arbitrary player prompts."""
+    from .formatters import format_ground_markdown
+    from .game_data import ground_text_entities
+
+    joined = " ".join(t for t in text if t).strip()
+    if not joined:
+        raise click.UsageError("Provide non-empty prompt text to ground.")
+    res = ground_text_entities(joined, limit=limit)
+    if as_json:
+        _emit_json(res, compact=compact, out_path=out_path, sanitize=False)
+        return
+    _emit_text(format_ground_markdown(res), out_path=out_path)
+
+
 @main.command("audit")
 @click.option(
     "--keep",
@@ -1176,7 +1445,7 @@ def cmd_audit(
     out_path: str | None,
 ) -> None:
     """Run build health check and non-destructive 4-part PoB inflation ('water') audit."""
-    from .formatters import fmt_delta, fmt_num, render_table
+    from .formatters import fmt_delta, fmt_num, format_recency_stamp, render_table
 
     params: dict[str, Any] = {"target": target, "attribution": not no_attribution}
     if keep:
@@ -1186,7 +1455,7 @@ def cmd_audit(
         _emit_json(res, compact=compact, out_path=out_path)
         return
 
-    lines = ["### Build Health & Inflation ('Water') Audit"]
+    lines = [format_recency_stamp(res, slot=target), "### Build Health & Inflation ('Water') Audit"]
     r_warn = _restore_warning(res)
     if r_warn:
         lines.append(r_warn)
@@ -1302,6 +1571,11 @@ def cmd_items(
     """List equipped items, inspect a single slot, or dump all equipped items & jewels (`--all --raw`)."""
     from .formatters import render_table, strip_pob_escapes
 
+    if slot:
+        from .guardrails import GuardrailScope, check_input
+
+        check_input(slot, scope=GuardrailScope.SLOT, expected_game="poe1")
+
     res = _daemon_call(
         "items",
         {"target": target, "slot": slot, "raw": bool(raw or all_items), "allRaw": bool(all_items)},
@@ -1326,7 +1600,7 @@ def cmd_items(
                 lines.append(f"  {txt}")
         if raw and res.get("raw"):
             lines.append("\n```text\n" + res["raw"].strip() + "\n```")
-        _emit_text("\n".join(lines), out_path=out_path)
+        _emit_text(_prepend_active_guardrail_warnings("\n".join(lines)), out_path=out_path)
         return
 
     if all_items:
@@ -1349,7 +1623,7 @@ def cmd_items(
             raw_txt = s.get("raw")
             if raw_txt:
                 lines.append("```text\n" + str(raw_txt).strip() + "\n```")
-        _emit_text("\n".join(lines), out_path=out_path)
+        _emit_text(_prepend_active_guardrail_warnings("\n".join(lines)), out_path=out_path)
         return
 
     rows = []
@@ -1426,6 +1700,16 @@ def cmd_skills(group: str | None, target: str, as_json: bool, compact: bool, out
     _emit_text(render_table(["Group", "Label", "Slot", "Enabled", "FullDPS", "Gems"], rows), out_path=out_path)
 
 
+def _prepend_active_guardrail_warnings(body: str) -> str:
+    from .guardrails import get_active_warnings
+
+    warns = get_active_warnings()
+    if not warns:
+        return body
+    lines = [w.format_markdown() for w in warns]
+    return "\n".join(lines) + "\n\n" + body
+
+
 def _run_tree_inspect(
     *,
     searches: tuple[str, ...],
@@ -1442,8 +1726,11 @@ def _run_tree_inspect(
 ) -> None:
     """Summarize allocated passive tree nodes or search/filter tree nodes with paths, masteries, or jewel radius."""
     from .formatters import format_tree_markdown
+    from .guardrails import GuardrailScope, check_input
 
     search_list = [s for s in searches if s]
+    for s in search_list:
+        check_input(s, scope=GuardrailScope.DATA_QUERY, expected_game="poe1")
     params: dict[str, Any] = {
         "target": target,
         "search": search_list[0] if search_list else None,
@@ -1462,7 +1749,7 @@ def _run_tree_inspect(
 
     search_label = ", ".join(search_list) if search_list else None
     body = format_tree_markdown(res, search_label=search_label, show_path=show_path, masteries=masteries)
-    _emit_text(body, out_path=out_path)
+    _emit_text(_prepend_active_guardrail_warnings(body), out_path=out_path)
 
 
 @main.command("calc")
@@ -1483,8 +1770,12 @@ def cmd_calc(
 ) -> None:
     """Search PoB Calcs breakdown tables and formulas by one or more English/Chinese keywords."""
     from .formatters import render_table, strip_pob_escapes
+    from .guardrails import GuardrailScope, check_input
 
     kw_list = list(keywords)
+    for kw in kw_list:
+        if kw.strip():
+            check_input(kw, scope=GuardrailScope.CALC_QUERY, expected_game="poe1")
     res = _daemon_call(
         "calc",
         {
@@ -1545,7 +1836,7 @@ def cmd_calc(
                 continue
             for m in sub_matches[:row_limit]:
                 _append_calc_match(lines, m)
-        _emit_text("\n".join(lines), out_path=out_path)
+        _emit_text(_prepend_active_guardrail_warnings("\n".join(lines)), out_path=out_path)
         return
 
     if not matches:
@@ -1556,7 +1847,7 @@ def cmd_calc(
     for m in matches[:row_limit]:
         _append_calc_match(lines, m)
 
-    _emit_text("\n".join(lines), out_path=out_path)
+    _emit_text(_prepend_active_guardrail_warnings("\n".join(lines)), out_path=out_path)
 
 
 # --- 4.3 What-If & Apply Mutations ---
@@ -1597,6 +1888,12 @@ def cmd_item_try(
         raw_text = Path(file_path).read_text(encoding="utf-8-sig", errors="replace").lstrip("\ufeff")
     if not raw_text:
         raise click.UsageError('Provide either --raw "<item_text>" or --file <item.txt>.')
+
+    from .guardrails import GuardrailScope, check_input, check_input_item_raw
+
+    if slot:
+        check_input(slot, scope=GuardrailScope.SLOT, expected_game="poe1")
+    check_input_item_raw(raw_text, expected_game="poe1")
 
     res = _daemon_call(
         "item_try",
@@ -1668,6 +1965,14 @@ def cmd_item_edit(
     if not replace_mods and not add_mods and not remove_mods:
         raise click.UsageError("Provide at least one of --replace-mod, --add-mod, or --remove-mod.")
 
+    from .guardrails import GuardrailScope, check_input
+
+    check_input(slot, scope=GuardrailScope.SLOT, expected_game="poe1")
+    for _, new_line in replace_mods:
+        check_input(new_line, scope=GuardrailScope.ITEM_RAW, expected_game="poe1")
+    for new_mod in add_mods:
+        check_input(new_mod, scope=GuardrailScope.ITEM_RAW, expected_game="poe1")
+
     res = _daemon_call(
         "item_edit",
         {
@@ -1716,6 +2021,9 @@ def cmd_item_unequip(
     out_path: str | None,
 ) -> None:
     """Unequip the item in an equipment or jewel slot (0-residue what-if unless --apply)."""
+    from .guardrails import GuardrailScope, check_input
+
+    check_input(slot, scope=GuardrailScope.SLOT, expected_game="poe1")
     res = _daemon_call("item_unequip", {"target": target, "slot": slot, "apply": apply})
     if as_json:
         _emit_json(res, compact=compact, out_path=out_path)
@@ -1760,6 +2068,11 @@ def cmd_item_db(
 ) -> None:
     """Search PoB's built-in Unique/Rare item database (EN/ZH) and optionally try/equip a match."""
     from .formatters import render_table, strip_pob_escapes
+    from .guardrails import GuardrailScope, check_input
+
+    check_input(query, scope=GuardrailScope.DATA_QUERY, expected_game="poe1")
+    if slot:
+        check_input(slot, scope=GuardrailScope.SLOT, expected_game="poe1")
 
     res = _daemon_call(
         "item_db",
@@ -1848,7 +2161,7 @@ def cmd_item_flask(
 
 @grp_item.command("anoint")
 @click.option("--slot", default="Amulet", show_default=True, help="Equipment slot to anoint.")
-@click.option("--notable", required=True, help="Notable passive name (Chinese or English).")
+@click.option("--notable", "--oil", "notable", required=True, help="Notable passive name (Chinese or English).")
 @click.option("--index", "anoint_idx", type=int, default=1, show_default=True, help="Anoint slot index (1..4).")
 @click.option("--apply", is_flag=True, help="Persist anoint into build.")
 @_target_option(allow_slot_alias=False)
@@ -1866,6 +2179,10 @@ def cmd_item_anoint(
 ) -> None:
     """Anoint an equipped item via PoB's native item_edit_popup workflow."""
     from .formatters import strip_pob_escapes
+    from .guardrails import GuardrailScope, check_input
+
+    check_input(slot, scope=GuardrailScope.SLOT, expected_game="poe1")
+    check_input(notable, scope=GuardrailScope.NOTABLE_OR_OIL, expected_game="poe1")
 
     res = _daemon_call(
         "item_anoint",
@@ -1885,6 +2202,134 @@ def cmd_item_anoint(
         _emit_text(_render_mutation_report(f"Anoint {slot} (#{anoint_idx}) -> {lbl}", res), out_path=out_path)
 
 
+def _extract_trap_opt(raw_args: tuple[str, ...], names: tuple[str, ...]) -> str | None:
+    args_list = list(raw_args)
+    for idx, tok in enumerate(args_list):
+        if tok in names and idx + 1 < len(args_list):
+            return args_list[idx + 1]
+        for nm in names:
+            if tok.startswith(f"{nm}="):
+                return tok.split("=", 1)[1]
+    return None
+
+
+@grp_item.command(
+    "charm",
+    hidden=True,
+    context_settings={"ignore_unknown_options": True, "allow_extra_args": True},
+    short_help="[TRAP -> pob item flask] PoE1 uses Flask 1..5, not PoE2 belt Charms.",
+)
+@click.argument("raw_args", nargs=-1, type=click.UNPROCESSED)
+def cmd_item_charm_trap(raw_args: tuple[str, ...]) -> None:
+    """Intentional reverse guardrail trap for PoE2 `item charm` invocations in `pob`."""
+    from .errors import CrossGameHallucinationError
+
+    pos = [a for a in raw_args if not a.startswith("-")]
+    idx_tok = pos[0] if pos and pos[0] in ("1", "2", "3", "4", "5", "all") else "1"
+    state_tok = pos[1].lower() if len(pos) >= 2 and pos[1].lower() in ("on", "off") else "on"
+    raise CrossGameHallucinationError(
+        game="poe1",
+        detected_game="poe2",
+        trigger=" ".join(["pob item charm", *raw_args]).strip(),
+        error="Belt `Charm 1..3` slots (`护符`/`咒符`) are a PoE2 mechanic; Path of Exile 1 does not have belt Charm slots.",
+        remediation=(
+            "In PoE1, toggle `Flask 1..5` via `pob item flask <1..5|all> <on|off>`, "
+            "or run `pob2 item charm` in `F:/poe2` for PoE2 builds."
+        ),
+        equivalent_command=f"pob item flask {idx_tok} {state_tok}",
+        rule_id="CLI_TRAP_ITEM_CHARM_IN_POB1",
+    )
+
+
+@grp_item.command(
+    "instill",
+    hidden=True,
+    context_settings={"ignore_unknown_options": True, "allow_extra_args": True},
+    short_help="[TRAP -> pob item anoint] PoE1 uses Blight Oils (`anoint`), not PoE2 `instill`.",
+)
+@click.argument("raw_args", nargs=-1, type=click.UNPROCESSED)
+def cmd_item_instill_trap(raw_args: tuple[str, ...]) -> None:
+    """Intentional reverse guardrail trap for PoE2 `item instill` invocations in `pob`."""
+    from .errors import CrossGameHallucinationError
+
+    slot_val = _extract_trap_opt(raw_args, ("--slot",))
+    notable_val = _extract_trap_opt(raw_args, ("--notable",))
+    slot_part = f"--slot {slot_val} " if slot_val else ""
+    notable_part = f'--notable "{notable_val}"' if notable_val else '--notable "<name>"'
+    raise CrossGameHallucinationError(
+        game="poe1",
+        detected_game="poe2",
+        trigger=" ".join(["pob item instill", *raw_args]).strip(),
+        error="Amulet Instilling (`涂灌` with Delirium Distilled/Liquid Emotions) is a PoE2 mechanic.",
+        remediation=(
+            "In PoE1, anoint amulets/rings with Blight Oils (`圣油`/`涂油`) via `pob item anoint`, "
+            "or run `pob2 item instill` in `F:/poe2` for PoE2 builds."
+        ),
+        equivalent_command=f"pob item anoint {slot_part}{notable_part}".strip(),
+        rule_id="CLI_TRAP_ITEM_INSTILL_IN_POB1",
+    )
+
+
+@main.command(
+    "rune",
+    hidden=True,
+    context_settings={"ignore_unknown_options": True, "allow_extra_args": True},
+    short_help="[TRAP -> pob bench] PoE1 uses Hideout Crafting Bench, not PoE2 equipment Runes.",
+)
+@click.argument("raw_args", nargs=-1, type=click.UNPROCESSED)
+def cmd_rune_trap(raw_args: tuple[str, ...]) -> None:
+    """Intentional reverse guardrail trap for PoE2 `rune` invocations in `pob`."""
+    from .errors import CrossGameHallucinationError
+
+    slot_val = _extract_trap_opt(raw_args, ("--slot",)) or "helmet"
+    stat_val = _extract_trap_opt(raw_args, ("--stat", "--search"))
+    if stat_val:
+        equiv = f'pob bench suggest --slot {slot_val} --stat "{stat_val}"'
+    else:
+        equiv = f"pob bench list --slot {slot_val}"
+    raise CrossGameHallucinationError(
+        game="poe1",
+        detected_game="poe2",
+        trigger=" ".join(["pob rune", *raw_args]).strip(),
+        error="Path of Exile 1 does not have PoE2 equipment Rune/Soul Core sockets (`pob2 rune` / `ModRunes.lua`).",
+        remediation=(
+            "In PoE1, gear crafting uses the Hideout Crafting Bench (`{crafted}` via `pob bench list` / `pob bench suggest`), "
+            "or run `pob2 rune` in `F:/poe2` for PoE2."
+        ),
+        equivalent_command=equiv,
+        rule_id="CLI_TRAP_RUNE_IN_POB1",
+    )
+
+
+@main.command(
+    "instill",
+    hidden=True,
+    context_settings={"ignore_unknown_options": True, "allow_extra_args": True},
+    short_help="[TRAP -> pob item anoint] PoE1 uses Blight Oils (`pob item anoint`), not PoE2 `instill`.",
+)
+@click.argument("raw_args", nargs=-1, type=click.UNPROCESSED)
+def cmd_instill_trap(raw_args: tuple[str, ...]) -> None:
+    """Intentional reverse guardrail trap for PoE2 `instill` invocations in `pob`."""
+    from .errors import CrossGameHallucinationError
+
+    slot_val = _extract_trap_opt(raw_args, ("--slot",))
+    notable_val = _extract_trap_opt(raw_args, ("--notable",))
+    slot_part = f"--slot {slot_val} " if slot_val else ""
+    notable_part = f'--notable "{notable_val}"' if notable_val else '--notable "<name>"'
+    raise CrossGameHallucinationError(
+        game="poe1",
+        detected_game="poe2",
+        trigger=" ".join(["pob instill", *raw_args]).strip(),
+        error="Amulet Instilling (`涂灌` with Delirium Distilled/Liquid Emotions) is a PoE2 mechanic.",
+        remediation=(
+            "In PoE1, anoint items with Blight Oils (`圣油`/`涂油`) via `pob item anoint`, "
+            "or run `pob2 item instill` in `F:/poe2` for PoE2."
+        ),
+        equivalent_command=f"pob item anoint {slot_part}{notable_part}".strip(),
+        rule_id="CLI_TRAP_INSTILL_IN_POB1",
+    )
+
+
 @main.group("skill")
 def grp_skill() -> None:
     """Modify, add, or replace skill groups and support/active gems."""
@@ -1893,7 +2338,7 @@ def grp_skill() -> None:
 
 @grp_skill.command("set")
 @click.option("--group", default="main", show_default=True, help="Skill group ('main', index, or label).")
-@click.option("--gem", help="Gem 1-based index or name within group.")
+@click.option("--gem", "--gem-name", "gem", help="Gem 1-based index or name within group.")
 @click.option("--new-gem", "--name", "new_gem", help="Replace gem with a new gem name (English or Chinese).")
 @click.option("--level", type=int, help="Gem level.")
 @click.option("--quality", type=int, help="Gem quality.")
@@ -1920,6 +2365,10 @@ def cmd_skill_set(
     out_path: str | None,
 ) -> None:
     """Modify gem level/quality/enabled/count/gemId or group FullDPS state."""
+    if new_gem:
+        from .guardrails import GuardrailScope, check_input
+
+        check_input(new_gem, scope=GuardrailScope.GEM_NAME, expected_game="poe1", block_legacy_gems=True)
     res = _daemon_call(
         "skill_set",
         {
@@ -1943,7 +2392,7 @@ def cmd_skill_set(
 
 @grp_skill.command("add")
 @click.option("--group", default="main", show_default=True, help="Skill group ('main', index, or label).")
-@click.option("--gem", required=True, help="Gem name (English or Chinese).")
+@click.option("--gem", "--gem-name", "--name", "gem", required=True, help="Gem name (English or Chinese).")
 @click.option("--level", type=int, default=20, show_default=True)
 @click.option("--quality", type=int, default=20, show_default=True)
 @click.option("--apply", is_flag=True, help="Persist change into build.")
@@ -1962,6 +2411,9 @@ def cmd_skill_add(
     out_path: str | None,
 ) -> None:
     """Add a gem to a skill group."""
+    from .guardrails import GuardrailScope, check_input
+
+    check_input(gem, scope=GuardrailScope.GEM_NAME, expected_game="poe1", block_legacy_gems=True)
     res = _daemon_call(
         "skill_add",
         {
@@ -1984,7 +2436,7 @@ def cmd_skill_add(
 
 @grp_skill.command("rm")
 @click.option("--group", default="main", show_default=True, help="Skill group ('main', index, or label).")
-@click.option("--gem", required=True, help="Gem 1-based index or name to remove.")
+@click.option("--gem", "--gem-name", "--name", "gem", required=True, help="Gem 1-based index or name to remove.")
 @click.option("--apply", is_flag=True, help="Persist change into build.")
 @_target_option(allow_slot_alias=True)
 @click.option("--json", "as_json", is_flag=True, help="Output raw JSON.")
@@ -2037,7 +2489,14 @@ def cmd_skill_new_group(
     out_path: str | None,
 ) -> None:
     """Create a new skill group and optionally populate its linked gems in one transaction."""
+    from .guardrails import GuardrailScope, check_input
+
+    if slot:
+        check_input(slot, scope=GuardrailScope.SLOT, expected_game="poe1")
     gems = [_parse_gem_spec(g) for g in gem_specs] if gem_specs else None
+    for g_item in gems or []:
+        if g_item.get("name"):
+            check_input(str(g_item["name"]), scope=GuardrailScope.GEM_NAME, expected_game="poe1", block_legacy_gems=True)
     res = _daemon_call(
         "skill_new_group",
         {
@@ -2098,6 +2557,15 @@ def cmd_skill_replace_group(
 
     if not parsed_gems:
         raise click.UsageError("Provide at least one gem via --gem 'Name[:lvl[:qual]]' or --gems '[...]'.")
+
+    from .guardrails import GuardrailScope, check_input
+
+    if slot:
+        check_input(slot, scope=GuardrailScope.SLOT, expected_game="poe1")
+    for g_item in parsed_gems:
+        g_name = str(g_item.get("name") or g_item.get("nameSpec") or g_item.get("gem") or "").strip()
+        if g_name:
+            check_input(g_name, scope=GuardrailScope.GEM_NAME, expected_game="poe1", block_legacy_gems=True)
 
     res = _daemon_call(
         "skill_replace_group",
@@ -2276,6 +2744,12 @@ def cmd_tree_set_class(
     if not class_name and not ascendancy and not secondary_asc:
         raise click.UsageError("Specify class_name, ascendancy, and/or --secondary-asc.")
 
+    from .guardrails import check_poe2_class_or_ascendancy
+
+    check_poe2_class_or_ascendancy(class_name, field="class")
+    check_poe2_class_or_ascendancy(ascendancy, field="ascendancy")
+    check_poe2_class_or_ascendancy(secondary_asc, field="secondary_ascendancy")
+
     res = _daemon_call(
         "tree_set_class",
         {
@@ -2320,6 +2794,11 @@ def cmd_config_list(
     """List active (non-default) ConfigTab variables and raw customMods."""
     from .formatters import fmt_num, render_table
 
+    if search:
+        from .guardrails import GuardrailScope, check_input
+
+        check_input(search, scope=GuardrailScope.CONFIG_VAR, expected_game="poe1")
+
     res = _daemon_call(
         "config_list",
         {
@@ -2353,7 +2832,7 @@ def cmd_config_list(
     cm_text = (res.get("customModsText") or "").strip()
     if cm_text:
         lines.append("\n#### Custom Modifiers\n```text\n" + cm_text + "\n```")
-    _emit_text("\n".join(lines), out_path=out_path)
+    _emit_text(_prepend_active_guardrail_warnings("\n".join(lines)), out_path=out_path)
 
 
 @grp_config.command("set")
@@ -2383,6 +2862,15 @@ def cmd_config_set(
             raise click.UsageError(f"Invalid config assignment '{p}'; expected key=value.")
         k, v = p.split("=", 1)
         assignments.append([k.strip(), v.strip()])
+
+    from .guardrails import GuardrailScope, check_input
+
+    for k, _ in assignments:
+        check_input(k, scope=GuardrailScope.CONFIG_VAR, expected_game="poe1")
+    if custom_mods is not None and custom_mods.strip().lower() not in ("clear", "reset", "none", "disable", "disabled", ""):
+        check_input(custom_mods, scope=GuardrailScope.CONFIG_VAR, expected_game="poe1")
+    if append_mods is not None:
+        check_input(append_mods, scope=GuardrailScope.CONFIG_VAR, expected_game="poe1")
 
     res = _daemon_call(
         "config_set",
@@ -2708,24 +3196,31 @@ def cmd_rank_gems(
         _emit_json(res, compact=compact, out_path=out_path)
         return
 
+    cands = res.get("candidates", [])
+    has_caveats = any(gm.get("caveat") for gm in cands)
     rows = []
-    for idx, gm in enumerate(res.get("candidates", []), start=1):
+    for idx, gm in enumerate(cands, start=1):
         pct = gm.get("pct")
         pct_str = f"{float(pct):+.1f}%" if pct is not None else "-"
-        rows.append(
-            [
-                idx,
-                strip_pob_escapes(gm.get("nameZh") or gm.get("name")),
-                strip_pob_escapes(gm.get("name")),
-                fmt_num(gm.get("dps")),
-                fmt_num(gm.get("delta")),
-                pct_str,
-            ]
-        )
+        row_g: list[Any] = [
+            idx,
+            strip_pob_escapes(gm.get("nameZh") or gm.get("name")),
+            strip_pob_escapes(gm.get("name")),
+            fmt_num(gm.get("dps")),
+            fmt_num(gm.get("delta")),
+            pct_str,
+        ]
+        if has_caveats:
+            row_g.append(str(gm.get("caveat") or "-"))
+        rows.append(row_g)
+    headers_g = ["#", "Gem (ZH)", "Gem (EN)", "New DPS", "Delta", "Gain %"] + (["Caveat"] if has_caveats else [])
     body = (
         f"### Candidate Gem Ranking — Group #{res.get('groupIndex')} `{strip_pob_escapes(res.get('groupLabel'))}` ({res.get('mode')}, Base `{res.get('dpsField')}`: `{fmt_num(res.get('baseDps'))}`)\n"
-        + render_table(["#", "Gem (ZH)", "Gem (EN)", "New DPS", "Delta", "Gain %"], rows)
+        + render_table(headers_g, rows)
     )
+    skipped = res.get("filteredArchetypeSwaps") or []
+    if skipped:
+        body += f"\n_Filtered archetype-changing / invalid supports: {', '.join(skipped[:8])}_"
     _emit_text(body, out_path=out_path)
 
 
@@ -2869,12 +3364,30 @@ def _render_single_data_markdown(res: dict[str, Any], kind: str, query: str) -> 
 
     kind_norm = res.get("kind", kind.lower())
     results = res.get("results", [])
-    lines = [
-        f"### Local Game Data (`{kind_norm}`): `{query}` — `{res.get('count', len(results))}` hits "
-        f"(PoB `{res.get('pobVersion')}` / Data `{res.get('dataVersion')}`)",
-    ]
+    lines: list[str] = []
+    for w in res.get("warnings") or []:
+        if isinstance(w, dict):
+            tag = "[POE1-PATCH-WARN]" if w.get("category") == "legacy_patch" else "[POE1-TRAP-WARN]"
+            canon = f" (canonical: {w['canonicalTerm']})" if w.get("canonicalTerm") else ""
+            lines.append(f"> {tag} `{w.get('trigger', '')}`{canon}: {w.get('warning', '')}")
+    alias = res.get("resolvedAlias")
+    alias_note = f" (alias `{alias['from']}` -> `{alias['to']}`)" if isinstance(alias, dict) and alias.get("to") else ""
+    lines.append(
+        f"### Local Game Data (`{kind_norm}`): `{query}`{alias_note} — `{res.get('count', len(results))}` hits "
+        f"(PoB `{res.get('pobVersion')}` / Data `{res.get('dataVersion')}`)"
+    )
     if not results:
         lines.append("_(no matches)_")
+        sugs = res.get("suggestions") or []
+        if sugs:
+            s_rows = [
+                [s.get("name") or "-", s.get("zh_name") or "-", f"{float(s.get('score') or 0):.2f}"]
+                for s in sugs
+            ]
+            lines.append("\n#### Did You Mean")
+            lines.append(render_table(["Name (EN)", "Name (ZH)", "Score"], s_rows))
+        if res.get("hint"):
+            lines.append(f"\n> {res['hint']}")
         return "\n".join(lines)
 
     if kind_norm == "translate":
@@ -2884,7 +3397,10 @@ def _render_single_data_markdown(res: dict[str, Any], kind: str, query: str) -> 
         for r in results:
             zh_part = f" ({r['zh_name']})" if r.get("zh_name") else ""
             kind_lbl = "Support" if r.get("is_support") else "Active"
-            lines.append(f"\n#### {r.get('display_name') or r.get('name')}{zh_part} — `{r.get('color') or '-'}` {kind_lbl}")
+            legacy_tag = f" **[LEGACY / REMOVED IN {r.get('removedInPatch') or '3.25'}]**" if r.get("legacyOnly") else ""
+            lines.append(f"\n#### {r.get('display_name') or r.get('name')}{zh_part} — `{r.get('color') or '-'}` {kind_lbl}{legacy_tag}")
+            if r.get("legacyNote"):
+                lines.append(f"> [POE1-PATCH-WARN] {r['legacyNote']}")
             meta_bits = []
             if r.get("tag_string"):
                 meta_bits.append(f"Tags: {r['tag_string']}")
@@ -2920,8 +3436,17 @@ def _render_single_data_markdown(res: dict[str, Any], kind: str, query: str) -> 
 
             q_stats = r.get("quality_stats") or []
             if q_stats:
-                q_str = "; ".join(f"{q['stat']}={q['at_20_quality']} (@20%)" for q in q_stats[:4])
-                lines.append(f"- **Quality (20%)**: {q_str}")
+                q_parts = []
+                for q in q_stats[:4]:
+                    pq = q.get("per_quality")
+                    at20 = q.get("at_20_quality")
+                    at40 = q.get("at_40_quality")
+                    lbl = q.get("label")
+                    if lbl:
+                        q_parts.append(f"{lbl} [`{q['stat']}`, {pq}/1%, @20%={at20}, @40%={at40}]")
+                    else:
+                        q_parts.append(f"{q['stat']}={at20} (@20%, {pq}/1%, @40%={at40})")
+                lines.append(f"- **Quality**: {'; '.join(q_parts)}")
             variants = r.get("variants") or []
             if variants:
                 v_parts = []
@@ -2937,6 +3462,10 @@ def _render_single_data_markdown(res: dict[str, Any], kind: str, query: str) -> 
             meta = [x for x in [f"ReqLv {r['req_level']}" if r.get("req_level") else "", r.get("league") or "", r.get("source") or ""] if x]
             if meta:
                 lines.append("- " + " | ".join(meta))
+            matched_mods = r.get("matched_mods") or []
+            if matched_mods:
+                for mm in matched_mods[:4]:
+                    lines.append(f"- **[Match]** {mm}")
             for imp, imp_zh in zip(r.get("implicits") or [], (r.get("implicits_zh") or []) + [None] * 10):
                 lines.append(f"- [Implicit] {imp}" + (f" / {imp_zh}" if imp_zh else ""))
             for exp, exp_zh in zip(r.get("explicits") or [], (r.get("explicits_zh") or []) + [None] * 30):
@@ -3002,13 +3531,179 @@ def _render_single_data_markdown(res: dict[str, Any], kind: str, query: str) -> 
     return "\n".join(lines)
 
 
+def _render_gem_quality_breakpoints_markdown(res: dict[str, Any]) -> str:
+    from .formatters import render_table
+
+    lines: list[str] = []
+    for w in res.get("warnings") or []:
+        if isinstance(w, dict):
+            tag = "[POE1-PATCH-WARN]" if w.get("category") == "legacy_patch" else "[POE1-TRAP-WARN]"
+            lines.append(f"> {tag} `{w.get('trigger', '')}`: {w.get('warning', '')}")
+    if res.get("qualityRule"):
+        lines.append(f"> **[PoE1 3.30 Gem Quality Rule]** {res['qualityRule']}")
+
+    scope_lbl = "Active Skill Gems Only" if res.get("activeOnly") else "All Gems (Active + Support)"
+    q_lbl = f" | Search: `{res['query']}`" if res.get("query") else ""
+    lines.append(
+        f"\n### PoE1 3.30 Gem Quality Breakpoints ({scope_lbl}{q_lbl}) — "
+        f"showing `{res.get('count', 0)}` of `{res.get('totalMatched', 0)}` "
+        f"(PoB `{res.get('pobVersion')}` / `{res.get('elapsedMs')}ms`)"
+    )
+    results = res.get("results") or []
+    if not results:
+        lines.append("_(no matching gem quality stats)_")
+        return "\n".join(lines)
+
+    rows: list[list[Any]] = []
+    for idx, g in enumerate(results, start=1):
+        name_en = str(g.get("name") or "-")
+        name_zh = str(g.get("zhName") or "-")
+        kind_s = "Support" if g.get("isSupport") else "Active"
+        q_list = g.get("qualityStats") or []
+        q0 = q_list[0] if q_list else {}
+        stat_desc = "; ".join(str(q.get("label") or q.get("stat") or "") for q in q_list[:2])
+        bp_note = "; ".join(str(q.get("breakpointNote") or "") for q in q_list[:2] if q.get("breakpointNote"))
+        rows.append(
+            [
+                idx,
+                name_zh,
+                name_en,
+                kind_s,
+                q0.get("category") or "-",
+                stat_desc[:90],
+                bp_note[:70] or "-",
+            ]
+        )
+    lines.append(
+        render_table(
+            ["#", "Gem (ZH)", "Gem (EN)", "Type", "Tier", "Quality Effect (@20% -> @40%)", "Breakpoint / Step"],
+            rows,
+        )
+    )
+    return "\n".join(lines)
+
+
+def _render_tree_data_markdown(res: dict[str, Any]) -> str:
+    from .formatters import render_table
+
+    lines: list[str] = []
+    for w in res.get("warnings") or []:
+        if isinstance(w, dict):
+            tag = "[POE1-PATCH-WARN]" if w.get("category") == "legacy_patch" else "[POE1-TRAP-WARN]"
+            canon = f" (canonical: {w['canonicalTerm']})" if w.get("canonicalTerm") else ""
+            lines.append(f"> {tag} `{w.get('trigger', '')}`{canon}: {w.get('warning', '')}")
+
+    filters_obj = res.get("filters") if isinstance(res.get("filters"), dict) else {}
+    filters: list[str] = []
+    if res.get("queries"):
+        filters.append("Q=`" + ", ".join(str(x) for x in res["queries"]) + "`")
+    if filters_obj.get("type"):
+        filters.append(f"Type=`{filters_obj['type']}`")
+    if filters_obj.get("asc"):
+        filters.append(f"Asc=`{filters_obj['asc']}`")
+    filter_s = " | ".join(filters) or "all"
+    lines.append(
+        f"### Local Passive Tree Data (`Tree {res.get('treeVersion') or '3_30'}`): {filter_s} — "
+        f"`{res.get('count', 0)}` hits (`{res.get('elapsedMs')}ms`)"
+    )
+    aliases = res.get("resolvedAliases") or []
+    if aliases:
+        lines.append("- **Resolved Slang**: " + ", ".join(f"`{a['from']}` -> `{a['to']}`" for a in aliases))
+    results = res.get("results") or []
+    if not results:
+        lines.append("_(no matching passive tree nodes)_")
+        return "\n".join(lines)
+
+    rows: list[list[Any]] = []
+    for n in results:
+        name_en = str(n.get("name") or "-")
+        name_zh = str(n.get("zhName") or "")
+        disp = f"{name_zh} ({name_en})" if (name_zh and name_zh != name_en) else name_en
+        asc_en = str(n.get("ascName") or n.get("asc") or "")
+        asc_zh = str(n.get("ascNameZh") or n.get("ascZh") or "")
+        if asc_zh and asc_en and asc_zh != asc_en:
+            asc_disp = f"{asc_zh} ({asc_en})"
+        else:
+            asc_disp = asc_zh or asc_en or "-"
+        if n.get("isBloodline"):
+            asc_disp = f"{asc_disp} [Bloodline]"
+        stats_lines = n.get("stats") or []
+        if not stats_lines and n.get("masteryEffects"):
+            stats_lines = ["; ".join(me.get("stats") or []) for me in (n.get("masteryEffects") or [])[:3]]
+        stats_txt = "; ".join(str(s) for s in stats_lines[:6]) or "-"
+        rows.append([n.get("id"), disp, n.get("type") or "-", asc_disp, stats_txt])
+    lines.append(render_table(["ID", "Node", "Type", "Ascendancy", "Live 3.30 Stats"], rows))
+    return "\n".join(lines)
+
+
+def _render_tick_data_markdown(res: dict[str, Any]) -> str:
+    from .formatters import render_table
+
+    cd = res.get("current") or {}
+    nb = cd.get("nextBreakpoint") or {}
+    preset = res.get("preset") or res.get("presetLabel")
+    label = f" (`{preset}`)" if preset else ""
+    base_cd = res.get("baseCdSec")
+    cdr_val = cd.get("globalCdrPct", 0)
+    spells = res.get("triggeredSpells", 1)
+    lines = [
+        f"### PoE1 Server Tick Cooldown Calculator (`0.033s = 33ms` tick){label}",
+        "- **Formula**: `ticks = ceil((base_cd / (1 + cdr/100)) / 0.033)`, `effective_cd = ticks * 0.033s` (NOT `1/30 = 33.33ms`)",
+    ]
+    if cd:
+        lines.append(
+            f"- **Current (`base={base_cd}s`, `CDR={cdr_val:g}%`, `spells={spells}`)**: "
+            f"raw `{cd.get('rawCdSec')}s` -> **`{cd.get('ticks')}` ticks = `{cd.get('effectiveCdSec')}s` (`{cd.get('effectiveCdMs')}ms`)**, "
+            f"cap **`{cd.get('effectiveCapPerSec')}/s`**"
+            + (
+                f" | **Next breakpoint**: `{nb.get('requiredCdrPct')}%` CDR (`+{nb.get('cdrNeededPct')}%` more) -> "
+                f"`{nb.get('targetTicks')}` ticks = `{nb.get('effectiveCdMs')}ms` (`{nb.get('effectiveCapPerSec')}/s`)"
+                if nb
+                else " | at minimum 1-tick cap"
+            )
+        )
+    if cd.get("aps") is not None:
+        if cd.get("overspeed"):
+            lines.append(f"> **[OVERSPEED WARNING]** {cd.get('overspeedNote')}")
+        else:
+            lines.append(
+                f"- **APS Check**: OK — `{cd['aps']:.2f}/s` <= cap `{cd.get('effectiveCapPerSec')}/s` "
+                f"(ratio `{cd.get('apsRatioToCap')}`)"
+            )
+    if res.get("cwcNote"):
+        lines.append(f"- **CwC Reminder**: {res['cwcNote']}")
+
+    bp_rows = [
+        [
+            f"{bp.get('ticks')}t" + (" *" if cd and bp.get("ticks") == cd.get("ticks") else ""),
+            f"{bp.get('effectiveCdSec')}s ({bp.get('effectiveCdMs')}ms)",
+            f"{bp.get('minCdrPct')}%",
+            f"{bp.get('maxApsCap') or bp.get('maxTriggersPerSec')}/s",
+        ]
+        for bp in (res.get("breakpoints") or [])
+    ]
+    if bp_rows:
+        lines.append("\n#### Exact `0.033s` Tick Breakpoint Table")
+        lines.append(render_table(["Ticks", "Effective CD", "Min CDR %", "Max Triggers/s"], bp_rows))
+    return "\n".join(lines)
+
+
 @main.command("data")
-@click.argument("kind", type=click.Choice(["gem", "unique", "mod", "base", "translate"], case_sensitive=False))
-@click.argument("queries", nargs=-1, required=True)
+@click.argument("kind", type=click.Choice(["gem", "unique", "mod", "base", "translate", "tree", "tick"], case_sensitive=False))
+@click.argument("queries", nargs=-1, required=False)
 @click.option("--slot", help="Filter mods/uniques/bases by slot (e.g. 'body_armour', 'helmet', 'ring', 'wand').")
 @click.option("--ilvl", type=int, help="Maximum item level / required level filter.")
+@click.option("--mod", "mod_filter", type=str, default=None, help="[unique only] Filter uniques by explicit/implicit mod substring (EN or ZH).")
+@click.option("--type", "node_type", type=str, default=None, help="[tree only] Filter passive tree nodes by type (Keystone, Notable, Mastery, Ascendancy, Bloodline, Socket).")
+@click.option("--asc", "asc_filter", type=str, default=None, help="[tree only] Filter passive tree nodes by Ascendancy or Bloodline name (EN or ZH, e.g. Warden, Trickster, 守望者).")
+@click.option("--cdr", "cdr_pct", type=float, default=0.0, show_default=True, help="[tick only] Total Cooldown Recovery Rate % (e.g. 14, 52).")
+@click.option("--aps", "aps_rate", type=float, default=None, help="[tick only] Trigger attack/action rate per second for CoC overspeed check.")
+@click.option("--spells", "triggered_spells", type=int, default=1, show_default=True, help="[tick only] Number of distinct triggered skills sharing the trigger.")
 @click.option("--limit", type=int, default=25, show_default=True, help="Maximum number of results per query.")
-@click.option("--rebuild", is_flag=True, help="Force rebuild the local SQLite game data index.")
+@click.option("--quality-breakpoints", "quality_breakpoints", is_flag=True, help="[gem only] Scan 3.30 gems for 20%->40%+ quality breakpoints (integer steps & more multipliers).")
+@click.option("--search-quality", "search_quality", type=str, default=None, help="[gem only] Search gems by quality stat keyword (EN or ZH, e.g. 'projectile', '连锁', 'more').")
+@click.option("--active-only", "active_only", is_flag=True, help="[gem quality scan] Restrict to Active Skill Gems only (matching '+% to Quality of all Skill Gems').")
+@click.option("--rebuild", is_flag=True, help="Force rebuild the local SQLite game/tree data index.")
 @click.option("--json", "as_json", is_flag=True, help="Output raw JSON.")
 @_output_options
 def cmd_data(
@@ -3016,34 +3711,111 @@ def cmd_data(
     queries: tuple[str, ...],
     slot: str | None,
     ilvl: int | None,
+    mod_filter: str | None,
+    node_type: str | None,
+    asc_filter: str | None,
+    cdr_pct: float,
+    aps_rate: float | None,
+    triggered_spells: int,
     limit: int,
+    quality_breakpoints: bool,
+    search_quality: str | None,
+    active_only: bool,
     rebuild: bool,
     as_json: bool,
     compact: bool,
     out_path: str | None,
 ) -> None:
-    """Query local 0ms PoB Lua game data & ZH dictionary (`gem|unique|mod|base|translate`, daemon-free)."""
+    """Query local 0ms PoB Lua game/tree data & 0.033s tick calculator (`gem|unique|mod|base|translate|tree|tick`, daemon-free)."""
     from . import game_data as gd
 
+    kind_low = kind.lower()
     if rebuild:
-        gd.ensure_gamedata_index(force_rebuild=True)
+        if kind_low == "tree":
+            gd.ensure_treedata_index(force_rebuild=True)
+        elif kind_low != "tick":
+            gd.ensure_gamedata_index(force_rebuild=True)
 
     q_list = [q.strip() for q in queries if q and q.strip()]
-    if not q_list:
-        raise click.UsageError("Provide at least one non-empty query.")
-    if len(q_list) == 1:
-        res = gd.query_local_data(kind, q_list[0], slot=slot, ilvl=ilvl, limit=limit)
+
+    if kind_low == "tick":
+        if not q_list:
+            raise click.UsageError(
+                "Provide base cooldown seconds or trigger preset (e.g. `pob data tick 0.15 --cdr 14 --aps 8.5` or `pob data tick coc --cdr 52`)."
+            )
+        try:
+            res = gd.query_tick_breakpoints(
+                q_list[0],
+                cdr_pct=cdr_pct,
+                aps=aps_rate,
+                triggered_spells=triggered_spells,
+            )
+        except ValueError as exc:
+            raise click.UsageError(str(exc)) from exc
         if as_json:
             _emit_json(res, compact=compact, out_path=out_path, sanitize=False)
             return
-        _emit_text(_render_single_data_markdown(res, kind, q_list[0]), out_path=out_path)
+        _emit_text(_render_tick_data_markdown(res), out_path=out_path)
+        return
+
+    if kind_low == "tree":
+        if not q_list and not node_type and not asc_filter:
+            raise click.UsageError(
+                "Provide at least one node query or `--type` / `--asc` filter (e.g. `pob data tree --asc Warden` or `pob data tree Polymath`)."
+            )
+        res = gd.query_tree_data(
+            q_list or None,
+            node_type=node_type,
+            asc=asc_filter,
+            limit=limit,
+        )
+        if as_json:
+            _emit_json(res, compact=compact, out_path=out_path, sanitize=False)
+            return
+        _emit_text(_render_tree_data_markdown(res), out_path=out_path)
+        return
+
+    if mod_filter is not None and kind_low != "unique":
+        raise click.UsageError("--mod is only supported for `pob data unique`.")
+
+    if quality_breakpoints or search_quality is not None:
+        if kind_low != "gem":
+            raise click.UsageError("--quality-breakpoints and --search-quality are only supported for `pob data gem`.")
+        eff_q = search_quality if search_quality is not None else (" ".join(q_list) or None)
+        res = gd.query_gem_quality_breakpoints(
+            eff_q,
+            active_only=active_only,
+            limit=limit,
+        )
+        if as_json:
+            _emit_json(res, compact=compact, out_path=out_path, sanitize=False)
+            return
+        _emit_text(_render_gem_quality_breakpoints_markdown(res), out_path=out_path)
+        return
+
+    if not q_list:
+        if kind_low == "unique" and mod_filter and mod_filter.strip():
+            res = gd.query_local_data(kind, "", slot=slot, ilvl=ilvl, mod_filter=mod_filter, limit=limit)
+            if as_json:
+                _emit_json(res, compact=compact, out_path=out_path, sanitize=False)
+                return
+            _emit_text(_render_single_data_markdown(res, kind, f"--mod {mod_filter}"), out_path=out_path)
+            return
+        raise click.UsageError("Provide at least one non-empty query.")
+    if len(q_list) == 1:
+        res = gd.query_local_data(kind, q_list[0], slot=slot, ilvl=ilvl, mod_filter=mod_filter, limit=limit)
+        if as_json:
+            _emit_json(res, compact=compact, out_path=out_path, sanitize=False)
+            return
+        q_disp = f"{q_list[0]} (--mod {mod_filter})" if mod_filter else q_list[0]
+        _emit_text(_render_single_data_markdown(res, kind, q_disp), out_path=out_path)
         return
 
     # Multi-query path: use game_data.query_local_data_multi / query_multi if available, else loop
     multi_res: dict[str, Any]
     if hasattr(gd, "query_local_data_multi"):
         multi_res = _call_with_supported_kwargs(
-            gd.query_local_data_multi, kind, q_list, slot=slot, ilvl=ilvl, limit=limit
+            gd.query_local_data_multi, kind, q_list, slot=slot, ilvl=ilvl, mod_filter=mod_filter, limit=limit
         )
     elif hasattr(gd, "query_multi"):
         import inspect
@@ -3053,14 +3825,14 @@ def cmd_data(
         if first_param in ("db", "conn", "db_path"):
             db_path = gd.ensure_gamedata_index()
             multi_res = _call_with_supported_kwargs(
-                gd.query_multi, db_path, kind, q_list, slot=slot, ilvl=ilvl, limit=limit
+                gd.query_multi, db_path, kind, q_list, slot=slot, ilvl=ilvl, mod_filter=mod_filter, limit=limit
             )
         else:
             multi_res = _call_with_supported_kwargs(
-                gd.query_multi, kind, q_list, slot=slot, ilvl=ilvl, limit=limit
+                gd.query_multi, kind, q_list, slot=slot, ilvl=ilvl, mod_filter=mod_filter, limit=limit
             )
     else:
-        grouped = {q: gd.query_local_data(kind, q, slot=slot, ilvl=ilvl, limit=limit) for q in q_list}
+        grouped = {q: gd.query_local_data(kind, q, slot=slot, ilvl=ilvl, mod_filter=mod_filter, limit=limit) for q in q_list}
         multi_res = {"kind": kind.lower(), "queries": q_list, "results": grouped}
 
     if as_json:

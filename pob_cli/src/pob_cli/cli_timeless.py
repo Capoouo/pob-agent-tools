@@ -19,8 +19,9 @@ from .cli import (
     _resolve_output_flags,
     _target_option,
 )
-from .errors import DaemonRequestError
+from .errors import CrossGameHallucinationError, DaemonRequestError
 from .formatters import fmt_num, render_table
+from .guardrails import GuardrailScope, check_input, check_poe2_timeless_jewel
 from .timeless import STAT_KEYS, search, set_idle_priority
 
 
@@ -208,6 +209,8 @@ def cmd_timeless_list(
     """List timeless jewel types and the build's allocated jewel sockets."""
     try:
         info = _daemon_call("timeless_list", {"target": target})
+    except CrossGameHallucinationError:
+        raise
     except (DaemonRequestError, ValueError) as exc:
         raise click.ClickException(_err_text(exc)) from exc
     except (BridgeError, RuntimeError, OSError, zlib.error) as exc:
@@ -269,8 +272,15 @@ def cmd_timeless_search(
     if workers is not None and workers < 1:
         raise click.ClickException("--workers must be >= 1.")
 
+    check_poe2_timeless_jewel(jewel, expected_game="poe1")
+    check_input(jewel, scope=GuardrailScope.DATA_QUERY, expected_game="poe1")
+    for mod in mods:
+        check_input(mod, scope=GuardrailScope.ITEM_RAW, expected_game="poe1")
+
     try:
         exported = _daemon_call("export", {"target": target, "include_xml": True})
+    except CrossGameHallucinationError:
+        raise
     except (DaemonRequestError, ValueError) as exc:
         raise click.ClickException(_err_text(exc)) from exc
     except (BridgeError, RuntimeError, OSError, zlib.error) as exc:
@@ -304,6 +314,8 @@ def cmd_timeless_search(
             progress=log,
             pob_dir=exported.get("pobDir"),
         )
+    except CrossGameHallucinationError:
+        raise
     except (DaemonRequestError, ValueError) as exc:
         raise click.ClickException(_err_text(exc)) from exc
     except (BridgeError, RuntimeError, OSError, zlib.error) as exc:

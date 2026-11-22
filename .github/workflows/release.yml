@@ -84,6 +84,12 @@ jobs:
           }
           & $exe timeless --help | Out-Null
           if ($LASTEXITCODE -ne 0) { throw "pob.exe timeless --help failed (missing bundled cli_timeless?)" }
+          & $exe diagnose --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "pob.exe diagnose --help failed" }
+          & $exe ground "Divine Blessing with Hatred" --json | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "pob.exe ground failed (missing bundled guardrails/game_data?)" }
+          & $exe data tick coc --cdr 14 --aps 8.28 --json | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "pob.exe data tick failed" }
           & $exe bench list --slot gloves --limit 3 | Out-Null
           if ($LASTEXITCODE -ne 0) { throw "pob.exe bench list failed (missing bundled bench_costs.json?)" }
           & $exe trade convert --text "Rarity: RARE`nDoom Hand`nSlink Gloves`nImplicits: 0`n+42% to Fire Resistance" --to cold --json | Out-Null

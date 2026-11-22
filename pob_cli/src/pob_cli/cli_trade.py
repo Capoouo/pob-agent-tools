@@ -19,8 +19,10 @@ import click
 from . import bench as bench_mod
 from .cli import _emit_json, _emit_text, _output_options, _resolve_output_flags
 from .daemon import BootstrapMissingError, call_daemon
+from .errors import CrossGameHallucinationError
 from .external_data import resolve_current_trade_league
 from .formatters import emit_json, render_table, render_update_warning
+from .guardrails import GuardrailScope, check_input, check_input_item_raw, validate_url
 from .importers import _get_cache_dir
 from .trade_client import (
     CookieRequired,
@@ -58,6 +60,7 @@ from .trade_query import (
     infer_weapon_category_from_base,
     load_trade_stats,
     parse_stat_argument,
+    parse_sum_group_argument,
     plan_stats,
     pob_slot_for_slot,
     resolve_stat,
@@ -202,9 +205,11 @@ def _build_label_from_info(info: dict[str, Any] | None, target: str) -> str:
     return f"slot:{target}"
 
 
-def _read_current_item(slot: str, target: str) -> tuple[Any, str | None, dict[str, Any] | None, str | None]:
+def _read_current_item(slot: str, target: str) -> tuple[Any, str | None, str | None, str | None]:
     try:
         payload = _daemon_call_safe("items", {"target": target, "slot": slot, "raw": True})
+    except CrossGameHallucinationError:
+        raise
     except BootstrapMissingError as exc:
         alert = format_stderr_update_alert(exc.update_status) or str(exc)
         return None, sanitize_text(alert, 300), None, None
@@ -230,6 +235,27 @@ def _price_of(row: dict[str, Any]) -> tuple[float | None, str | None]:
         parsed_amount = None
     currency = price.get("currency")
     return parsed_amount, (str(currency) if currency else None)
+
+
+_PSEUDO_SUM_RE = re.compile(r"^\s*Sum:\s*([+-]?\d+(?:\.\d+)?)", re.IGNORECASE)
+
+
+def _weighted_sum_of(raw_item: dict[str, Any]) -> float | None:
+    """Extract the official PoE1 Trade weighted sum (``pseudoMods: ["Sum: 32"]``) if present."""
+    pseudo_mods = raw_item.get("pseudoMods")
+    if not isinstance(pseudo_mods, list):
+        return None
+    for entry in pseudo_mods:
+        text = entry.get("description") if isinstance(entry, dict) else str(entry)
+        if not text:
+            continue
+        m = _PSEUDO_SUM_RE.match(text)
+        if m:
+            try:
+                return float(m.group(1))
+            except ValueError:
+                continue
+    return None
 
 
 def _conversion_payload(plan: Any) -> dict[str, Any]:
@@ -290,6 +316,10 @@ def cmd_trade_stats(
 ) -> None:
     """Resolve an English or Chinese modifier to an official PoE1 trade stat ID."""
     ctx = click.get_current_context()
+    validate_url(text, expected_game="poe1", cli_subcommand="trade stats")
+    if slot:
+        check_input(slot, scope=GuardrailScope.SLOT, expected_game="poe1")
+    check_input(text, scope=GuardrailScope.STAT_QUERY, expected_game="poe1")
     with TradeClient(proxy=proxy) as client:
         try:
             entries, source = load_trade_stats(
@@ -320,7 +350,9 @@ def cmd_trade_stats(
         }
         _emit_json(payload, compact=compact, out_path=out_path, sanitize=True)
     else:
-        lines: list[str] = []
+        from .guardrails import get_active_warnings
+
+        lines: list[str] = [w.format_markdown() for w in get_active_warnings()]
         if match:
             lines.append(
                 f"Resolved (`{source}`): `{match.text}` -> `{match.id}` (score {match.score:.3f})"
@@ -346,6 +378,15 @@ def cmd_trade_stats(
     "stats",
     multiple=True,
     help='Hard filter (EN or 中文), e.g. "to Cold Resistance=40" or "冰霜抗性=40".',
+)
+@click.option(
+    "--sum",
+    "sum_groups",
+    multiple=True,
+    help=(
+        'Weighted Sum group ("stat1[*w1]|stat2[*w2]|...[>=min]", EN or 中文). '
+        "Groups stackable numeric mods so the trade site displays Sum: XX for one-click sorting."
+    ),
 )
 @click.option("--want", "wants", multiple=True, help="Soft preference (EN or 中文, scoring only).")
 @click.option("--weight", "weights", multiple=True, help="Override scoring weight, e.g. resist=1.2.")
@@ -383,11 +424,17 @@ def cmd_trade_stats(
     is_flag=True,
     help="Do not auto-exclude corrupted/mirrored items when --allow-conversion is set.",
 )
-@click.option("--search-sort", type=click.Choice(["asc", "desc"]), default="asc", show_default=True)
+@click.option(
+    "--search-sort",
+    type=click.Choice(["asc", "desc", "sum"]),
+    default="asc",
+    show_default=True,
+    help="Trade API sort order: price asc/desc, or sum (primary --sum weighted group desc).",
+)
 @click.option(
     "--sort",
     "sort_by",
-    type=click.Choice(["score", "price", "pob"]),
+    type=click.Choice(["score", "price", "pob", "sum"]),
     default="score",
     show_default=True,
 )
@@ -437,6 +484,7 @@ def cmd_trade_stats(
 def cmd_trade_search(
     slot: str | None,
     stats: tuple[str, ...],
+    sum_groups: tuple[str, ...],
     wants: tuple[str, ...],
     weights: tuple[str, ...],
     budget: float | None,
@@ -472,6 +520,22 @@ def cmd_trade_search(
 ) -> None:
     """Search official PoE1 trade listings, compare against equipped gear, and verify in PoB."""
     ctx = click.get_current_context()
+    if slot:
+        check_input(slot, scope=GuardrailScope.SLOT, expected_game="poe1")
+    if category:
+        check_input(category, scope=GuardrailScope.CATEGORY, expected_game="poe1")
+    for s_val in stats:
+        validate_url(s_val, expected_game="poe1", cli_subcommand="trade search")
+        check_input(s_val, scope=GuardrailScope.STAT_QUERY, expected_game="poe1")
+    for sg_val in sum_groups:
+        validate_url(sg_val, expected_game="poe1", cli_subcommand="trade search")
+        sg_body = re.split(r"(?:>=|<=|=)", sg_val, maxsplit=1)[0]
+        for part in sg_body.split("|"):
+            if part.strip():
+                check_input(part.strip(), scope=GuardrailScope.STAT_QUERY, expected_game="poe1")
+    for w_val in wants:
+        validate_url(w_val, expected_game="poe1", cli_subcommand="trade search")
+        check_input(w_val, scope=GuardrailScope.STAT_QUERY, expected_game="poe1")
     if not slot and not category and not no_category:
         _err_utf8("Provide --slot (or --category / --no-category).")
         ctx.exit(1)
@@ -487,6 +551,7 @@ def cmd_trade_search(
         translated_wants = [translate_stat_query(w) for w in wants]
         preferred = preferred_templates(translated_wants)
         requests = [parse_stat_argument(value) for value in stats]
+        weighted_groups = [parse_sum_group_argument(value) for value in sum_groups]
     except ValueError as exc:
         _err_utf8(str(exc))
         ctx.exit(1)
@@ -588,6 +653,7 @@ def cmd_trade_search(
                 allow_conversion=allow_conversion,
                 convert_to=convert_to,
                 rarity=rarity,
+                weighted_groups=weighted_groups,
             )
             query = build_query(
                 plan=plan,
@@ -668,6 +734,7 @@ def cmd_trade_search(
 
         deltas = compare_items(current, item, weights=weight_map, preferred=preferred)
         amount, price_currency = _price_of(row)
+        weighted_sum = _weighted_sum_of(raw_item)
         candidates.append(
             Candidate(
                 raw=row,
@@ -681,10 +748,12 @@ def cmd_trade_search(
                 conversion_warnings=conversion_warnings,
                 url=search_url,
                 listing_id=row.get("id"),
+                weighted_sum=weighted_sum,
             )
         )
 
-    candidates = sort_candidates(candidates, "score")
+    pre_sort = "sum" if (sort_by == "sum" or (search_sort == "sum" and sort_by != "price")) else "score"
+    candidates = sort_candidates(candidates, pre_sort)
 
     if pob_mode != "off" and candidates:
         if not pob_slot:
@@ -702,6 +771,8 @@ def cmd_trade_search(
                     limit=max(0, pob_limit),
                     daemon_call=_daemon_call_safe,
                 )
+            except CrossGameHallucinationError:
+                raise
             except BootstrapMissingError as exc:
                 alert = format_stderr_update_alert(exc.update_status) or str(exc)
                 _err_utf8(alert)
@@ -834,6 +905,7 @@ def cmd_trade_convert(
         _err_utf8("Provide --text or --file.")
         ctx.exit(1)
         return
+    check_input_item_raw(raw_text, expected_game="poe1")
 
     try:
         converted = convert_item_text(raw_text, target, force=force)
@@ -924,7 +996,9 @@ def cmd_bench_list(
     out_path: str | None,
 ) -> None:
     """List crafting bench modifiers available for a slot."""
+    check_input(slot, scope=GuardrailScope.SLOT, expected_game="poe1")
     if text:
+        check_input(text, scope=GuardrailScope.STAT_QUERY, expected_game="poe1")
         results = bench_mod.search(slot, text, limit=limit, affix=affix)
         items = [r.recipe for r in results]
     else:
@@ -984,6 +1058,8 @@ def cmd_bench_suggest(
 ) -> None:
     """Suggest the strongest crafting bench craft for a desired modifier."""
     ctx = click.get_current_context()
+    check_input(slot, scope=GuardrailScope.SLOT, expected_game="poe1")
+    check_input(text, scope=GuardrailScope.STAT_QUERY, expected_game="poe1")
     results = bench_mod.search(slot, text, limit=limit, affix=affix)
     if not results:
         _emit_text(f"No bench modifier for `{slot}` matched `{text}`.", out_path=out_path)

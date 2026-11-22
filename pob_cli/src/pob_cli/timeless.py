@@ -35,7 +35,9 @@ from pathlib import Path
 from typing import Any
 
 from .bridge_client import BridgeWorker
+from .errors import CrossGameHallucinationError
 from .formatters import _parse_numeric_or_none
+from .guardrails import GuardrailScope, check_input, check_poe2_timeless_jewel, validate_engine_root
 from .importers import share_code_to_xml
 from .updater import resolve_engine_root
 
@@ -133,6 +135,17 @@ def _resolve_game_dir(
     """Resolve the PoE1 game data directory from an explicit `pob_dir`, an active worker, or engine lookup."""
     if pob_dir:
         p = Path(pob_dir)
+        validate_engine_root(p, expected_game="poe1", source_label="pob_dir")
+        if p.name.lower() == "poe2" and not (p / "PoE1").is_dir():
+            raise CrossGameHallucinationError(
+                game="poe1",
+                detected_game="poe2",
+                trigger=f"pob_dir={p}",
+                error=f"Timeless engine directory `{p}` points at a PoE2 directory (`PoE2`).",
+                remediation="Point `POB_ROOT` / `pob_dir` to a PoE1 PobTools directory or use `pob2` in `F:/poe2`.",
+                equivalent_command="pob bootstrap",
+                rule_id="ENV_POE2_ENGINE_IN_POB1",
+            )
         if (p / "PoE1").is_dir() or not (p / "Data").is_dir():
             return p / "PoE1"
         return p
@@ -733,6 +746,11 @@ def search(
     calculate a sample, estimate the rest, and calculate the estimated-best until none of the remaining is
     estimated to reach the top `top` (see `narrow_down`).
     """
+    check_poe2_timeless_jewel(jewel_name, expected_game="poe1")
+    check_input(jewel_name, scope=GuardrailScope.DATA_QUERY, expected_game="poe1")
+    for mod in mods:
+        check_input(mod, scope=GuardrailScope.ITEM_RAW, expected_game="poe1")
+
     if stat not in STAT_KEYS:
         raise ValueError(f"Unknown stat {stat!r}. Known: {', '.join(STAT_KEYS)}")
     if socket <= 0:
@@ -748,6 +766,8 @@ def search(
     else:
         try:
             pre_game_dir = _resolve_game_dir(None, runtime_dir=runtime_dir)
+        except CrossGameHallucinationError:
+            raise
         except Exception:
             pre_game_dir = None
 

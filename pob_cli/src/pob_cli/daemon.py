@@ -25,7 +25,7 @@ from .bridge_client import (
     BridgeError,
     BridgeWorker,
 )
-from .errors import DaemonRequestError
+from .errors import CrossGameHallucinationError, DaemonRequestError, LegacyPatchTrapError
 from .updater import (
     OK_STATES,
     STATE_BOOTSTRAP_MISSING,
@@ -38,6 +38,7 @@ from .updater import (
     resolve_engine_root,
 )
 
+GAME_ID = "poe1"
 DAEMON_STATE_FILE = RUNTIME_DIR / "daemon.json"
 DAEMON_LOCK_FILE = RUNTIME_DIR / "daemon.start.lock"
 REF_IDLE_TIMEOUT_SEC = 300.0        # 5 minutes (for all non-main slots)
@@ -669,7 +670,12 @@ class DaemonManager:
             state_file = _daemon_state_file(self.runtime_dir)
             try:
                 if state_file.exists():
-                    state_file.unlink()
+                    existing = read_daemon_state(self.runtime_dir)
+                    if existing is None or (
+                        existing.get("game") in (None, GAME_ID)
+                        and existing.get("pid") in (None, os.getpid())
+                    ):
+                        state_file.unlink()
             except Exception:
                 pass
             if self.server is not None:
@@ -801,6 +807,7 @@ class DaemonManager:
                     "hasLoadedBuild": False,
                 }
                 res: dict[str, Any] = {
+                    "game": GAME_ID,
                     "pid": os.getpid(),
                     "uptimeSec": round(time.time() - self.started_at, 1),
                     "idleSec": round(time.time() - self.last_active_ts, 1),
@@ -812,9 +819,12 @@ class DaemonManager:
                 }
                 return self._attach_warning_if_degraded(res)
 
-        if action in ("compare", "borrow"):
+        if action in ("compare", "borrow") or (
+            action == "diagnose" and (params.get("compare_source") or params.get("compare_xml_code"))
+        ):
             main_slot = normalize_slot_name(params.get("main_target") or params.get("target") or "main")
-            ref_slot = normalize_slot_name(params.get("ref_target") or "ref")
+            default_ref = "ref" if main_slot == "main" else f"{main_slot}_ref"
+            ref_slot = normalize_slot_name(params.get("ref_target") or default_ref)
             with self._reader_barrier():
                 lock_order = sorted({main_slot, ref_slot})
                 locks = [self._get_slot_lock(s) for s in lock_order]
@@ -825,12 +835,70 @@ class DaemonManager:
                     rw = self._get_worker_in_barrier(ref_slot)
                     return self._dispatch_dual_slot(action, params, mw, rw)
 
+        _STATE_META_ACTIONS = frozenset(
+            {
+                "load",
+                "summary",
+                "audit",
+                "diagnose",
+                "undo",
+                "redo",
+                "new_build",
+                "switch_main",
+                "item_try",
+                "item_edit",
+                "item_unequip",
+                "item_db",
+                "item_flask",
+                "item_anoint",
+                "skill_set",
+                "skill_add",
+                "skill_rm",
+                "skill_new_group",
+                "skill_replace_group",
+                "tree_change",
+                "tree_set_class",
+                "config_set",
+                "batch",
+                "sweep",
+                "matrix",
+            }
+        )
         target = normalize_slot_name(params.get("target"))
         with self._reader_barrier():
             slot_lock = self._get_slot_lock(target)
             with slot_lock:
                 worker = self._get_worker_in_barrier(target)
-                return self._dispatch_slot(action, params, worker)
+                res_slot = self._dispatch_slot(action, params, worker)
+                if action in ("load", "undo", "redo"):
+                    self._bump_worker_rev(worker)
+                elif isinstance(res_slot, dict) and res_slot.get("applied") is True:
+                    self._bump_worker_rev(worker)
+                if action in _STATE_META_ACTIONS:
+                    return self._attach_state_meta(res_slot, worker)
+                return res_slot
+
+    @staticmethod
+    def _bump_worker_rev(w: BridgeWorker) -> int | None:
+        bump = getattr(w, "bump_rev", None)
+        if callable(bump):
+            new_rev = int(bump())
+            save = getattr(w, "save_slot_state", None)
+            if callable(save):
+                save()
+            return new_rev
+        return None
+
+    @staticmethod
+    def _attach_state_meta(res: Any, w: BridgeWorker) -> Any:
+        if isinstance(res, dict):
+            raw_rev = getattr(w, "rev", None)
+            if isinstance(raw_rev, int) and not isinstance(raw_rev, bool):
+                res.setdefault("rev", raw_rev)
+            slot_nm = getattr(w, "slot_name", None)
+            if isinstance(slot_nm, str) and slot_nm:
+                res.setdefault("targetSlot", slot_nm)
+        return res
 
     def _dispatch_dual_slot(
         self,
@@ -842,12 +910,15 @@ class DaemonManager:
         from .comparator import borrow_from_ref, compare_builds
 
         if action == "compare":
-            return compare_builds(
+            cmp_res = compare_builds(
                 mw,
                 rw,
                 ref_source=params.get("ref_source"),
                 ref_xml_code=params.get("ref_xml_code"),
             )
+            if params.get("ref_source") or params.get("ref_xml_code"):
+                self._bump_worker_rev(rw)
+            return self._attach_state_meta(cmp_res, mw)
 
         if action == "borrow":
             if not rw.last_good_code:
@@ -856,13 +927,43 @@ class DaemonManager:
                     f"No reference build loaded in '{ref_slot}' slot. "
                     f"Run `pob load <source> --target {ref_slot}` or `pob compare <source>` first."
                 )
-            return borrow_from_ref(
+            b_res = borrow_from_ref(
                 mw,
                 rw,
                 item_slots=params.get("item_slots"),
                 skill_group=params.get("skill_group"),
                 apply=bool(params.get("apply", False)),
             )
+            if isinstance(b_res, dict) and b_res.get("applied") is True:
+                self._bump_worker_rev(mw)
+            return self._attach_state_meta(b_res, mw)
+
+        if action == "diagnose":
+            from .analyzer import diagnose_compare_builds
+
+            raw_keep = params.get("keep")
+            keep_val = [raw_keep] if isinstance(raw_keep, str) else (list(raw_keep) if raw_keep is not None else None)
+            top_val = int(params["top"]) if params.get("top") is not None else 5
+            main_slot_name = str(params.get("target") or getattr(mw, "slot_name", "main") or "main")
+            default_ref_name = "ref" if main_slot_name == "main" else f"{main_slot_name}_ref"
+            ref_slot_name = str(params.get("ref_target") or getattr(rw, "slot_name", default_ref_name) or default_ref_name)
+            diag_cmp = diagnose_compare_builds(
+                mw,
+                rw,
+                source=params.get("source"),
+                xml_code=params.get("xml_code"),
+                compare_source=params.get("compare_source"),
+                compare_xml_code=params.get("compare_xml_code"),
+                keep=keep_val,
+                top=top_val,
+                no_rank=bool(params.get("no_rank", params.get("noRank", True))),
+                ask=params.get("ask"),
+                pob_dir=self.pob_dir,
+                runtime_dir=self.runtime_dir,
+                target=main_slot_name,
+                ref_target=ref_slot_name,
+            )
+            return self._attach_warning_if_degraded(diag_cmp)
 
         raise ValueError(f"Unknown dual-slot daemon action '{action}'.")
 
@@ -882,6 +983,8 @@ class DaemonManager:
                     source=params.get("source"),
                     xml_code=params.get("xml_code"),
                 )
+            except CrossGameHallucinationError:
+                raise
             except Exception as exc:
                 warn = self._current_update_warning()
                 if warn:
@@ -942,6 +1045,30 @@ class DaemonManager:
                 keep=keep_val,
                 attribution=bool(params.get("attribution", True)),
             )
+
+        if action == "diagnose":
+            from .analyzer import diagnose_build
+            from .importers import load_build_into_worker
+
+            src = params.get("source")
+            xml_code = params.get("xml_code")
+            if src or xml_code:
+                load_build_into_worker(w, source=src, xml_code=xml_code)
+                self._bump_worker_rev(w)
+            raw_keep = params.get("keep")
+            keep_val = [raw_keep] if isinstance(raw_keep, str) else (list(raw_keep) if raw_keep is not None else None)
+            top_val = int(params["top"]) if params.get("top") is not None else 5
+            diag_res = diagnose_build(
+                w,
+                keep=keep_val,
+                top=top_val,
+                no_rank=bool(params.get("no_rank", params.get("noRank", False))),
+                ask=params.get("ask"),
+                pob_dir=self.pob_dir,
+                runtime_dir=self.runtime_dir,
+                target=str(params.get("target") or getattr(w, "slot_name", "main") or "main"),
+            )
+            return self._attach_warning_if_degraded(diag_res)
 
         if action == "items":
             from .analyzer import inspect_items
@@ -1336,6 +1463,19 @@ def make_handler(manager: DaemonManager) -> type["BaseHTTPRequestHandler"]:
 
         def do_POST(self) -> None:
             token = self.headers.get("X-PoB-Token", "")
+            foreign_token = self.headers.get("X-PoB2-Token", "")
+            if foreign_token and not token:
+                exc = CrossGameHallucinationError(
+                    game=GAME_ID,
+                    detected_game="poe2",
+                    trigger="Header X-PoB2-Token",
+                    error="Received PoE2 auth header `X-PoB2-Token` on a PoE1 (`pob`) daemon.",
+                    remediation="Use `pob2` with its own `POB2_RUNTIME_DIR` for PoE2 requests, or send `X-PoB-Token` for PoE1.",
+                    equivalent_command="pob2 status",
+                    rule_id="DAEMON_CROSS_GAME_TOKEN_HEADER",
+                )
+                self._send_json(400, {**exc.to_dict(), "type": "CrossGameHallucinationError"})
+                return
             if not secrets.compare_digest(token, manager.token):
                 self._send_json(403, {"ok": False, "error": "Forbidden: invalid or missing X-PoB-Token"})
                 return
@@ -1370,6 +1510,22 @@ def make_handler(manager: DaemonManager) -> type["BaseHTTPRequestHandler"]:
                     raise ValueError("RPC 'params' must be a JSON object.")
                 result = manager.dispatch(action, params)
                 self._send_json(200, {"ok": True, "result": result})
+            except CrossGameHallucinationError as exc:
+                self._send_json(
+                    400,
+                    {
+                        **exc.to_dict(),
+                        "type": "CrossGameHallucinationError",
+                    },
+                )
+            except LegacyPatchTrapError as exc:
+                self._send_json(
+                    400,
+                    {
+                        **exc.to_dict(),
+                        "type": "LegacyPatchTrapError",
+                    },
+                )
             except (DaemonRequestError, ValueError) as exc:
                 self._send_json(
                     400,
@@ -1422,6 +1578,9 @@ def _serve_daemon(
     rt_dir.mkdir(parents=True, exist_ok=True)
     boot_err_file = _daemon_boot_error_file(rt_dir)
     state_file = _daemon_state_file(rt_dir)
+    existing_state = read_daemon_state(rt_dir)
+    if existing_state is not None:
+        _guard_foreign_daemon_state(existing_state, state_file, rt_dir)
 
     try:
         if boot_err_file.exists():
@@ -1469,6 +1628,7 @@ def _serve_daemon(
     actual_port = server.server_address[1]
 
     state_payload = {
+        "game": GAME_ID,
         "pid": os.getpid(),
         "port": actual_port,
         "token": token,
@@ -1627,6 +1787,27 @@ def _parse_daemon_endpoint(state: dict[str, Any]) -> tuple[int, str]:
     return port, str(raw_token)
 
 
+def _guard_foreign_daemon_state(state: dict[str, Any], state_file: Path, rt_dir: Path) -> None:
+    """Non-destructively block when `daemon.json` explicitly belongs to `poe2`.
+
+    Legacy PoE1 `daemon.json` files (and existing PoE1 test fixtures) may omit `"game"`;
+    treat missing `"game"` (`None`) as `"poe1"` so compatibility stays 100% intact.
+    """
+    recorded_game = state.get("game")
+    if recorded_game is None:
+        return
+    if str(recorded_game).strip().lower() == "poe2":
+        raise CrossGameHallucinationError(
+            game=GAME_ID,
+            detected_game="poe2",
+            trigger=f"{state_file} (game={recorded_game!r})",
+            error=f"Runtime directory `{rt_dir}` belongs to a `poe2` daemon, not `{GAME_ID}`.",
+            remediation="Use separate runtime directories (`POB_RUNTIME_DIR` vs `POB2_RUNTIME_DIR`).",
+            equivalent_command="pob2 status",
+            rule_id="DAEMON_STATE_GAME_MISMATCH",
+        )
+
+
 def _probe_daemon(state: dict[str, Any], *, timeout: float = 5.0) -> dict[str, Any] | None:
     """Return daemon status result if alive and reachable, else None."""
     pid = state.get("pid")
@@ -1640,8 +1821,21 @@ def _probe_daemon(state: dict[str, Any], *, timeout: float = 5.0) -> dict[str, A
             {"action": "status", "params": {"skip_periodic_check": True}},
             timeout=timeout,
         )
+        if status_code == 400 and data.get("errorKind") == "cross_game_hallucination":
+            raise CrossGameHallucinationError.from_dict(data, default_game=GAME_ID)
         if status_code == 200 and data.get("ok"):
-            return data.get("result")
+            res = data.get("result")
+            if isinstance(res, dict) and str(res.get("game") or "").strip().lower() == "poe2":
+                raise CrossGameHallucinationError(
+                    game=GAME_ID,
+                    detected_game="poe2",
+                    trigger=f"status.game={res.get('game')!r}",
+                    error="Connected daemon reports `game='poe2'`, not `poe1`.",
+                    remediation="Use separate runtime directories (`POB_RUNTIME_DIR` vs `POB2_RUNTIME_DIR`).",
+                    equivalent_command="pob2 status",
+                    rule_id="DAEMON_STATUS_GAME_MISMATCH",
+                )
+            return res
     except (OSError, http.client.HTTPException, TimeoutError, KeyError, TypeError, ValueError):
         return None
     return None
@@ -1654,6 +1848,8 @@ def stop_daemon(runtime_dir: Path | None = None, *, timeout: float = 10.0) -> di
     state = read_daemon_state(rt_dir)
     if state is None:
         return {"stopped": False, "alreadyStopped": True}
+
+    _guard_foreign_daemon_state(state, state_file, rt_dir)
 
     pid = state.get("pid")
     if isinstance(pid, int) and not _is_pid_alive(pid):
@@ -1671,6 +1867,8 @@ def stop_daemon(runtime_dir: Path | None = None, *, timeout: float = 10.0) -> di
             {"action": "stop", "params": {}},
             timeout=timeout,
         )
+        if status_code == 400 and data.get("errorKind") == "cross_game_hallucination":
+            raise CrossGameHallucinationError.from_dict(data, default_game=GAME_ID)
         if status_code in (403, 404):
             try:
                 state_file.unlink()
@@ -1827,6 +2025,10 @@ def _ensure_daemon(
 def _rpc_result(data: dict[str, Any]) -> dict[str, Any]:
     """Preserve the daemon's request/failure classification in the CLI process."""
     if not data.get("ok"):
+        if data.get("errorKind") == "cross_game_hallucination":
+            raise CrossGameHallucinationError.from_dict(data, default_game=GAME_ID)
+        if data.get("errorKind") == "legacy_patch_trap":
+            raise LegacyPatchTrapError.from_dict(data)
         message = data.get("error") or "Daemon error"
         if data.get("errorKind") == "request":
             raise DaemonRequestError(message)
@@ -1851,6 +2053,7 @@ def call_daemon(
 
     state = read_daemon_state(rt_dir)
     if state is not None:
+        _guard_foreign_daemon_state(state, state_file, rt_dir)
         pid = state.get("pid")
         if isinstance(pid, int) and not _is_pid_alive(pid):
             # Fast <1ms stale PID detection: unlink immediately without paying 2s loopback TCP timeout

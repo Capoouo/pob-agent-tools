@@ -635,9 +635,16 @@ def query_price(
     Supports `--variant` substring filtering, `--detailed` (or auto-upgraded)
     concurrent stash overview queries, explicit proxy, and stale-cache fallback.
     """
-    q = query.strip().lower()
+    from .guardrails import GuardrailScope, check_input, validate_url
+
+    q_raw = query.strip()
+    q = q_raw.lower()
     if not q:
         raise ValueError("Price query cannot be empty.")
+    validate_url(q_raw, expected_game="poe1", cli_subcommand="price")
+    check_input(q_raw, scope=GuardrailScope.DATA_QUERY, expected_game="poe1")
+    if category and category.strip().lower() != "all":
+        check_input(category, scope=GuardrailScope.CATEGORY, expected_game="poe1")
 
     is_detailed = bool(detailed or _should_auto_detail(query, variant))
 
@@ -700,9 +707,16 @@ def query_price_multi(
     max_workers: int = 6,
 ) -> dict[str, Any]:
     """Search multiple poe.ninja economy queries sharing ONE dense/stash fetch batch."""
+    from .guardrails import GuardrailScope, check_input, validate_url
+
     clean_queries = [q.strip() for q in queries if isinstance(q, str) and q.strip()]
     if not clean_queries:
         raise ValueError("Price queries cannot be empty.")
+    if category and category.strip().lower() != "all":
+        check_input(category, scope=GuardrailScope.CATEGORY, expected_game="poe1")
+    for q_item in clean_queries:
+        validate_url(q_item, expected_game="poe1", cli_subcommand="price")
+        check_input(q_item, scope=GuardrailScope.DATA_QUERY, expected_game="poe1")
 
     resolved_league = league or resolve_current_trade_league(proxy=proxy)
     _LAST_STALE.value = False
@@ -955,9 +969,13 @@ def query_wiki(
     client: httpx.Client | None = None,
 ) -> dict[str, Any]:
     """Query poewiki.net MediaWiki API for mechanics/uniques/keystones with 24h local disk cache."""
+    from .guardrails import GuardrailScope, check_input, validate_url
+
     q = topic.strip()
     if not q:
         raise ValueError("Wiki topic cannot be empty.")
+    validate_url(q, expected_game="poe1", cli_subcommand="wiki")
+    check_input(q, scope=GuardrailScope.DATA_QUERY, expected_game="poe1")
 
     slug_hash = hashlib.sha1(q.lower().encode("utf-8")).hexdigest()[:12]
     cache_file = _shared_cache_dir() / f"poewiki_{slug_hash}.json"
@@ -1058,9 +1076,14 @@ def query_wiki_multi(
     max_workers: int = 4,
 ) -> dict[str, Any]:
     """Query multiple poewiki.net topics concurrently using ONE shared httpx.Client."""
+    from .guardrails import GuardrailScope, check_input, validate_url
+
     clean_queries = [q.strip() for q in queries if isinstance(q, str) and q.strip()]
     if not clean_queries:
         raise ValueError("Wiki queries cannot be empty.")
+    for q_item in clean_queries:
+        validate_url(q_item, expected_game="poe1", cli_subcommand="wiki")
+        check_input(q_item, scope=GuardrailScope.DATA_QUERY, expected_game="poe1")
 
     now = time.time()
     cached_hits: dict[str, dict[str, Any]] = {}

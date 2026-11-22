@@ -368,6 +368,9 @@ def resolve_engine_root(
     env_root = os.environ.get("POB_ROOT", "").strip()
     if env_root:
         p = Path(env_root)
+        from .guardrails import validate_engine_root
+
+        validate_engine_root(p, expected_game="poe1", source_label="POB_ROOT")
         if is_valid_engine_dir(p):
             return p
 
@@ -1816,6 +1819,9 @@ def bootstrap_engine(
     # 1. Explicit offline directory import
     if from_dir is not None:
         src = Path(from_dir)
+        from .guardrails import validate_engine_root
+
+        validate_engine_root(src, expected_game="poe1", source_label="--from-dir")
         if not is_valid_engine_dir(src):
             req_desc = "pob-zh.exe and PoE1/" if is_windows() else "PoE1/, Data/bridge/bridge.lua, and LuaJIT"
             raise UpdateError(f"Offline source directory is invalid (requires {req_desc}): {src}")
@@ -2052,8 +2058,15 @@ def check_and_apply_updates(
 
     if engine_dir is not None:
         active_dir = Path(engine_dir)
+        from .guardrails import validate_engine_root
+
+        validate_engine_root(active_dir, expected_game="poe1", source_label="engine_dir")
     else:
         env_root = os.environ.get("POB_ROOT", "").strip()
+        if env_root:
+            from .guardrails import validate_engine_root
+
+            validate_engine_root(Path(env_root), expected_game="poe1", source_label="POB_ROOT")
         if env_root and is_valid_engine_dir(Path(env_root)):
             active_dir = Path(env_root)
             explicit_engine = True

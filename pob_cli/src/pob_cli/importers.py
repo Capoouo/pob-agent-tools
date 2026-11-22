@@ -347,6 +347,9 @@ def _resolve_poe_ninja_overviews(
 
 def fetch_poe_ninja_character_code(url: str) -> str:
     """Resolve a poe.ninja character URL into a raw PoB share code."""
+    from .guardrails import validate_url
+
+    validate_url(url, expected_game="poe1", cli_subcommand="load")
     m = POE_NINJA_CHAR_RE.match(url.strip())
     if not m:
         raise ValueError(f"Not a valid poe.ninja character URL: {url}")
@@ -420,9 +423,14 @@ def fetch_poe_ninja_character_code(url: str) -> str:
 
 def fetch_share_url_code_fallback(url: str) -> str:
     """Fallback Python httpx fetcher for share site URLs when Curl/Lua fails."""
+    from .guardrails import validate_build_xml, validate_url
+
     clean_url = url.strip()
+    validate_url(clean_url, expected_game="poe1", cli_subcommand="load")
     if POE_NINJA_CHAR_RE.match(clean_url):
-        return fetch_poe_ninja_character_code(clean_url)
+        code = fetch_poe_ninja_character_code(clean_url)
+        validate_build_xml(share_code_to_xml(code), expected_game="poe1", source_hint=clean_url)
+        return code
 
     with _make_httpx_client(timeout=DEFAULT_HTTP_TIMEOUT) as client:
         for pattern, template in SHARE_RAW_PATTERNS:
@@ -432,7 +440,7 @@ def fetch_share_url_code_fallback(url: str) -> str:
                 resp = client.get(raw_url)
                 resp.raise_for_status()
                 code = resp.text.strip()
-                share_code_to_xml(code)
+                validate_build_xml(share_code_to_xml(code), expected_game="poe1", source_hint=clean_url)
                 return code
 
         m_maxroll = MAXROLL_POB_RE.match(clean_url)
@@ -446,14 +454,14 @@ def fetch_share_url_code_fallback(url: str) -> str:
             payload = resp.json()
             code = payload.get("build") or payload.get("code") or payload.get("data")
             if isinstance(code, str) and code.strip():
-                share_code_to_xml(code.strip())
+                validate_build_xml(share_code_to_xml(code.strip()), expected_game="poe1", source_hint=clean_url)
                 return code.strip()
 
         # Generic raw GET attempt
         resp = client.get(clean_url)
         resp.raise_for_status()
         text = resp.text.strip()
-        share_code_to_xml(text)
+        validate_build_xml(share_code_to_xml(text), expected_game="poe1", source_hint=clean_url)
         return text
 
 
@@ -468,49 +476,83 @@ def load_build_into_worker(
     Follows R11: local file I/O happens on the CLI side (passed as `xml_code`), never on the daemon.
     Always snapshots `export_code` into `worker.last_good_code` and clears undo/redo history on load.
     """
+    from .guardrails import validate_build_xml, validate_url
+
     with worker.lock:
         import_method = "code"
         if xml_code:
             clean_xml_code = xml_code.lstrip("\ufeff").strip()
             if clean_xml_code.startswith("<"):
+                validate_build_xml(clean_xml_code, expected_game="poe1")
                 clean_xml_code = xml_to_share_code(clean_xml_code)
+            else:
+                try:
+                    decoded_xml = share_code_to_xml(clean_xml_code)
+                except ValueError:
+                    decoded_xml = ""
+                if decoded_xml:
+                    validate_build_xml(decoded_xml, expected_game="poe1")
             res = worker.call("import_code", {"code": clean_xml_code, "mode": "replace"})
             import_method = "xml_file"
         elif source:
             src = source.lstrip("\ufeff").strip()
             if src.startswith("<"):
+                validate_build_xml(src, expected_game="poe1")
                 res = worker.call("import_code", {"code": xml_to_share_code(src), "mode": "replace"})
                 import_method = "xml_file"
-            elif POE_NINJA_CHAR_RE.match(src):
-                code = fetch_poe_ninja_character_code(src)
-                res = worker.call("import_code", {"code": code, "mode": "replace"})
-                import_method = "poe_ninja_character"
-            elif src.startswith(("http://", "https://")):
-                try:
-                    url_res = worker.call("import_from_url", {"url": src})
-                    code = (url_res.get("code") or "").strip()
-                    if not code:
-                        raise BridgeError("import_from_url returned empty code")
-                    res = worker.call("import_code", {"code": code, "mode": "replace"})
-                    import_method = "url_native"
-                except BridgeError:
-                    code = fetch_share_url_code_fallback(src)
-                    res = worker.call("import_code", {"code": code, "mode": "replace"})
-                    import_method = "url_fallback"
             else:
-                # Raw Base64 share code: pre-validate before import_code so malformed share
-                # codes raise ValueError (errorKind="request", exit 1) while engine crashes
-                # stay BridgeError (errorKind="daemon", exit 5).
-                share_code_to_xml(src)
-                res = worker.call("import_code", {"code": src, "mode": "replace"})
-                import_method = "share_code"
+                validate_url(src, expected_game="poe1", cli_subcommand="load")
+                if POE_NINJA_CHAR_RE.match(src):
+                    code = fetch_poe_ninja_character_code(src)
+                    validate_build_xml(share_code_to_xml(code), expected_game="poe1", source_hint=src)
+                    res = worker.call("import_code", {"code": code, "mode": "replace"})
+                    import_method = "poe_ninja_character"
+                elif src.startswith(("http://", "https://")):
+                    try:
+                        url_res = worker.call("import_from_url", {"url": src})
+                        code = (url_res.get("code") or "").strip()
+                        if not code:
+                            raise BridgeError("import_from_url returned empty code")
+                        try:
+                            decoded_xml = share_code_to_xml(code)
+                        except ValueError:
+                            decoded_xml = ""
+                        if decoded_xml:
+                            validate_build_xml(decoded_xml, expected_game="poe1", source_hint=src)
+                        res = worker.call("import_code", {"code": code, "mode": "replace"})
+                        import_method = "url_native"
+                    except BridgeError:
+                        code = fetch_share_url_code_fallback(src)
+                        res = worker.call("import_code", {"code": code, "mode": "replace"})
+                        import_method = "url_fallback"
+                else:
+                    # Raw Base64 share code: pre-validate before import_code so malformed share
+                    # codes raise ValueError (errorKind="request", exit 1) while engine crashes
+                    # stay BridgeError (errorKind="daemon", exit 5).
+                    decoded_xml = share_code_to_xml(src)
+                    validate_build_xml(decoded_xml, expected_game="poe1")
+                    res = worker.call("import_code", {"code": src, "mode": "replace"})
+                    import_method = "share_code"
         else:
             raise ValueError("Either 'source' or 'xml_code' must be provided.")
 
         # Snapshot current build state as last_good_code and reset undo/redo
         exp = worker.call("export_code", {})
         worker.last_good_code = exp.get("code")
-        worker.source_label = source or "xml_file"
+        if source:
+            src_s = source.strip()
+            if (
+                len(src_s) > 120
+                and not src_s.startswith(("http://", "https://"))
+                and not src_s.startswith("<")
+            ):
+                worker.source_label = f"share_code({len(src_s)} chars)"
+            elif len(src_s) > 200:
+                worker.source_label = f"{src_s[:120]}... ({len(src_s)} chars)"
+            else:
+                worker.source_label = src_s
+        else:
+            worker.source_label = "xml_file"
         worker.undo_stack.clear()
         worker.redo_stack.clear()
         worker.save_slot_state()

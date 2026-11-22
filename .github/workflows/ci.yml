@@ -65,6 +65,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "pob.exe _daemon --help failed" }
           & $exe timeless --help | Out-Null
           if ($LASTEXITCODE -ne 0) { throw "pob.exe timeless --help failed (missing bundled cli_timeless?)" }
+          & $exe diagnose --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "pob.exe diagnose --help failed" }
+          & $exe ground "Divine Blessing with Hatred" --json | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "pob.exe ground failed (missing bundled guardrails/game_data?)" }
+          & $exe data tick coc --cdr 14 --aps 8.28 --json | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "pob.exe data tick failed" }
           & $exe bench list --slot gloves --limit 3 | Out-Null
           if ($LASTEXITCODE -ne 0) { throw "pob.exe bench list failed (missing bundled bench_costs.json?)" }
           & $exe bench suggest --slot gloves --stat "to Cold Resistance" --json | Out-Null
@@ -171,6 +177,9 @@ jobs:
           pob status --json
           pob load "@$RUNNER_TEMP/test_build.xml" --json
           pob summary --json
+          pob diagnose --no-rank -q "Hatred" --json
+          pob ground "Divine Blessing" --json
+          pob data tick coc --cdr 14 --json
           pob audit --json
           pob audit --keep conditionStationary --no-attribution --json
           pob skills --json

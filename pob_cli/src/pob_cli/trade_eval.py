@@ -233,6 +233,7 @@ class Candidate:
     conversion_warnings: list[str] = field(default_factory=list)
     url: str = ""
     listing_id: str | None = None
+    weighted_sum: float | None = None
     pob: PobEval | None = None
     pob_error: str | None = None
 
@@ -716,7 +717,18 @@ def eval_trade_items(
 
 
 def sort_candidates(candidates: list[Candidate], sort: str = "score") -> list[Candidate]:
-    """Sort candidates by ``score``, ``price``, or ``pob`` (always NaN-safe)."""
+    """Sort candidates by ``score``, ``price``, ``sum``, or ``pob`` (always NaN-safe)."""
+    if sort == "sum":
+        return sorted(
+            candidates,
+            key=lambda c: (
+                c.weighted_sum is None or not math.isfinite(c.weighted_sum),
+                -_finite_sort_key(c.weighted_sum, 0.0),
+                c.price_amount is None or not math.isfinite(c.price_amount),
+                _finite_sort_key(c.price_amount, 0.0),
+                -_finite_sort_key(c.score, 0.0),
+            ),
+        )
     if sort == "price":
         return sorted(
             candidates,
@@ -826,10 +838,17 @@ def format_report(
         return "\n".join(lines)
 
     has_pob = any(candidate.pob is not None for candidate in candidates)
+    has_sum = any(
+        candidate.weighted_sum is not None and math.isfinite(candidate.weighted_sum)
+        for candidate in candidates
+    )
+    headers = ["#", "Item", "Price"]
+    if has_sum:
+        headers.append("Sum")
+    headers.append("Score")
     if has_pob:
-        headers = ["#", "Item", "Price", "Score", "PoB DPS", "PoB EHP", "Gains", "Losses", "Conversion"]
-    else:
-        headers = ["#", "Item", "Price", "Score", "Gains", "Losses", "Conversion"]
+        headers.extend(["PoB DPS", "PoB EHP"])
+    headers.extend(["Gains", "Losses", "Conversion"])
 
     rows: list[list[Any]] = []
     for index, candidate in enumerate(candidates, start=1):
@@ -840,34 +859,25 @@ def format_report(
             or "-"
         )
         score_str = f"{_finite_float(candidate.score):g}"
+        row_cells: list[Any] = [
+            index,
+            _escape(candidate.display_name),
+            _escape(candidate.price_text),
+        ]
+        if has_sum:
+            sum_str = (
+                f"{candidate.weighted_sum:g}"
+                if (candidate.weighted_sum is not None and math.isfinite(candidate.weighted_sum))
+                else "-"
+            )
+            row_cells.append(sum_str)
+        row_cells.append(score_str)
         if has_pob:
             dps = candidate.pob.dps_pct_str if candidate.pob is not None else "-"
             ehp = candidate.pob.ehp_pct_str if candidate.pob is not None else "-"
-            rows.append(
-                [
-                    index,
-                    _escape(candidate.display_name),
-                    _escape(candidate.price_text),
-                    score_str,
-                    _escape(dps),
-                    _escape(ehp),
-                    gains,
-                    losses,
-                    _escape(conversion),
-                ]
-            )
-        else:
-            rows.append(
-                [
-                    index,
-                    _escape(candidate.display_name),
-                    _escape(candidate.price_text),
-                    score_str,
-                    gains,
-                    losses,
-                    _escape(conversion),
-                ]
-            )
+            row_cells.extend([_escape(dps), _escape(ehp)])
+        row_cells.extend([gains, losses, _escape(conversion)])
+        rows.append(row_cells)
 
     lines.append(render_table(headers, rows))
     lines.append("")
@@ -999,6 +1009,7 @@ def report_json(candidates: list[Candidate]) -> list[dict[str, Any]]:
                 "amount": _json_safe_optional_float(candidate.price_amount),
                 "currency": candidate.price_currency,
             },
+            "weighted_sum": _json_safe_optional_float(candidate.weighted_sum),
             "score": _finite_float(candidate.score),
             "url": candidate.url,
             "conversions": [conversion.as_dict() for conversion in candidate.conversions],

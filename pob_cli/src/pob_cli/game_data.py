@@ -24,7 +24,7 @@ from typing import Any
 from . import updater as _updater
 from .updater import detect_source_checkout_root, get_runtime_dir
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 _INDEX_BUILD_LOCK = threading.RLock()
 
 _FOLD_CHAR_MAP = str.maketrans(
@@ -332,6 +332,56 @@ SLOT_ALIASES: dict[str, tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]
         ("One Handed Sword", "Two Handed Sword", "One Handed Axe", "Two Handed Axe", "One Handed Mace", "Two Handed Mace", "Dagger", "Claw", "Wand", "Bow", "Staff", "Sceptre", "Thrusting One Handed Sword"),
     ),
     "weapon_2": (
+        ("weapon", "one_hand_weapon", "shield", "quiver", "sword", "axe", "mace", "dagger", "claw", "wand", "sceptre"),
+        ("weapon", "shield", "quiver", "default"),
+        ("One Handed Sword", "One Handed Axe", "One Handed Mace", "Dagger", "Claw", "Wand", "Sceptre", "Thrusting One Handed Sword", "Shield", "Quiver"),
+    ),
+    # Tolerant EN/ZH aliases (P0-2)
+    "offhand": (
+        ("weapon", "one_hand_weapon", "shield", "quiver", "sword", "axe", "mace", "dagger", "claw", "wand", "sceptre"),
+        ("weapon", "shield", "quiver", "default"),
+        ("One Handed Sword", "One Handed Axe", "One Handed Mace", "Dagger", "Claw", "Wand", "Sceptre", "Thrusting One Handed Sword", "Shield", "Quiver"),
+    ),
+    "mainhand": (
+        ("weapon", "one_hand_weapon", "two_hand_weapon", "sword", "axe", "mace", "dagger", "claw", "wand", "bow", "staff", "sceptre"),
+        ("weapon", "default"),
+        ("One Handed Sword", "Two Handed Sword", "One Handed Axe", "Two Handed Axe", "One Handed Mace", "Two Handed Mace", "Dagger", "Claw", "Wand", "Bow", "Staff", "Sceptre", "Thrusting One Handed Sword"),
+    ),
+    "ring1": (("ring",), ("ring", "default"), ("Ring",)),
+    "ring2": (("ring",), ("ring", "default"), ("Ring",)),
+    "ring3": (("ring",), ("ring", "default"), ("Ring",)),
+    "weapon1": (
+        ("weapon", "one_hand_weapon", "two_hand_weapon", "sword", "axe", "mace", "dagger", "claw", "wand", "bow", "staff", "sceptre"),
+        ("weapon", "default"),
+        ("One Handed Sword", "Two Handed Sword", "One Handed Axe", "Two Handed Axe", "One Handed Mace", "Two Handed Mace", "Dagger", "Claw", "Wand", "Bow", "Staff", "Sceptre", "Thrusting One Handed Sword"),
+    ),
+    "weapon2": (
+        ("weapon", "one_hand_weapon", "shield", "quiver", "sword", "axe", "mace", "dagger", "claw", "wand", "sceptre"),
+        ("weapon", "shield", "quiver", "default"),
+        ("One Handed Sword", "One Handed Axe", "One Handed Mace", "Dagger", "Claw", "Wand", "Sceptre", "Thrusting One Handed Sword", "Shield", "Quiver"),
+    ),
+    "衣服": (("body_armour",), ("body_armour", "armour", "default"), ("Body Armour",)),
+    "胸甲": (("body_armour",), ("body_armour", "armour", "default"), ("Body Armour",)),
+    "头盔": (("helmet",), ("helmet", "armour", "default"), ("Helmet",)),
+    "手套": (("gloves",), ("gloves", "armour", "default"), ("Gloves",)),
+    "鞋子": (("boots",), ("boots", "armour", "default"), ("Boots",)),
+    "靴子": (("boots",), ("boots", "armour", "default"), ("Boots",)),
+    "盾牌": (("shield",), ("shield", "armour", "default"), ("Shield",)),
+    "箭袋": (("quiver",), ("quiver", "default"), ("Quiver",)),
+    "项链": (("amulet",), ("amulet", "default"), ("Amulet",)),
+    "护身符": (("amulet",), ("amulet", "default"), ("Amulet",)),
+    "戒指": (("ring",), ("ring", "default"), ("Ring",)),
+    "左戒指": (("ring",), ("ring", "default"), ("Ring",)),
+    "右戒指": (("ring",), ("ring", "default"), ("Ring",)),
+    "腰带": (("belt",), ("belt", "default"), ("Belt",)),
+    "药剂": (("flask",), ("flask", "default"), ("Flask",)),
+    "珠宝": (("jewel", "abyss_jewel"), ("jewel", "default"), ()),
+    "主手": (
+        ("weapon", "one_hand_weapon", "two_hand_weapon", "sword", "axe", "mace", "dagger", "claw", "wand", "bow", "staff", "sceptre"),
+        ("weapon", "default"),
+        ("One Handed Sword", "Two Handed Sword", "One Handed Axe", "Two Handed Axe", "One Handed Mace", "Two Handed Mace", "Dagger", "Claw", "Wand", "Bow", "Staff", "Sceptre", "Thrusting One Handed Sword"),
+    ),
+    "副手": (
         ("weapon", "one_hand_weapon", "shield", "quiver", "sword", "axe", "mace", "dagger", "claw", "wand", "sceptre"),
         ("weapon", "shield", "quiver", "default"),
         ("One Handed Sword", "One Handed Axe", "One Handed Mace", "Dagger", "Claw", "Wand", "Sceptre", "Thrusting One Handed Sword", "Shield", "Quiver"),
@@ -1277,24 +1327,42 @@ def _parse_gems_and_skills(poe1_dir: Path, zh: _ZhDictionary) -> list[dict[str, 
         levels_out: dict[str, Any] = {}
         for lvl_num in target_levels:
             lvl_stats = _compute_skill_level_stats(skill, lvl_num)
+            if sec_skill and not is_vaal:
+                sec_lvl = _compute_skill_level_stats(sec_skill, lvl_num)
+                if sec_lvl is not None:
+                    if lvl_stats is None:
+                        lvl_stats = sec_lvl
+                    else:
+                        merged_st = dict(sec_lvl.get("stats") or {})
+                        merged_st.update(lvl_stats.get("stats") or {})
+                        lvl_stats["stats"] = merged_st
+                        for k_aux in ("cooldown", "critChance", "damageEffectiveness", "manaMultiplier", "cost"):
+                            if lvl_stats.get(k_aux) is None and sec_lvl.get(k_aux) is not None:
+                                lvl_stats[k_aux] = sec_lvl[k_aux]
             if lvl_stats is not None:
                 levels_out[str(lvl_num)] = lvl_stats
 
         quality_stats: list[dict[str, Any]] = []
-        for qs in _as_seq(skill.get("qualityStats")):
-            if isinstance(qs, list) and len(qs) >= 2 and isinstance(qs[1], (int, float)):
-                quality_stats.append(
-                    {
-                        "stat": qs[0],
-                        "per_quality": qs[1],
-                        "at_20_quality": round(float(qs[1]) * 20, 4),
-                    }
-                )
+        seen_qs: set[str] = set()
+        for src_sk in (skill, sec_skill) if (sec_skill and not is_vaal) else (skill,):
+            for qs in _as_seq(src_sk.get("qualityStats")):
+                if isinstance(qs, list) and len(qs) >= 2 and isinstance(qs[1], (int, float)) and str(qs[0]) not in seen_qs:
+                    seen_qs.add(str(qs[0]))
+                    quality_stats.append(
+                        {
+                            "stat": qs[0],
+                            "per_quality": qs[1],
+                            "at_20_quality": round(float(qs[1]) * 20, 4),
+                        }
+                    )
 
         constant_stats: list[dict[str, Any]] = []
-        for cs in _as_seq(skill.get("constantStats")):
-            if isinstance(cs, list) and len(cs) >= 2:
-                constant_stats.append({"stat": cs[0], "value": cs[1]})
+        seen_cs: set[str] = set()
+        for src_sk in (skill, sec_skill) if (sec_skill and not is_vaal) else (skill,):
+            for cs in _as_seq(src_sk.get("constantStats")):
+                if isinstance(cs, list) and len(cs) >= 2 and str(cs[0]) not in seen_cs:
+                    seen_cs.add(str(cs[0]))
+                    constant_stats.append({"stat": cs[0], "value": cs[1]})
 
         lvl20 = levels_out.get("20") or levels_out.get(str(nat_max)) or levels_out.get("1") or {}
         zh_name = zh.translate_gem(name)
@@ -2801,39 +2869,112 @@ def _query_gems(conn: sqlite3.Connection, q_lower: str, limit: int) -> list[dict
     return [json.loads(item[1]) for item in scored[:limit]]
 
 
+def _unique_matching_mod_lines(obj: dict[str, Any], mod_tokens: list[str], mod_phrase: str) -> tuple[int, list[str]]:
+    """Return `(tier, matched_lines)` for a unique item against a folded `--mod` query, or `(-1, [])` if unmatched."""
+    en_lines: list[str] = []
+    zh_lines: list[str] = []
+    for k_en, k_zh in (("implicits", "implicits_zh"), ("explicits", "explicits_zh")):
+        raw_en = obj.get(k_en) or []
+        raw_zh = obj.get(k_zh) or []
+        for idx, line in enumerate(raw_en):
+            s_en = MOD_TAG_PREFIX_RE.sub("", str(line or "")).strip()
+            s_zh = str(raw_zh[idx]).strip() if idx < len(raw_zh) and raw_zh[idx] else ""
+            if s_en:
+                en_lines.append(s_en)
+                zh_lines.append(s_zh)
+    for fb in obj.get("foulborn_mods") or []:
+        fb_en = fb.get("stats") or []
+        fb_zh = fb.get("stats_zh") or []
+        for idx, line in enumerate(fb_en):
+            s_en = MOD_TAG_PREFIX_RE.sub("", str(line or "")).strip()
+            s_zh = str(fb_zh[idx]).strip() if idx < len(fb_zh) and fb_zh[idx] else ""
+            if s_en:
+                en_lines.append(f"[Foulborn] {s_en}")
+                zh_lines.append(s_zh)
+
+    exact_line_hits: list[str] = []
+    token_line_hits: list[str] = []
+    all_folded_parts: list[str] = []
+
+    for s_en, s_zh in zip(en_lines, zh_lines):
+        f_en = _fold_search_text(s_en)
+        f_zh = _fold_search_text(s_zh) if s_zh else ""
+        comb = f"{f_en} {f_zh}".strip()
+        all_folded_parts.append(comb)
+        disp = f"{s_en} / {s_zh}" if s_zh else s_en
+        if mod_phrase and (mod_phrase in f_en or (f_zh and mod_phrase in f_zh)):
+            exact_line_hits.append(disp)
+        elif mod_tokens and all(t in comb for t in mod_tokens):
+            token_line_hits.append(disp)
+
+    if exact_line_hits:
+        return 0, exact_line_hits
+    if token_line_hits:
+        return 1, token_line_hits
+
+    whole_text = " ".join(all_folded_parts)
+    if mod_tokens and all(t in whole_text for t in mod_tokens):
+        partial_hits = [
+            f"{s_en} / {s_zh}" if s_zh else s_en
+            for s_en, s_zh in zip(en_lines, zh_lines)
+            if any(t in _fold_search_text(f"{s_en} {s_zh}") for t in mod_tokens)
+        ]
+        return 2, partial_hits[:6]
+    return -1, []
+
+
 def _query_uniques(
-    conn: sqlite3.Connection, q_lower: str, slot: str | None, ilvl: int | None, limit: int
+    conn: sqlite3.Connection,
+    q_lower: str,
+    slot: str | None,
+    ilvl: int | None,
+    limit: int,
+    *,
+    mod_filter: str | None = None,
 ) -> list[dict[str, Any]]:
     slot_spec = _normalize_slot_filter(slot) if slot else None
-    if not q_lower:
+    mod_lower = _fold_search_text(mod_filter or "").strip()
+    mod_tokens = [t for t in mod_lower.split() if t] if mod_lower else []
+
+    # Build combined search expression for FTS5 candidate narrowing when possible
+    combined_q = " ".join(p for p in (q_lower, mod_lower) if p).strip()
+    if not combined_q:
         rows = conn.execute(
             "SELECT name_lower, zh_lower, foulborn_lower, zh_foulborn_lower, slots_lower, data_json FROM uniques LIMIT 300"
         ).fetchall()
     else:
-        fts_expr, tokens = _build_fts_match(q_lower)
+        fts_expr, _ = _build_fts_match(combined_q)
+        row_limit = 600 if mod_lower else 300
         if fts_expr:
             rows = conn.execute(
-                """
+                f"""
                 SELECT u.name_lower, u.zh_lower, u.foulborn_lower, u.zh_foulborn_lower, u.slots_lower, u.data_json
                 FROM uniques_fts f
                 JOIN uniques u ON u.rowid = f.rowid
                 WHERE uniques_fts MATCH ?
-                LIMIT 300
+                LIMIT {row_limit}
                 """,
                 (fts_expr,),
             ).fetchall()
         else:
+            probe = mod_lower or q_lower
             rows = conn.execute(
-                """
+                f"""
                 SELECT name_lower, zh_lower, foulborn_lower, zh_foulborn_lower, slots_lower, data_json
                 FROM uniques
                 WHERE instr(search_text_lower, ?) > 0
-                LIMIT 300
+                LIMIT {row_limit}
                 """,
-                (q_lower,),
+                (probe,),
+            ).fetchall()
+        # If mod_filter had short (<3 char) or mixed CJK tokens missed by FTS5, fall back cleanly to full table scan
+        if mod_lower and not rows:
+            rows = conn.execute(
+                "SELECT name_lower, zh_lower, foulborn_lower, zh_foulborn_lower, slots_lower, data_json FROM uniques"
             ).fetchall()
 
-    scored: list[tuple[tuple[int, int, str], dict[str, Any] | str]] = []
+    q_tokens = [t for t in q_lower.split() if t] if q_lower else []
+    scored: list[tuple[tuple[int, int, int, str], dict[str, Any] | str]] = []
     for name_l, zh_l, fb_l, zh_fb_l, slots_l, data_json in rows:
         zh_l = zh_l or ""
         fb_l = fb_l or ""
@@ -2849,10 +2990,31 @@ def _query_uniques(
                 continue
 
         payload: dict[str, Any] | str = data_json
-        if ilvl is not None:
+        mod_tier = 0
+        if mod_lower or ilvl is not None or (q_tokens and mod_lower):
             obj = json.loads(data_json)
-            if obj.get("req_level") is not None and int(obj["req_level"]) > ilvl:
+            if ilvl is not None and obj.get("req_level") is not None and int(obj["req_level"]) > ilvl:
                 continue
+            if mod_lower:
+                mod_tier, matched_lines = _unique_matching_mod_lines(obj, mod_tokens, mod_lower)
+                if mod_tier < 0:
+                    continue
+                obj["matched_mods"] = matched_lines
+            if q_tokens and mod_lower:
+                hay_q = _fold_search_text(
+                    " ".join(
+                        str(x or "")
+                        for x in (
+                            obj.get("name"),
+                            obj.get("zh_name"),
+                            obj.get("base_type"),
+                            obj.get("base_type_zh"),
+                            obj.get("item_class"),
+                        )
+                    )
+                )
+                if not all(t in hay_q for t in q_tokens):
+                    continue
             payload = obj
 
         if q_lower:
@@ -2866,7 +3028,7 @@ def _query_uniques(
                 tier = 3
         else:
             tier = 0
-        scored.append(((tier, len(name_l), name_l), payload))
+        scored.append(((mod_tier, tier, len(name_l), name_l), payload))
 
     scored.sort(key=lambda item: item[0])
     return [item[1] if isinstance(item[1], dict) else json.loads(item[1]) for item in scored[:limit]]
@@ -3318,13 +3480,14 @@ def _dispatch_query(
     ilvl: int | None,
     limit: int,
     zh_available: bool,
+    mod_filter: str | None = None,
 ) -> list[dict[str, Any]]:
     if limit == 0:
         return []
     if kind_norm == "gem":
         return _query_gems(conn, q_folded, limit)
     if kind_norm == "unique":
-        return _query_uniques(conn, q_folded, slot, ilvl, limit)
+        return _query_uniques(conn, q_folded, slot, ilvl, limit, mod_filter=mod_filter)
     if kind_norm == "base":
         return _query_bases(conn, q_folded, slot, ilvl, limit)
     if kind_norm == "mod":
@@ -3332,27 +3495,1137 @@ def _dispatch_query(
     return _query_translate(conn, q_folded, limit, zh_available)
 
 
+def _guardrail_scope_for_kind(kind_norm: str) -> Any:
+    from .guardrails import GuardrailScope
+
+    if kind_norm == "gem":
+        return GuardrailScope.GEM_NAME
+    if kind_norm == "mod":
+        return GuardrailScope.STAT_QUERY
+    return GuardrailScope.DATA_QUERY
+
+
+# ---------------------------------------------------------------------------
+# Player Slang Map, Zero-Empty-Result Suggestions & Entity Grounding (P0-2)
+# ---------------------------------------------------------------------------
+
+PLAYER_SLANG_MAP: dict[str, tuple[str, str]] = {
+    # Iconic Uniques
+    "法血": ("Mageblood", "unique"),
+    "魔血": ("Mageblood", "unique"),
+    "猎首": ("Headhunter", "unique"),
+    "尼米斯": ("Nimis", "unique"),
+    "原罪": ("Original Sin", "unique"),
+    "百属": ("Astramentis", "unique"),
+    "百属项链": ("Astramentis", "unique"),
+    "全知": ("Crystallised Omniscience", "unique"),
+    "全知项链": ("Crystallised Omniscience", "unique"),
+    "星尘": ("Ashes of the Stars", "unique"),
+    "骨灰盒": ("Ashes of the Stars", "unique"),
+    "群星": ("Ashes of the Stars", "unique"),
+    "象牙塔": ("The Ivory Tower", "unique"),
+    "白袍": ("Tabula Rasa", "unique"),
+    "三球鞋": ("Ralakesh's Impatience", "unique"),
+    "拉利克斯": ("Ralakesh's Impatience", "unique"),
+    "格挡盾": ("Svalinn", "unique"),
+    "斯瓦林": ("Svalinn", "unique"),
+    "塑界手": ("Shaper's Touch", "unique"),
+    "信念之砧": ("Defiance of Destiny", "unique"),
+    "女王头": ("Crown of the Inward Eye", "unique"),
+    "禁断肉体": ("Forbidden Flesh", "unique"),
+    "禁断火焰": ("Forbidden Flame", "unique"),
+    "狮眼甲": ("Lioneye's Vision", "unique"),
+    "龙牙": ("Replica Dragonfang's Flight", "unique"),
+    "火衣": ("Cloak of Flame", "unique"),
+    "电甲": ("Lightning Coil", "unique"),
+    "万古之剑": ("The Sword of Ages", "unique"),
+    "万古剑": ("The Sword of Ages", "unique"),
+    "靛蓝头": ("Indigon", "unique"),
+    "靛蓝": ("Indigon", "unique"),
+    "不眨之眼": ("The Unblinking Eye", "unique"),
+    "枯萎尖叫": ("Screams of the Desiccated", "unique"),
+    "四季之侵": ("Sap of the Seasons", "unique"),
+    "卫道之袍": ("Cloak of Defiance", "unique"),
+    "恨意": ("Taste of Hate", "unique"),
+    "艾许之面": ("Esh's Visage", "unique"),
+    "薛朗的护身长袍": ("Shavronne's Wrappings", "unique"),
+    "夏乌拉衣": ("Shavronne's Wrappings", "unique"),
+    "大CI": ("Shavronne's Wrappings", "unique"),
+    "小CI": ("Solaris Lorica", "unique"),
+    "血肉溶解": ("Dissolution of the Flesh", "unique"),
+    "卡斯普里": ("Cospri's Malice", "unique"),
+    "冰剑": ("Cospri's Malice", "unique"),
+    "雷锤": ("Mjölner", "unique"),
+    "诗人之笔": ("The Poet's Pen", "unique"),
+    "闪耀精华": ("Coruscating Elixir", "unique"),
+    # Popular Skill & Support Gems
+    "吟唱时施放": ("Cast while Channelling", "gem"),
+    "引导时施放": ("Cast while Channelling", "gem"),
+    "暴击时施放": ("Cast On Critical Strike", "gem"),
+    "急冻": ("Hypothermia", "gem"),
+    "元素集中": ("Elemental Focus", "gem"),
+    "献祭": ("Immolate", "gem"),
+    "启迪": ("Inspiration", "gem"),
+    "大法师": ("Archmage", "gem"),
+    "时空幻影": ("Temporal Mirage", "gem"),
+    "倾泻火雨": ("Firestorm of Pelting", "gem"),
+    "改造火雨": ("Firestorm of Pelting", "gem"),
+    "碎焰之烈炎风暴": ("Firestorm of Pelting", "gem"),
+    "陨星火雨": ("Firestorm of Meteors", "gem"),
+    "陨石火雨": ("Firestorm of Meteors", "gem"),
+    "沸燃": ("Volatile Dead of Seething", "gem"),
+    "沸腾灵体火球": ("Volatile Dead of Seething", "gem"),
+    "沸燃之灵体火球": ("Volatile Dead of Seething", "gem"),
+    "逆转规则": ("Invert the Rules", "gem"),
+    "寒冰法师": ("Frostmage", "gem"),
+    "冰法师": ("Frostmage", "gem"),
+    "暗夜血契": ("Dark Bargain", "gem"),
+    "暗夜契约": ("Dark Bargain", "gem"),
+    "黑暗交易": ("Dark Bargain", "gem"),
+    "电弧": ("Arc", "gem"),
+    "闪打": ("Flicker Strike", "gem"),
+    "正火": ("Righteous Fire", "gem"),
+    "龙卷": ("Tornado Shot", "gem"),
+    "冰矛": ("Ice Spear", "gem"),
+    "电打": ("Lightning Strike", "gem"),
+    "冰霜新星": ("Ice Nova of Frostbolts", "gem"),
+    "力爆": ("Kinetic Blast", "gem"),
+    "力抽": ("Power Siphon", "gem"),
+    "灵体火球": ("Volatile Dead", "gem"),
+    "天雷": ("Ball Lightning", "gem"),
+    "火雨": ("Firestorm", "gem"),
+    "毒雨": ("Toxic Rain", "gem"),
+    "毒瓶": ("Poisonous Concoction", "gem"),
+    "旋风斩": ("Cyclone", "gem"),
+    "忏悔烙印": ("Penance Brand of Dissipation", "gem"),
+    "魔蛊": ("Hexblast", "gem"),
+    "飞刃": ("Blade Vortex", "gem"),
+    "刀雨": ("Bladefall", "gem"),
+    "活栓": ("Lifetap", "gem"),
+    "启蒙": ("Enlighten", "gem"),
+    "赋予": ("Empower", "gem"),
+    "增幅": ("Enhance", "gem"),
+    "熔盾": ("Molten Shell", "gem"),
+    "跃击": ("Leap Slam", "gem"),
+    "冰闪": ("Frostblink", "gem"),
+    "盾冲": ("Shield Charge", "gem"),
+    "自动触发": ("Automation", "gem"),
+    "自动增助": ("Autoexertion", "gem"),
+    # Stats / Mechanics
+    "法压": ("Spell Suppression", "stat"),
+    "暴伤": ("Critical Strike Multiplier", "stat"),
+    "暴击率": ("Critical Strike Chance", "stat"),
+    "魔保": ("Mana Reservation Efficiency", "stat"),
+    "魔力保留": ("Mana Reservation Efficiency", "stat"),
+    "扑杀": ("Culling Strike", "stat"),
+    "攻速": ("Attack Speed", "stat"),
+    "施法速度": ("Cast Speed", "stat"),
+    "移速": ("Movement Speed", "stat"),
+    "元穿": ("Elemental Penetration", "stat"),
+    "持续伤害加成": ("Damage over Time Multiplier", "stat"),
+    "最大抗": ("Maximum Elemental Resistance", "stat"),
+    "物转元": ("Physical Damage taken as", "stat"),
+    "回血": ("Life Regeneration", "stat"),
+    "秒回": ("Life Regenerated per Second", "stat"),
+    # PoE2-CN -> PoE1-CN Keystone & Mechanic Mistranslation Aliases & 3.30 Keystones/Ascendancies
+    "杂耍": ("Acrobatics", "keystone"),
+    "心灵灭界": ("Mind Over Matter", "keystone"),
+    "混沌接种": ("Chaos Inoculation", "keystone"),
+    "异能魔力": ("Eldritch Battery", "keystone"),
+    "喋血之刃": ("Bloodsoaked Blade", "keystone"),
+    "守藏者": ("Reliquarian", "ascendancy"),
+    "圣宗": ("Hierophant", "ascendancy"),
+    "欺诈师": ("Trickster", "ascendancy"),
+    "守望者": ("Warden", "ascendancy"),
+    "聚魂": ("Polymath", "passive"),
+    "博学者": ("Polymath", "passive"),
+    "思维圣殿": ("Sanctuary of Thought", "passive"),
+    "意识圣殿": ("Sanctuary of Thought", "passive"),
+}
+
+_SLANG_SORTED_KEYS: tuple[str, ...] = tuple(sorted(PLAYER_SLANG_MAP.keys(), key=len, reverse=True))
+
+_GROUND_ENTITY_INDEX_CACHE: dict[str, dict[str, Any]] = {}
+_GROUND_EN_STOPWORDS: frozenset[str] = frozenset(
+    {
+        "the", "and", "for", "with", "from", "this", "that", "can", "use", "get", "how", "why",
+        "what", "does", "not", "but", "are", "was", "has", "have", "will", "should", "build",
+        "item", "gem", "gems", "skill", "skills", "ring", "belt", "helm", "helmet", "body",
+        "boots", "gloves", "shield", "staff", "wand", "bow", "claw", "sword", "axe", "mace",
+        "flask", "jewel", "map", "mod", "mods", "dps", "ehp", "life", "mana", "crit", "hit",
+        "dot", "cast", "time", "damage", "chance", "more", "less", "cold", "fire", "chaos",
+        "physical", "lightning", "elemental", "support", "attack", "spell", "minion", "totem",
+        "aura", "curse", "guard", "warcry", "charge", "charges", "socket", "sockets", "link",
+        "links", "level", "quality", "poe", "poe1", "poe2", "pob", "still", "work", "works",
+        "best", "good", "bad", "need", "want", "check", "test", "make", "take", "give", "one",
+        "two", "all", "any", "into", "over", "under", "than", "then", "when", "where", "only",
+        "pure", "base", "extra", "added", "increased", "reduced", "maximum", "minimum", "energy",
+        "armour", "armor", "evasion", "block", "dodge", "bleed", "poison", "ignite", "shock",
+        "chill", "freeze", "focus", "spirit", "charm", "rune", "waystone", "portal", "mark",
+        "brand", "mine", "trap", "banner", "stance", "offering", "golem", "spectre", "zombie",
+        "skeleton", "melee", "ranged", "proj", "projectile", "area", "aoe", "speed", "power",
+        "frenzy", "endurance", "resist", "resistance", "resistances", "left", "right", "click",
+        "instant", "manual", "auto", "trigger", "buff", "debuff", "boss", "pinnacle", "uber",
+    }
+)
+_GROUND_ZH_STOPWORDS: frozenset[str] = frozenset(
+    {
+        "攻击", "施法", "法术", "闪电", "火焰", "冰霜", "混沌", "物理", "元素", "伤害", "暴击",
+        "生命", "魔力", "护盾", "护甲", "闪避", "格挡", "抗性", "范围", "投射物", "近战",
+        "辅助", "光环", "诅咒", "印记", "图腾", "召唤", "地雷", "陷阱", "烙印", "战吼",
+        "药剂", "珠宝", "装备", "技能", "宝石", "天赋", "升华", "戒指", "项链", "腰带",
+        "头盔", "胸甲", "手套", "鞋子", "盾牌", "武器", "单手", "双手", "弓", "法杖",
+        "流血", "中毒", "点燃", "感电", "冰缓", "冰冻", "穿透", "贯穿", "转化", "保留",
+    }
+)
+
+
+def resolve_player_slang(query: str) -> tuple[str, str] | None:
+    """Resolve a PoE1 CN player slang term (exact match) into `(canonical_en, kind_hint)`."""
+    if not query:
+        return None
+    q = query.strip()
+    hit = PLAYER_SLANG_MAP.get(q)
+    if hit is not None:
+        return hit
+    q_low = _fold_search_text(q)
+    return PLAYER_SLANG_MAP.get(q_low)
+
+
+def _suggest_similar(
+    conn: sqlite3.Connection,
+    kind_norm: str,
+    q_lower: str,
+    *,
+    limit: int = 5,
+    zh_available: bool = True,
+) -> list[dict[str, Any]]:
+    """Return up to `limit` fuzzy/token/difflib suggestions ONLY when primary query yields 0 hits."""
+    import difflib
+
+    if not q_lower or limit <= 0:
+        return []
+
+    is_cjk = bool(_CJK_RE.search(q_lower))
+    q_tokens = [t for t in re.split(r"[\s_\-/]+", q_lower) if len(t) >= 2]
+
+    candidates: list[tuple[str, str | None, str]] = []  # (name_en, zh_name, key_for_match)
+    if kind_norm == "gem":
+        rows = conn.execute("SELECT name, name_lower, zh_name, zh_lower FROM gems").fetchall()
+        for nm, nm_l, zh, zh_l in rows:
+            candidates.append((nm, zh, (zh_l or nm_l) if is_cjk else nm_l))
+    elif kind_norm == "unique":
+        rows = conn.execute("SELECT name, name_lower, zh_name, zh_lower FROM uniques").fetchall()
+        for nm, nm_l, zh, zh_l in rows:
+            candidates.append((nm, zh, (zh_l or nm_l) if is_cjk else nm_l))
+    elif kind_norm == "base":
+        rows = conn.execute("SELECT name, name_lower, zh_name, zh_lower FROM bases").fetchall()
+        for nm, nm_l, zh, zh_l in rows:
+            candidates.append((nm, zh, (zh_l or nm_l) if is_cjk else nm_l))
+    elif kind_norm == "mod":
+        # Sample top mod stat templates matching any token/char for fast suggestions
+        if is_cjk:
+            chars = list(dict.fromkeys(ch for ch in q_lower if _CJK_RE.match(ch)))[:4]
+            if chars:
+                where = " OR ".join("instr(stats_zh_lower, ?) > 0" for _ in chars)
+                mrows = conn.execute(
+                    f"SELECT id, stats_en_lower, stats_zh_lower, data_json FROM mods WHERE {where} LIMIT 250",
+                    chars,
+                ).fetchall()
+            else:
+                mrows = []
+        else:
+            toks = [t for t in q_tokens if len(t) >= 3][:3] or [q_lower[:3]]
+            where = " OR ".join("instr(stats_en_lower, ?) > 0" for _ in toks)
+            mrows = conn.execute(
+                f"SELECT id, stats_en_lower, stats_zh_lower, data_json FROM mods WHERE {where} LIMIT 250",
+                toks,
+            ).fetchall()
+        seen_mod_txt: set[str] = set()
+        for _, en_l, zh_l, dj in mrows:
+            obj = json.loads(dj)
+            en_s = (obj.get("stats") or [""])[0]
+            zh_s = next((s for s in (obj.get("stats_zh") or []) if s), None)
+            if en_s and en_s not in seen_mod_txt:
+                seen_mod_txt.add(en_s)
+                candidates.append((en_s, zh_s, (zh_l or en_l) if is_cjk else en_l))
+    else:  # translate
+        for tbl in ("gems", "uniques", "bases"):
+            rows = conn.execute(f"SELECT name, name_lower, zh_name, zh_lower FROM {tbl}").fetchall()
+            for nm, nm_l, zh, zh_l in rows:
+                candidates.append((nm, zh, (zh_l or nm_l) if is_cjk else nm_l))
+        if zh_available and not candidates:
+            rows = conn.execute("SELECT en, en_lower, zh, zh_lower FROM translations WHERE cat_rank <= 2 LIMIT 2000").fetchall()
+            for en, en_l, zh, zh_l in rows:
+                candidates.append((en, zh, zh_l if is_cjk else en_l))
+
+    if not candidates:
+        return []
+
+    scored: list[tuple[float, str, str | None]] = []
+    seen_en: set[str] = set()
+    q_chars = set(ch for ch in q_lower if _CJK_RE.match(ch)) if is_cjk else set()
+
+    for en, zh, key_txt in candidates:
+        if not key_txt or en in seen_en:
+            continue
+        score = 0.0
+        if is_cjk and q_chars:
+            overlap = sum(1 for ch in q_chars if ch in key_txt)
+            if overlap == 0:
+                continue
+            score = (overlap / len(q_chars)) * 0.7 + difflib.SequenceMatcher(None, q_lower, key_txt).ratio() * 0.3
+        else:
+            tok_hits = sum(1 for t in q_tokens if t in key_txt) if q_tokens else 0
+            ratio = difflib.SequenceMatcher(None, q_lower, key_txt).ratio()
+            if tok_hits == 0 and ratio < 0.45:
+                continue
+            score = ratio * 0.75 + (tok_hits / max(1, len(q_tokens))) * 0.25
+        if score >= 0.40:
+            seen_en.add(en)
+            scored.append((score, en, zh))
+
+    scored.sort(key=lambda item: (-item[0], len(item[1]), item[1]))
+    return [
+        {"name": en, "zh_name": zh, "score": round(sc, 3)}
+        for sc, en, zh in scored[:limit]
+    ]
+
+
+def _build_zero_result_hint(kind_norm: str, query: str, suggestions: list[dict[str, Any]]) -> str:
+    if suggestions:
+        top_names = ", ".join(
+            f"{s['name']} ({s['zh_name']})" if s.get("zh_name") else s["name"]
+            for s in suggestions[:3]
+        )
+        return (
+            f"0 exact {kind_norm} matches for '{query}'. "
+            f"Did you mean: {top_names}? Try re-querying with one of those names or `pob data translate \"{query}\"`."
+        )
+    return (
+        f"0 exact {kind_norm} matches for '{query}'. "
+        f"Verify the exact PoE1 3.30 name via `pob data translate \"{query}\"` or `pob poedb \"{query}\"` — do NOT guess stats from memory."
+    )
+
+
+def _format_gem_fact_card(gem_obj: dict[str, Any], *, matched_by: str | None = None) -> dict[str, Any]:
+    lvls = gem_obj.get("levels") or {}
+    lv20 = lvls.get("20") or lvls.get("1") or (next(iter(lvls.values())) if lvls else {})
+    q_stats = gem_obj.get("quality_stats") or []
+    card: dict[str, Any] = {
+        "kind": "gem",
+        "name": gem_obj.get("display_name") or gem_obj.get("name"),
+        "zhName": gem_obj.get("zh_name"),
+        "isSupport": bool(gem_obj.get("is_support")),
+        "color": gem_obj.get("color"),
+        "tags": gem_obj.get("tag_string"),
+        "castTime": gem_obj.get("cast_time"),
+        "critChance": gem_obj.get("crit_chance") or lv20.get("critChance"),
+        "damageEffectiveness": gem_obj.get("damage_effectiveness") or lv20.get("damageEffectiveness"),
+        "manaMultiplier": gem_obj.get("mana_multiplier"),
+        "lv20Cost": lv20.get("cost"),
+        "lv20Stats": dict(list((lv20.get("stats") or {}).items())[:6]),
+        "quality20": [
+            {
+                "stat": q.get("stat"),
+                "perQuality": q.get("per_quality"),
+                "at20": q.get("at_20_quality"),
+                "at40": round(float(q.get("per_quality") or 0.0) * 40, 4),
+            }
+            for q in q_stats[:3]
+        ],
+    }
+    variants = gem_obj.get("variants") or []
+    if variants:
+        card["variants"] = [
+            f"{v.get('name')} ({v['zh_name']})" if v.get("zh_name") else str(v.get("name"))
+            for v in variants[:4]
+        ]
+    if matched_by:
+        card["matchedBy"] = matched_by
+    return card
+
+
+def _format_unique_fact_card(u_obj: dict[str, Any], *, matched_by: str | None = None) -> dict[str, Any]:
+    implicits = [MOD_TAG_PREFIX_RE.sub("", s).strip() for s in (u_obj.get("implicits") or [])[:3]]
+    explicits = [MOD_TAG_PREFIX_RE.sub("", s).strip() for s in (u_obj.get("explicits") or [])[:8]]
+    card: dict[str, Any] = {
+        "kind": "unique",
+        "name": u_obj.get("name"),
+        "zhName": u_obj.get("zh_name"),
+        "baseType": u_obj.get("base_type"),
+        "baseTypeZh": u_obj.get("base_type_zh"),
+        "itemClass": u_obj.get("item_class"),
+        "reqLevel": u_obj.get("req_level"),
+        "implicits": [s for s in implicits if s],
+        "explicits": [s for s in explicits if s],
+    }
+    if matched_by:
+        card["matchedBy"] = matched_by
+    return card
+
+
+_REMOVED_LEGACY_GEM_NAMES_LOWER: frozenset[str] = frozenset(
+    {
+        "divine blessing",
+        "divine blessing support",
+        "ancestral protector",
+        "ancestral warchief",
+        "vaal ancestral warchief",
+        "call to arms",
+    }
+)
+
+
+def _get_ground_entity_index(conn: sqlite3.Connection, db_key: str) -> dict[str, Any]:
+    cached = _GROUND_ENTITY_INDEX_CACHE.get(db_key)
+    if cached is not None:
+        return cached
+
+    zh_entries: list[tuple[str, str, int, str]] = []  # (zh_compact, kind, rowid, name)
+    en_entries: list[tuple[str, str, int, str]] = []  # (name_lower, kind, rowid, name)
+
+    for kind, tbl in (("gem", "gems"), ("unique", "uniques")):
+        rows = conn.execute(f"SELECT rowid, name, name_lower, zh_lower FROM {tbl}").fetchall()
+        for rid, name, name_l, zh_l in rows:
+            if kind == "gem" and name_l in _REMOVED_LEGACY_GEM_NAMES_LOWER:
+                continue
+            if name_l and len(name_l) >= 3 and name_l not in _GROUND_EN_STOPWORDS:
+                en_entries.append((name_l, kind, int(rid), name))
+            if zh_l:
+                zh_clean = re.sub(r"\s*(?:\(辅\)|（辅）|\(强辅\)|（强辅）|辅助)$", "", zh_l).strip()
+                zh_compact = re.sub(r"[\s·・.．:：()（）]", "", zh_clean)
+                if len(zh_compact) >= 2 and zh_compact not in _GROUND_ZH_STOPWORDS:
+                    zh_entries.append((zh_compact, kind, int(rid), name))
+
+    # Longest-first ensures specific names (e.g. "Vaal Molten Shell", "投射之漩涡") win over shorter substrings
+    zh_entries.sort(key=lambda x: (-len(x[0]), 0 if x[1] == "gem" else 1, x[3]))
+    en_entries.sort(key=lambda x: (-len(x[0]), 0 if x[1] == "gem" else 1, x[3]))
+
+    idx = {"zh": zh_entries, "en": en_entries}
+    _GROUND_ENTITY_INDEX_CACHE[db_key] = idx
+    return idx
+
+
+def lookup_fact_cards_for_build(
+    gem_names: list[str],
+    unique_names: list[str],
+    *,
+    pob_dir: Path | None = None,
+    runtime_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Fetch compact live 3.30 gem & unique fact cards from SQLite for `pob diagnose` (<5ms)."""
+    db_path = ensure_gamedata_index(pob_dir=pob_dir, runtime_dir=runtime_dir)
+    conn = sqlite3.connect(_sqlite_ro_uri(db_path), uri=True)
+    try:
+        meta = dict(conn.execute("SELECT key, value FROM meta").fetchall())
+        gem_cards: list[dict[str, Any]] = []
+        seen_gems: set[str] = set()
+        for raw_g in gem_names:
+            g_clean = re.sub(r"\s+support$", "", str(raw_g or "").strip(), flags=re.IGNORECASE)
+            if not g_clean:
+                continue
+            g_low = _fold_search_text(g_clean)
+            row = conn.execute(
+                "SELECT data_json FROM gems WHERE name_lower = ? OR display_name_lower = ? OR zh_lower = ? LIMIT 1",
+                (g_low, g_low, g_low),
+            ).fetchone()
+            if row is None:
+                # Try stripping " (辅)" suffix on zh or prefix lookup
+                hits = _query_gems(conn, g_low, 1)
+                if hits:
+                    obj = hits[0]
+                else:
+                    continue
+            else:
+                obj = json.loads(row[0])
+            cname = str(obj.get("name") or "")
+            if cname and cname not in seen_gems:
+                seen_gems.add(cname)
+                gem_cards.append(_format_gem_fact_card(obj))
+
+        unique_cards: list[dict[str, Any]] = []
+        seen_uniques: set[str] = set()
+        for raw_u in unique_names:
+            u_clean = str(raw_u or "").strip()
+            if not u_clean:
+                continue
+            u_low = _fold_search_text(u_clean)
+            row = conn.execute(
+                "SELECT data_json FROM uniques WHERE name_lower = ? OR zh_lower = ? LIMIT 1",
+                (u_low, u_low),
+            ).fetchone()
+            if row is None:
+                continue
+            obj = json.loads(row[0])
+            uname = str(obj.get("name") or "")
+            if uname and uname not in seen_uniques:
+                seen_uniques.add(uname)
+                unique_cards.append(_format_unique_fact_card(obj))
+
+        return {
+            "pobVersion": meta.get("pob_version", "unknown"),
+            "dataVersion": meta.get("data_version", "unknown"),
+            "gems": gem_cards,
+            "uniques": unique_cards,
+        }
+    finally:
+        conn.close()
+
+
+def ground_text_entities(
+    text: str,
+    *,
+    limit: int = 8,
+    pob_dir: Path | None = None,
+    runtime_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Scan arbitrary CN/EN player prompt text (<15ms warm) against live 3.30 SQLite + guardrails + patch traps.
+
+    Returns live gem/unique fact cards, resolved player slang, PoE2 cross-game warnings,
+    3.23-3.25 legacy patch warnings, same-name false friends, and a ready-to-inject Markdown `contextBlock`.
+    Never raises on PoE2/legacy traps — reports them cleanly for pre-turn LLM grounding.
+    """
+    from .guardrails import normalize_guardrail_text, normalize_zh_compact, scan_text_traps
+
+    t0 = time.perf_counter()
+    raw = str(text or "").strip()
+    limit = max(0, int(limit))
+
+    traps = scan_text_traps(raw)
+
+    db_path = ensure_gamedata_index(pob_dir=pob_dir, runtime_dir=runtime_dir)
+    conn = sqlite3.connect(_sqlite_ro_uri(db_path), uri=True)
+    try:
+        meta = dict(conn.execute("SELECT key, value FROM meta").fetchall())
+        pob_ver = meta.get("pob_version", "unknown")
+        data_ver = meta.get("data_version", "unknown")
+
+        resolved_slang: list[dict[str, str]] = []
+        entities: list[dict[str, Any]] = []
+        seen_keys: set[tuple[str, str]] = set()
+
+        if raw and limit > 0:
+            # 1. Resolve player slang mentions in text (longest-first)
+            for slang in _SLANG_SORTED_KEYS:
+                if slang in raw:
+                    canon_en, kind_hint = PLAYER_SLANG_MAP[slang]
+                    resolved_slang.append({"slang": slang, "canonical": canon_en, "kind": kind_hint})
+                    if len(entities) >= limit:
+                        continue
+                    c_low = _fold_search_text(canon_en)
+                    if kind_hint == "unique":
+                        row = conn.execute(
+                            "SELECT data_json FROM uniques WHERE name_lower = ? LIMIT 1", (c_low,)
+                        ).fetchone()
+                        if row:
+                            obj = json.loads(row[0])
+                            ekey = ("unique", str(obj.get("name")))
+                            if ekey not in seen_keys:
+                                seen_keys.add(ekey)
+                                entities.append(_format_unique_fact_card(obj, matched_by=f"slang:{slang}"))
+                    elif kind_hint == "gem":
+                        row = conn.execute(
+                            "SELECT data_json FROM gems WHERE name_lower = ? OR display_name_lower = ? LIMIT 1",
+                            (c_low, c_low),
+                        ).fetchone()
+                        if row:
+                            obj = json.loads(row[0])
+                            ekey = ("gem", str(obj.get("name")))
+                            if ekey not in seen_keys:
+                                seen_keys.add(ekey)
+                                entities.append(_format_gem_fact_card(obj, matched_by=f"slang:{slang}"))
+
+            # 2. Scan live SQLite gem & unique names (ZH & EN word-bounded)
+            if len(entities) < limit:
+                idx = _get_ground_entity_index(conn, f"{db_path}:{pob_ver}:{data_ver}")
+                has_cjk = bool(_CJK_RE.search(raw))
+                text_zh_compact = normalize_zh_compact(raw) if has_cjk else ""
+                text_en_norm = normalize_guardrail_text(raw)
+                has_ascii = bool(re.search(r"[a-z]{3,}", text_en_norm))
+
+                matched_refs: list[tuple[str, int, str]] = []  # (kind, rowid, matched_by)
+                if has_cjk and text_zh_compact:
+                    covered_zh: list[str] = []
+                    for zh_c, kind, rid, name in idx["zh"]:
+                        if len(entities) + len(matched_refs) >= limit:
+                            break
+                        if zh_c in text_zh_compact:
+                            if any(zh_c in prev for prev in covered_zh):
+                                continue
+                            ekey = (kind, name)
+                            if ekey not in seen_keys:
+                                seen_keys.add(ekey)
+                                covered_zh.append(zh_c)
+                                matched_refs.append((kind, rid, f"zh:{zh_c}"))
+
+                if has_ascii and len(entities) + len(matched_refs) < limit:
+                    for name_l, kind, rid, name in idx["en"]:
+                        if len(entities) + len(matched_refs) >= limit:
+                            break
+                        if name_l not in text_en_norm:
+                            continue
+                        if not re.search(rf"(?<![a-z0-9_'-]){re.escape(name_l)}(?![a-z0-9_'-])", text_en_norm):
+                            continue
+                        ekey = (kind, name)
+                        if ekey not in seen_keys:
+                            seen_keys.add(ekey)
+                            matched_refs.append((kind, rid, f"en:{name_l}"))
+
+                for kind, rid, mby in matched_refs:
+                    tbl = "gems" if kind == "gem" else "uniques"
+                    row = conn.execute(f"SELECT data_json FROM {tbl} WHERE rowid = ?", (rid,)).fetchone()
+                    if not row:
+                        continue
+                    obj = json.loads(row[0])
+                    if kind == "gem":
+                        entities.append(_format_gem_fact_card(obj, matched_by=mby))
+                    else:
+                        entities.append(_format_unique_fact_card(obj, matched_by=mby))
+    finally:
+        conn.close()
+
+    elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+    env = {
+        "game": "poe1",
+        "patch": "3.30",
+        "pobVersion": pob_ver,
+        "dataVersion": data_ver,
+    }
+
+    # Build concise, high-signal Markdown block for direct pre-turn prompt injection
+    ctx_lines = [f"[Env: PoE1 3.30 | PoB {pob_ver} | Data {data_ver}]"]
+    for w in traps["warnings"]:
+        ctx_lines.append(f"- {w['tag']} `{w['trigger']}`: {w['message']}")
+    if resolved_slang:
+        slang_bits = ", ".join(f"{s['slang']}={s['canonical']}" for s in resolved_slang[:6])
+        ctx_lines.append(f"- Slang: {slang_bits}")
+    for ent in entities:
+        zh_p = f" ({ent['zhName']})" if ent.get("zhName") else ""
+        if ent["kind"] == "gem":
+            bits = []
+            if ent.get("isSupport"):
+                bits.append("Support")
+            if ent.get("castTime") is not None:
+                bits.append(f"Cast={ent['castTime']}s")
+            if ent.get("tags"):
+                bits.append(f"Tags={ent['tags']}")
+            st_items = list((ent.get("lv20Stats") or {}).items())[:4]
+            if st_items:
+                bits.append("Lv20: " + ", ".join(f"{k}={v}" for k, v in st_items))
+            ctx_lines.append(f"- [Gem] {ent['name']}{zh_p}: " + " | ".join(bits))
+        else:
+            mods_preview = "; ".join((ent.get("explicits") or [])[:4])
+            ctx_lines.append(
+                f"- [Unique] {ent['name']}{zh_p} ({ent.get('baseType') or '-'}): {mods_preview}"
+            )
+
+    return {
+        "env": env,
+        "query": raw,
+        "entities": entities,
+        "resolvedSlang": resolved_slang,
+        "poe2Traps": traps["poe2Traps"],
+        "patchTraps": traps["patchTraps"],
+        "falseFriends": traps["falseFriends"],
+        "warnings": traps["warnings"],
+        "hasAlerts": bool(traps["warnings"]),
+        "contextBlock": "\n".join(ctx_lines),
+        "elapsedMs": elapsed_ms,
+    }
+
+
+SKILL_GEM_QUALITY_SCOPE_RULE = (
+    '"+X% to Quality of all Skill Gems" (所有主动技能石品质，如 Ashes of the Stars / 3.30 柳条人肢体) '
+    "applies ONLY to Active Skill Gems (`grants_active_skill`), NOT Support Gems (e.g. Archmage / Spell Echo)! "
+    'Only "+X% to Quality of Socketed [Support] Gems" (e.g. Foulborn Skin of the Loyal/Lords, Crest of Desire, Enhance Support) '
+    "applies to Support Gems."
+)
+
+_QUALITY_STAT_ZH_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "projectile": ("投射物", "箭矢", "飞弹", "弹幕"),
+    "chain": ("连锁", "弹射", "链"),
+    "split": ("分裂",),
+    "pierce": ("穿透",),
+    "fork": ("分叉",),
+    "final": ("更多", "独立乘区", "more"),
+    "more": ("更多", "独立乘区", "final"),
+    "cooldown": ("冷却", "cdr"),
+    "minion": ("召唤", "召唤物", "魔像", "僵尸", "骷髅", "灵体"),
+    "totem": ("图腾",),
+    "stage": ("阶段", "层数", "叠层", "脉冲", "爆发"),
+    "pulse": ("脉冲", "冲击", "波"),
+    "beam": ("光束", "射线"),
+    "wall": ("墙", "冰墙"),
+    "repeat": ("重复", "回响", "次数"),
+    "additional": ("额外", "数量", "上限"),
+    "maximum": ("上限", "最大"),
+    "double_damage": ("双倍", "双倍伤害"),
+    "critical": ("暴击", "暴伤"),
+    "penetration": ("元素穿透", "抗性穿透"),
+    "area": ("范围", "aoe"),
+    "speed": ("攻速", "施法速度", "速度"),
+    "brand": ("烙印",),
+    "mine": ("地雷",),
+    "trap": ("陷阱",),
+    "corpse": ("灵柩", "尸体"),
+    "wither": ("凋零",),
+    "bleeding": ("流血",),
+    "poison": ("中毒",),
+    "ignite": ("点燃",),
+    "shock": ("感电",),
+    "reservation": ("保留",),
+    "aura": ("光环",),
+    "curse": ("诅咒",),
+    "quality": ("品质",),
+}
+
+_INTEGER_STEP_STAT_TOKENS: tuple[str, ...] = (
+    "projectile",
+    "number_of_chains",
+    "chain_count",
+    "chains_+",
+    "split",
+    "pierce",
+    "fork",
+    "additional_",
+    "maximum_number",
+    "max_number",
+    "maximum_stages",
+    "max_stages",
+    "stage_count",
+    "stages_+",
+    "repeat",
+    "pulse",
+    "burst",
+    "beam",
+    "target",
+    "wall",
+    "totem",
+    "minion",
+    "golem",
+    "zombie",
+    "skeleton",
+    "spectre",
+    "sentinel",
+    "spider",
+    "storm",
+    "geyser",
+    "spire",
+    "brand",
+    "seal",
+    "orb",
+    "arrow",
+    "bolt",
+    "blade",
+    "wave",
+    "shard",
+    "strike",
+    "corpse",
+    "limit",
+    "count",
+    "clone",
+    "mirror",
+    "trap",
+    "mine",
+    "charge",
+    "link",
+    "bounce",
+    "explosion",
+    "impact",
+    "arc",
+    "radius",
+    "metres",
+)
+
+_INTEGER_STEP_EXCLUDE_TOKENS: tuple[str, ...] = (
+    "chance_%",
+    "%_chance",
+    "damage_+%",
+    "speed_+%",
+    "duration_+%",
+    "radius_+%",
+    "area_of_effect_+%",
+    "effect_+%",
+    "cost_+%",
+    "life_+%",
+    "multiplier",
+    "effectiveness",
+    "accuracy",
+    "critical_strike",
+    "threshold",
+    "distance",
+    "range",
+    "velocity",
+    "delay",
+)
+
+_HIGH_VALUE_QUALITY_TOKENS: tuple[str, ...] = (
+    "cooldown_speed",
+    "cooldown_recovery",
+    "double_damage",
+    "triple_damage",
+    "penetration",
+    "base_critical_strike_chance",
+    "wither",
+    "impale",
+    "aura_effect",
+    "curse_effect",
+    "mana_reservation",
+    "action_speed",
+    "elusive",
+    "fortify",
+    "exposure",
+    "culling",
+    "trigger",
+)
+
+
+def _humanize_quality_stat(stat_key: str, per_q: float) -> str:
+    """Turn PoB internal gem quality stat keys into readable EN/ZH descriptions."""
+    s = str(stat_key or "").strip()
+    low = s.lower()
+    is_final = "_+%_final" in low or low.endswith("_final")
+    is_pct = "+%" in low or "_%_" in low or low.endswith("_%")
+    cleaned = (
+        low.replace("_+%_final", "")
+        .replace("_final", "")
+        .replace("_+%", "")
+        .replace("_+", "")
+        .replace("active_skill_", "")
+        .replace("support_", "")
+        .replace("base_", "")
+        .replace("_", " ")
+        .strip()
+    )
+    val20 = round(per_q * 20, 3)
+    val40 = round(per_q * 40, 3)
+    sign = "+" if per_q >= 0 else ""
+
+    def _fmt_v(v: float) -> str:
+        return str(int(v)) if float(v).is_integer() else f"{v:g}"
+
+    if is_final:
+        return f"{sign}{_fmt_v(val20)}% -> {sign}{_fmt_v(val40)}% more {cleaned} (独立乘区)"
+    if is_pct:
+        return f"{sign}{_fmt_v(val20)}% -> {sign}{_fmt_v(val40)}% {cleaned}"
+    return f"{sign}{_fmt_v(val20)} -> {sign}{_fmt_v(val40)} {cleaned}"
+
+
+def _enrich_gem_quality_stats(results: list[dict[str, Any]], kind_norm: str) -> None:
+    """Attach `at_40_quality` and human-readable `label` to every gem's `quality_stats` without schema migration."""
+    if kind_norm != "gem":
+        return
+    for r in results:
+        if not isinstance(r, dict):
+            continue
+        q_list = r.get("quality_stats")
+        if not isinstance(q_list, list):
+            continue
+        cleaned_q: list[dict[str, Any]] = []
+        for q in q_list:
+            if not isinstance(q, dict):
+                continue
+            st_low = str(q.get("stat") or "").strip().lower()
+            if st_low.startswith("quality_display_"):
+                continue
+            per_q = q.get("per_quality")
+            if isinstance(per_q, (int, float)):
+                q["at_40_quality"] = round(float(per_q) * 40, 4)
+                if not q.get("label"):
+                    q["label"] = _humanize_quality_stat(str(q.get("stat") or ""), float(per_q))
+            cleaned_q.append(q)
+        r["quality_stats"] = cleaned_q
+
+
+def _classify_quality_stat(stat_key: str, per_q: float) -> tuple[str, int, str]:
+    """Classify a quality stat into `(category, priority_score, breakpoint_note)` for 20% -> 40%+ analysis."""
+    import math
+
+    low = str(stat_key or "").lower()
+    if low.startswith("quality_display_"):
+        return ("other", 0, "")
+    abs_pq = abs(float(per_q))
+    if abs_pq <= 0:
+        return ("other", 0, "")
+
+    at20_raw = abs_pq * 20.0
+    at40_raw = abs_pq * 40.0
+
+    # 1. Integer-step mechanic breakpoints (e.g. +0.05 projectiles/qual -> +1@20%, +2@40%; +0.1 chains -> +2@20%, +4@40%)
+    is_step_candidate = (
+        abs_pq <= 0.5
+        and "+%" not in low
+        and "_%_" not in low
+        and not low.endswith("_%")
+        and "_final" not in low
+        and not any(ex in low for ex in _INTEGER_STEP_EXCLUDE_TOKENS)
+        and any(tok in low for tok in _INTEGER_STEP_STAT_TOKENS)
+    )
+    if is_step_candidate:
+        int20 = int(math.floor(at20_raw + 1e-9))
+        int40 = int(math.floor(at40_raw + 1e-9))
+        if int40 > int20:
+            step_q = round(1.0 / abs_pq, 1)
+            step_str = str(int(step_q)) if float(step_q).is_integer() else f"{step_q:g}"
+            core_bonus = 30 if any(k in low for k in ("number_of_projectiles", "number_of_chains", "projectile_number_to_split", "maximum_number_of_stages")) else (
+                20 if any(k in low for k in ("projectile", "chain", "split", "additional_", "maximum_number", "repeat", "stage", "pulse", "beam", "totem", "minion", "brand", "seal", "bounce", "wall")) else 10
+            )
+            return (
+                "integer_step",
+                100 + core_bonus + min(20, (int40 - int20) * 5),
+                f"+1 per {step_str}% qual (@20%={int20}, @40%={int40})",
+            )
+
+    # 2. Independent `more` (`_final`) multiplier scaling
+    if "_+%_final" in low or low.endswith("_final"):
+        delta = round(at40_raw - at20_raw, 2)
+        if delta >= 4.0:
+            bonus = 20 if "damage" in low or "speed" in low or "explosion" in low else 8
+            return (
+                "more_multiplier",
+                85 + bonus + min(25, int(delta // 5)),
+                f"more multiplier: {at20_raw:g}% (@20%) -> {at40_raw:g}% (@40%) [+{delta:g}%]",
+            )
+
+    # 3. High-value non-generic scaling (CDR, double damage, penetration, aura/curse effect, base crit, wither)
+    if any(tok in low for tok in _HIGH_VALUE_QUALITY_TOKENS):
+        delta = round(at40_raw - at20_raw, 2)
+        return (
+            "high_value",
+            60 + min(20, int(delta // 2)),
+            f"@20%={at20_raw:g} -> @40%={at40_raw:g}",
+        )
+
+    return ("standard", 10, f"@20%={at20_raw:g} -> @40%={at40_raw:g}")
+
+
+def query_gem_quality_breakpoints(
+    search_quality: str | None = None,
+    *,
+    active_only: bool = False,
+    limit: int = 30,
+    pob_dir: Path | None = None,
+    runtime_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Scan local 3.30 SQLite gems (<30ms) for 20% -> 40%+ quality breakpoints or quality-stat search."""
+    from .guardrails import GuardrailScope, check_input
+
+    t0 = time.perf_counter()
+    q_clean = str(search_quality or "").strip()
+    warnings = check_input(q_clean, scope=GuardrailScope.DATA_QUERY, expected_game="poe1") if q_clean else []
+    q_low = _fold_search_text(q_clean)
+    limit = max(1, int(limit))
+
+    # Expand bilingual search terms for `--search-quality`
+    search_terms: list[str] = []
+    if q_low:
+        search_terms.append(q_low)
+        for en_tok, zh_list in _QUALITY_STAT_ZH_KEYWORDS.items():
+            if q_low == en_tok or en_tok in q_low or any(z in q_low or q_low in z for z in zh_list):
+                if en_tok not in search_terms:
+                    search_terms.append(en_tok)
+                for z in zh_list:
+                    if z not in search_terms:
+                        search_terms.append(z)
+
+    db_path = ensure_gamedata_index(pob_dir=pob_dir, runtime_dir=runtime_dir)
+    conn = sqlite3.connect(_sqlite_ro_uri(db_path), uri=True)
+    try:
+        meta = dict(conn.execute("SELECT key, value FROM meta").fetchall())
+        where_clauses = ["is_item_skill = 0"]
+        if active_only:
+            where_clauses.append("is_support = 0")
+        sql = f"SELECT name, name_lower, zh_name, is_support, is_vaal, is_transfigured, is_imbued, color, tag_string, data_json FROM gems WHERE {' AND '.join(where_clauses)}"
+        rows = conn.execute(sql).fetchall()
+
+        matches: list[tuple[tuple[int, int, int, str], dict[str, Any]]] = []
+        for name, name_l, zh_name, is_sup, is_vaal, is_trans, is_imbued, color, tag_str, dj in rows:
+            if name_l in _REMOVED_LEGACY_GEM_NAMES_LOWER:
+                continue
+            obj = json.loads(dj)
+            q_stats = obj.get("quality_stats") or []
+            if not q_stats:
+                continue
+
+            best_score = -1
+            matched_q: list[dict[str, Any]] = []
+            for q in q_stats:
+                st = str(q.get("stat") or "")
+                pq = q.get("per_quality")
+                if not st or not isinstance(pq, (int, float)) or float(pq) == 0.0:
+                    continue
+                pq_f = float(pq)
+                at20 = round(pq_f * 20, 4)
+                at40 = round(pq_f * 40, 4)
+                label = _humanize_quality_stat(st, pq_f)
+                cat, score, bp_note = _classify_quality_stat(st, pq_f)
+
+                if search_terms:
+                    hay = _fold_search_text(f"{name} {zh_name or ''} {st} {label} {bp_note}")
+                    if not any(t in hay for t in search_terms):
+                        continue
+                else:
+                    # Breakpoints mode: only surface meaningful integer-step, independent more, or high-value scaling
+                    if cat not in ("integer_step", "more_multiplier", "high_value"):
+                        continue
+
+                if score > best_score:
+                    best_score = score
+                matched_q.append(
+                    {
+                        "stat": st,
+                        "label": label,
+                        "category": cat,
+                        "perQuality": pq_f,
+                        "at20": at20,
+                        "at40": at40,
+                        "breakpointNote": bp_note,
+                    }
+                )
+
+            if not matched_q:
+                continue
+
+            # Prefer non-Vaal base/transfigured gems slightly ahead of Vaal duplicates with identical quality stat
+            dup_penalty = 1 if is_vaal else 0
+            # Sort matched_q so highest-scoring quality stat is first
+            matched_q.sort(key=lambda item: (-_classify_quality_stat(item["stat"], item["perQuality"])[1], item["stat"]))
+            top_cat = matched_q[0]["category"]
+            sort_key = (-best_score, dup_penalty, int(is_sup), name_l)
+            matches.append(
+                (
+                    sort_key,
+                    {
+                        "name": obj.get("display_name") or name,
+                        "zhName": zh_name,
+                        "isSupport": bool(is_sup),
+                        "isTransfigured": bool(is_trans),
+                        "isVaal": bool(is_vaal),
+                        "color": color,
+                        "tags": tag_str,
+                        "topCategory": top_cat,
+                        "score": best_score,
+                        "qualityStats": matched_q,
+                    },
+                )
+            )
+
+        matches.sort(key=lambda item: item[0])
+        if not search_terms and limit >= 6:
+            # Stratify overview breakpoints across integer_step / more_multiplier / high_value
+            # so iconic independent `more` multipliers (e.g. Zenith, Glacial Cascade, Lacerate,
+            # Viper Strike of the Mamba, Blade Flurry, Flame Surge) and CDR/high-value scaling
+            # (e.g. Summon Holy Relic of Conviction) aren't drowned out by 150+ integer_step gems.
+            by_cat: dict[str, list[dict[str, Any]]] = {
+                "integer_step": [],
+                "more_multiplier": [],
+                "high_value": [],
+            }
+            for _, item in matches:
+                cat_k = item.get("topCategory")
+                if cat_k in by_cat:
+                    by_cat[cat_k].append(item)
+            q_int = max(2, int(round(limit * 0.45)))
+            q_more = max(2, int(round(limit * 0.40)))
+            q_hv = max(1, limit - q_int - q_more)
+            chosen: list[dict[str, Any]] = []
+            picked_names: set[str] = set()
+            for cat_k, quota in (("integer_step", q_int), ("more_multiplier", q_more), ("high_value", q_hv)):
+                for it in by_cat[cat_k][:quota]:
+                    if it["name"] not in picked_names:
+                        chosen.append(it)
+                        picked_names.add(it["name"])
+            if len(chosen) < limit:
+                for _, it in matches:
+                    if it["name"] not in picked_names:
+                        chosen.append(it)
+                        picked_names.add(it["name"])
+                        if len(chosen) >= limit:
+                            break
+            top_results = chosen[:limit]
+        else:
+            top_results = [item[1] for item in matches[:limit]]
+    finally:
+        conn.close()
+
+    elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+    out: dict[str, Any] = {
+        "kind": "gem_quality",
+        "mode": "search_quality" if q_clean else "quality_breakpoints",
+        "query": q_clean or None,
+        "activeOnly": bool(active_only),
+        "pobVersion": meta.get("pob_version", "unknown"),
+        "dataVersion": meta.get("data_version", "unknown"),
+        "qualityRule": SKILL_GEM_QUALITY_SCOPE_RULE,
+        "totalMatched": len(matches),
+        "count": len(top_results),
+        "elapsedMs": elapsed_ms,
+        "results": top_results,
+    }
+    if warnings:
+        out["warnings"] = [w.to_dict() for w in warnings]
+    return out
+
+
+def _annotate_legacy_gem_rows(results: list[dict[str, Any]], kind_norm: str) -> None:
+    """Explicitly tag retained legacy-only PoB `Gems.lua` rows (e.g. Divine Blessing) so weak models never misread them as active 3.30 gems."""
+    if kind_norm != "gem":
+        return
+    _enrich_gem_quality_stats(results, kind_norm)
+    for r in results:
+        if not isinstance(r, dict):
+            continue
+        nm_low = str(r.get("name") or "").strip().lower()
+        disp_low = str(r.get("display_name") or "").strip().lower()
+        if nm_low in _REMOVED_LEGACY_GEM_NAMES_LOWER or disp_low in _REMOVED_LEGACY_GEM_NAMES_LOWER:
+            r["legacyOnly"] = True
+            r["removedInPatch"] = "3.25"
+            r["legacyNote"] = (
+                "REMOVED in 3.25 (retained in PoB Gems.lua solely for importing pre-3.25 Standard characters; "
+                "drop-disabled & unobtainable in 3.25+ leagues)."
+            )
+
+
 def query_local_data(
     kind: str,
-    query: str,
+    query: str = "",
     *,
     pob_dir: Path | None = None,
     runtime_dir: Path | None = None,
     slot: str | None = None,
     ilvl: int | None = None,
+    mod_filter: str | None = None,
     limit: int = 25,
 ) -> dict[str, Any]:
     """Query local PoB game data (`gem`, `unique`, `mod`, `base`, `translate`) via SQLite index."""
+    from .guardrails import GuardrailScope, check_input, validate_url
+
     kind_norm = kind.strip().lower()
     if kind_norm not in ("gem", "unique", "mod", "base", "translate"):
         raise ValueError(
             f"Unsupported kind {kind!r}; expected one of: gem, unique, mod, base, translate."
         )
 
+    q_clean = str(query or "").strip()
+    mod_clean = str(mod_filter or "").strip() or None
+    if mod_clean and kind_norm != "unique":
+        raise ValueError("--mod filter is only supported for kind='unique'.")
+    if q_clean:
+        validate_url(q_clean, expected_game="poe1", cli_subcommand=f"data {kind_norm}")
+    warnings = check_input(q_clean, scope=_guardrail_scope_for_kind(kind_norm), expected_game="poe1") if q_clean else []
+    if mod_clean:
+        warnings.extend(check_input(mod_clean, scope=GuardrailScope.STAT_QUERY, expected_game="poe1"))
+    if slot:
+        check_input(slot, scope=GuardrailScope.SLOT, expected_game="poe1")
+
     db_path = ensure_gamedata_index(pob_dir=pob_dir, runtime_dir=runtime_dir)
     limit = max(0, int(limit))
-    q_clean = query.strip()
     q_lower = _fold_search_text(q_clean)
+
+    resolved_alias: dict[str, str] | None = None
+    suggestions: list[dict[str, Any]] | None = None
+    hint: str | None = None
 
     conn = sqlite3.connect(_sqlite_ro_uri(db_path), uri=True)
     try:
@@ -3366,20 +4639,72 @@ def query_local_data(
             ilvl=ilvl,
             limit=limit,
             zh_available=zh_available,
+            mod_filter=mod_clean,
         )
+        needs_slang = (not results) or (
+            kind_norm == "translate" and not any(r.get("match_type") == "exact" for r in results)
+        )
+        if needs_slang and limit > 0 and q_clean:
+            slang_hit = resolve_player_slang(q_clean)
+            if slang_hit is not None:
+                canon_en, _ = slang_hit
+                slang_res = _dispatch_query(
+                    conn,
+                    kind_norm,
+                    _fold_search_text(canon_en),
+                    slot=slot,
+                    ilvl=ilvl,
+                    limit=limit,
+                    zh_available=zh_available,
+                    mod_filter=mod_clean,
+                )
+                if slang_res:
+                    results = slang_res
+                    resolved_alias = {"from": q_clean, "to": canon_en}
+            if not results and not mod_clean:
+                suggestions = _suggest_similar(conn, kind_norm, q_lower, limit=5, zh_available=zh_available)
+                hint = _build_zero_result_hint(kind_norm, q_clean, suggestions)
+        elif not results and mod_clean and limit > 0:
+            # Try player slang expansion on mod_filter if direct match returned 0
+            slang_mod = resolve_player_slang(mod_clean)
+            if slang_mod is not None:
+                canon_mod, _ = slang_mod
+                slang_res = _dispatch_query(
+                    conn,
+                    kind_norm,
+                    q_lower,
+                    slot=slot,
+                    ilvl=ilvl,
+                    limit=limit,
+                    zh_available=zh_available,
+                    mod_filter=canon_mod,
+                )
+                if slang_res:
+                    results = slang_res
+                    resolved_alias = {"from": mod_clean, "to": canon_mod}
+        _annotate_legacy_gem_rows(results, kind_norm)
     finally:
         conn.close()
 
-    return {
+    out: dict[str, Any] = {
         "kind": kind_norm,
         "query": q_clean,
-        "filters": {"slot": slot, "ilvl": ilvl, "limit": limit},
+        "filters": {"slot": slot, "ilvl": ilvl, "mod": mod_clean, "limit": limit},
         "pobVersion": meta.get("pob_version", "unknown"),
         "dataVersion": meta.get("data_version", "unknown"),
         "zhAvailable": zh_available,
         "count": len(results),
         "results": results,
     }
+    if resolved_alias is not None:
+        out["resolvedAlias"] = resolved_alias
+    if suggestions is not None:
+        out["suggestions"] = suggestions
+    if hint is not None:
+        out["hint"] = hint
+    if warnings:
+        out["warnings"] = [w.to_dict() for w in warnings]
+    return out
 
 
 def query_multi(
@@ -3391,6 +4716,7 @@ def query_multi(
     runtime_dir: Path | None = None,
     slot: str | None = None,
     ilvl: int | None = None,
+    mod_filter: str | None = None,
     limit: int = 25,
 ) -> dict[str, Any]:
     """Run multiple local game-data queries in one SQLite connection for variadic `pob data`."""
@@ -3405,6 +4731,19 @@ def query_multi(
     )
     if not clean_queries:
         raise ValueError("queries must contain at least one non-empty query string.")
+
+    from .guardrails import GuardrailScope, check_input, validate_url
+
+    q_scope = _guardrail_scope_for_kind(kind_norm)
+    if slot:
+        check_input(slot, scope=GuardrailScope.SLOT, expected_game="poe1")
+    mod_clean = str(mod_filter or "").strip() or None
+    warnings_by_query: dict[str, list[dict[str, Any]]] = {}
+    for q_clean in clean_queries:
+        validate_url(q_clean, expected_game="poe1", cli_subcommand=f"data {kind_norm}")
+        ws = check_input(q_clean, scope=q_scope, expected_game="poe1")
+        if ws:
+            warnings_by_query[q_clean] = [w.to_dict() for w in ws]
 
     limit = max(0, int(limit))
     own_conn = False
@@ -3431,28 +4770,793 @@ def query_multi(
                 ilvl=ilvl,
                 limit=limit,
                 zh_available=zh_available,
+                mod_filter=mod_clean,
             )
-            results_by_query[q_clean] = {
+            resolved_alias: dict[str, str] | None = None
+            suggestions: list[dict[str, Any]] | None = None
+            hint: str | None = None
+            needs_slang_m = (not res) or (
+                kind_norm == "translate" and not any(r.get("match_type") == "exact" for r in res)
+            )
+            if needs_slang_m and limit > 0 and q_clean:
+                slang_hit = resolve_player_slang(q_clean)
+                if slang_hit is not None:
+                    canon_en, _ = slang_hit
+                    slang_res = _dispatch_query(
+                        conn,
+                        kind_norm,
+                        _fold_search_text(canon_en),
+                        slot=slot,
+                        ilvl=ilvl,
+                        limit=limit,
+                        zh_available=zh_available,
+                        mod_filter=mod_clean,
+                    )
+                    if slang_res:
+                        res = slang_res
+                        resolved_alias = {"from": q_clean, "to": canon_en}
+                if not res and not mod_clean:
+                    suggestions = _suggest_similar(conn, kind_norm, q_folded, limit=5, zh_available=zh_available)
+                    hint = _build_zero_result_hint(kind_norm, q_clean, suggestions)
+            _annotate_legacy_gem_rows(res, kind_norm)
+            entry: dict[str, Any] = {
                 "kind": kind_norm,
                 "query": q_clean,
-                "filters": {"slot": slot, "ilvl": ilvl, "limit": limit},
+                "filters": {"slot": slot, "ilvl": ilvl, "mod": mod_clean, "limit": limit},
                 "pobVersion": pob_ver,
                 "dataVersion": data_ver,
                 "zhAvailable": zh_available,
                 "count": len(res),
                 "results": res,
             }
+            if resolved_alias is not None:
+                entry["resolvedAlias"] = resolved_alias
+            if suggestions is not None:
+                entry["suggestions"] = suggestions
+            if hint is not None:
+                entry["hint"] = hint
+            if q_clean in warnings_by_query:
+                entry["warnings"] = warnings_by_query[q_clean]
+            results_by_query[q_clean] = entry
     finally:
         if own_conn:
             conn.close()
 
-    return {
+    out_multi: dict[str, Any] = {
         "kind": kind_norm,
         "queries": clean_queries,
-        "filters": {"slot": slot, "ilvl": ilvl, "limit": limit},
+        "filters": {"slot": slot, "ilvl": ilvl, "mod": mod_clean, "limit": limit},
         "pobVersion": pob_ver,
         "dataVersion": data_ver,
         "zhAvailable": zh_available,
         "count": sum(sub["count"] for sub in results_by_query.values()),
         "results": results_by_query,
     }
+    dedup_warns: list[dict[str, Any]] = []
+    seen_warn_keys: set[tuple[str, str]] = set()
+    for ws in warnings_by_query.values():
+        for w in ws:
+            wkey = (str(w.get("ruleId") or ""), str(w.get("trigger") or ""))
+            if wkey not in seen_warn_keys:
+                seen_warn_keys.add(wkey)
+                dedup_warns.append(w)
+    if dedup_warns:
+        out_multi["warnings"] = dedup_warns
+    return out_multi
+
+
+# ---------------------------------------------------------------------------
+# 0ms Daemon-Free Passive Tree Index (`pob data tree`) & Tick Calculator (`pob data tick`)
+# ---------------------------------------------------------------------------
+
+TREE_SCHEMA_VERSION = 4
+_TREE_INDEX_LOCK = threading.RLock()
+_VALID_TREE_INDEX_CACHE: set[tuple[str, str, str]] = set()
+
+_TREE_NODE_BLOCK_RE = re.compile(r"\n\t\t\[(\d+)\]\s*=\s*\{([\s\S]*?)\n\t\t\},")
+_TREE_QUOTED_FIELD_RE = re.compile(r'\["(name|ascendancyName)"\]\s*=\s*"((?:\\[\s\S]|[^"\\])*)"')
+_TREE_BOOL_FIELD_RE = re.compile(
+    r'\["(isKeystone|isNotable|isMastery|isJewelSocket|isBloodline|isMultipleChoiceOption|isProxy|isAscendancyStart)"\]\s*=\s*true'
+)
+_TREE_STATS_BLOCK_RE = re.compile(r'\["stats"\]\s*=\s*\{([\s\S]*?)\n\t\t\t\},')
+_TREE_REMINDER_BLOCK_RE = re.compile(r'\["reminderText"\]\s*=\s*\{([\s\S]*?)\n\t\t\t\},')
+_TREE_MASTERY_BLOCK_RE = re.compile(r'\["masteryEffects"\]\s*=\s*\{([\s\S]*?)\n\t\t\t\},')
+_TREE_MASTERY_ITEM_RE = re.compile(
+    r'\["effect"\]\s*=\s*(\d+),[\s\S]*?\["stats"\]\s*=\s*\{([\s\S]*?)\n\t\t\t\t\t\},'
+)
+_TREE_LUA_STR_RE = re.compile(r'"((?:\\[\s\S]|[^"\\])*)"')
+_TREE_ASC_ID_NAME_RE = re.compile(r'\["id"\]\s*=\s*"([^"]+)"\s*,\s*\["name"\]\s*=\s*"([^"]+)"')
+
+
+def _find_latest_tree_lua(poe1_dir: Path) -> tuple[str, Path]:
+    tree_root = poe1_dir / "TreeData"
+    if not tree_root.is_dir():
+        raise FileNotFoundError(f"PoE1/TreeData directory not found under {poe1_dir}")
+    candidates: list[tuple[tuple[int, int, int, str], str, Path]] = []
+    for sub in tree_root.iterdir():
+        if not sub.is_dir():
+            continue
+        lua_p = sub / "tree.lua"
+        if not lua_p.is_file():
+            continue
+        m = re.match(r"^(\d+)_(\d+)(.*)$", sub.name)
+        if m:
+            is_standard = 1 if not m.group(3) else 0
+            ver_key = (int(m.group(1)), int(m.group(2)), is_standard, sub.name)
+        else:
+            ver_key = (0, 0, 0, sub.name)
+        candidates.append((ver_key, sub.name, lua_p))
+    if not candidates:
+        raise FileNotFoundError(f"No tree.lua found under {tree_root}")
+    candidates.sort(key=lambda x: x[0])
+    _, ver_name, best_path = candidates[-1]
+    return ver_name, best_path
+
+
+def _extract_top_lua_section(txt: str, key: str) -> str | None:
+    marker = f'\n\t["{key}"] = {{'
+    start = txt.find(marker)
+    if start < 0:
+        return None
+    end = txt.find("\n\t},", start)
+    if end < 0:
+        end = txt.find("\n\t}", start)
+    if end < 0:
+        return None
+    return txt[start + len(marker) - 1 : end + 3]
+
+
+def _unescape_tree_str(raw_inner: str) -> list[str]:
+    """Unescape a Lua double-quoted string from tree.lua (splitting multiline `\\\\\\n` stats)."""
+    s = raw_inner.replace("\\\r\n", "\n").replace("\\\n", "\n").replace('\\"', '"').replace("\\\\", "\\")
+    return [part.strip() for part in s.splitlines() if part.strip()]
+
+
+def _load_tree_zh_maps(zh_dir: Path | None) -> tuple[dict[str, str], dict[str, str]]:
+    """Load EN->ZH maps for passive node/ascendancy names (`tree_dn.json`) and stats (`tree_sd.json` + S30)."""
+    dn_map: dict[str, str] = {}
+    sd_map: dict[str, str] = {}
+    if zh_dir is None or not zh_dir.is_dir():
+        return dn_map, sd_map
+    for fn in ("tree_dn.json", "Z-S25.json", "Z-S26.json", "Z-S27.json", "Z-S28.json", "Z-S29.json", "Z-S30.json", "Z-S30-Pearl_of_Tsoatha-Passive_Tree.json"):
+        p = zh_dir / fn
+        if not p.is_file():
+            continue
+        try:
+            entries = json.loads(p.read_text(encoding="utf-8")).get("entries")
+        except Exception:
+            continue
+        if not isinstance(entries, dict):
+            continue
+        for k, v in entries.items():
+            if isinstance(k, str) and isinstance(v, str) and k.strip() and v.strip():
+                dn_map[k.strip()] = v.strip()
+                if fn != "tree_dn.json":
+                    sd_map[k.strip().lower()] = v.strip()
+    sd_path = zh_dir / "tree_sd.json"
+    if sd_path.is_file():
+        try:
+            entries = json.loads(sd_path.read_text(encoding="utf-8")).get("entries")
+            if isinstance(entries, dict):
+                for k, v in entries.items():
+                    if isinstance(k, str) and isinstance(v, str) and k.strip() and v.strip():
+                        kl = k.strip().lower()
+                        if kl not in sd_map:
+                            sd_map[kl] = v.strip()
+        except Exception:
+            pass
+    return dn_map, sd_map
+
+
+def _parse_tree_lua_nodes(tree_lua_path: Path, zh_dir: Path | None) -> list[dict[str, Any]]:
+    txt = tree_lua_path.read_text(encoding="utf-8", errors="ignore")
+    dn_map, sd_map = _load_tree_zh_maps(zh_dir)
+
+    # 1. Build ascendancy ID -> (display_name, class_name, is_alternate_asc, is_bloodline)
+    #    Critical: in 3.25-3.30 tree.lua, Ranger's Warden keeps internal id="Raider",
+    #    while Affliction 3.23 legacy alternate_ascendancies has id="Warden", name="Warden of the Maji"!
+    asc_meta: dict[str, tuple[str, str, bool, bool]] = {}
+    cls_sec = _extract_top_lua_section(txt, "classes")
+    if cls_sec:
+        for aid, aname in _TREE_ASC_ID_NAME_RE.findall(cls_sec):
+            aid_s = aid.strip()
+            aname_s = aname.strip() or aid_s
+            if aid_s:
+                asc_meta[aid_s] = (aname_s, "", False, False)
+
+    alt_sec = _extract_top_lua_section(txt, "alternate_ascendancies")
+    if alt_sec:
+        for aid, aname in _TREE_ASC_ID_NAME_RE.findall(alt_sec):
+            aid_s = aid.strip()
+            aname_s = aname.strip() or aid_s
+            if aid_s and aid_s not in asc_meta:
+                is_bl = "bloodline" in aname_s.lower()
+                asc_meta[aid_s] = (aname_s, "", not is_bl, is_bl)
+
+    nodes_sec = _extract_top_lua_section(txt, "nodes")
+    if not nodes_sec:
+        return []
+
+    records: list[dict[str, Any]] = []
+    for m in _TREE_NODE_BLOCK_RE.finditer(nodes_sec):
+        nid = int(m.group(1))
+        body = m.group(2)
+        flags = set(_TREE_BOOL_FIELD_RE.findall(body))
+        if "isProxy" in flags or "isAscendancyStart" in flags or '["classStartIndex"]' in body:
+            continue
+
+        fields = dict(_TREE_QUOTED_FIELD_RE.findall(body))
+        raw_name = fields.get("name", "")
+        name_parts = _unescape_tree_str(raw_name)
+        name = name_parts[0] if name_parts else ""
+        if not name:
+            continue
+
+        raw_asc_id = fields.get("ascendancyName", "").strip()
+        stats: list[str] = []
+        m_st = _TREE_STATS_BLOCK_RE.search(body)
+        if m_st:
+            for sm in _TREE_LUA_STR_RE.finditer(m_st.group(1)):
+                stats.extend(_unescape_tree_str(sm.group(1)))
+
+        mastery_effects: list[dict[str, Any]] = []
+        if "isMastery" in flags:
+            m_me = _TREE_MASTERY_BLOCK_RE.search(body)
+            if m_me:
+                for em in _TREE_MASTERY_ITEM_RE.finditer(m_me.group(1)):
+                    eid = int(em.group(1))
+                    estats: list[str] = []
+                    for sm in _TREE_LUA_STR_RE.finditer(em.group(2)):
+                        estats.extend(_unescape_tree_str(sm.group(1)))
+                    estats_zh = [sd_map.get(s.lower()) for s in estats]
+                    mastery_effects.append(
+                        {
+                            "effect": eid,
+                            "stats": estats,
+                            "statsZh": [z for z in estats_zh if z],
+                        }
+                    )
+
+        reminder: list[str] = []
+        m_rem = _TREE_REMINDER_BLOCK_RE.search(body)
+        if m_rem:
+            for rm in _TREE_LUA_STR_RE.finditer(m_rem.group(1)):
+                reminder.extend(_unescape_tree_str(rm.group(1)))
+
+        is_keystone = "isKeystone" in flags
+        is_notable = "isNotable" in flags
+        is_mastery = "isMastery" in flags
+        is_socket = "isJewelSocket" in flags
+        is_bloodline_flag = "isBloodline" in flags
+        is_multi_opt = "isMultipleChoiceOption" in flags
+
+        asc_display = ""
+        class_name = ""
+        is_alt_asc = False
+        is_bloodline = is_bloodline_flag
+        if raw_asc_id:
+            if raw_asc_id in asc_meta:
+                asc_display, class_name, is_alt_asc, meta_bl = asc_meta[raw_asc_id]
+                is_bloodline = is_bloodline or meta_bl
+            else:
+                asc_display = raw_asc_id
+
+        is_ascendancy = bool(raw_asc_id)
+        if is_keystone:
+            ntype = "Keystone"
+        elif is_mastery:
+            ntype = "Mastery"
+        elif is_socket:
+            ntype = "Socket"
+        elif is_bloodline:
+            ntype = "Bloodline"
+        elif is_ascendancy and (is_notable or is_multi_opt):
+            ntype = "Ascendancy"
+        elif is_notable:
+            ntype = "Notable"
+        else:
+            ntype = "Normal"
+
+        zh_name = dn_map.get(name)
+        asc_zh = dn_map.get(asc_display) if asc_display else None
+        stats_zh = [z for s in stats if (z := sd_map.get(s.lower()))]
+
+        records.append(
+            {
+                "id": nid,
+                "name": name,
+                "zhName": zh_name,
+                "type": ntype,
+                "ascId": raw_asc_id or None,
+                "ascName": asc_display or None,
+                "ascNameZh": asc_zh,
+                "className": class_name or None,
+                "isAscendancy": is_ascendancy,
+                "isBloodline": is_bloodline,
+                "isAlternateAsc": is_alt_asc,
+                "stats": stats,
+                "statsZh": stats_zh,
+                "masteryEffects": mastery_effects,
+                "reminderText": reminder,
+            }
+        )
+
+    # Also index Timeless / Historic Jewel Keystones & Notables from LegionPassives.lua
+    legion_path = tree_lua_path.parent.parent.parent / "Data" / "TimelessJewelData" / "LegionPassives.lua"
+    if legion_path.is_file():
+        leg_txt = legion_path.read_text(encoding="utf-8", errors="ignore")
+        leg_nodes_sec = _extract_top_lua_section(leg_txt, "nodes") or leg_txt
+        seen_leg_names: set[str] = set()
+        for m_leg in _TREE_NODE_BLOCK_RE.finditer(leg_nodes_sec):
+            leg_idx = int(m_leg.group(1))
+            lbody = m_leg.group(2)
+            is_lks = bool(re.search(r'\["ks"\]\s*=\s*true', lbody))
+            is_lnot = bool(re.search(r'\["not"\]\s*=\s*true', lbody))
+            if not (is_lks or is_lnot):
+                continue
+            m_dn = re.search(r'\["dn"\]\s*=\s*"((?:\\[\s\S]|[^"\\])*)"', lbody)
+            if not m_dn:
+                continue
+            lname_parts = _unescape_tree_str(m_dn.group(1))
+            lname = lname_parts[0] if lname_parts else ""
+            if not lname or lname.lower() in seen_leg_names:
+                continue
+            seen_leg_names.add(lname.lower())
+            lstats: list[str] = []
+            m_sd = re.search(r'\["sd"\]\s*=\s*\{([\s\S]*?)\n\t\t\t\},', lbody)
+            if m_sd:
+                for sm in _TREE_LUA_STR_RE.finditer(m_sd.group(1)):
+                    lstats.extend(_unescape_tree_str(sm.group(1)))
+            lzh_name = dn_map.get(lname)
+            lstats_zh = [z for s in lstats if (z := sd_map.get(s.lower()))]
+            records.append(
+                {
+                    "id": 900000 + leg_idx,
+                    "name": lname,
+                    "zhName": lzh_name,
+                    "type": "Keystone" if is_lks else "Notable",
+                    "ascId": "Timeless",
+                    "ascName": "Timeless Jewel",
+                    "ascNameZh": "永恒珠宝",
+                    "className": None,
+                    "isAscendancy": False,
+                    "isBloodline": False,
+                    "isAlternateAsc": False,
+                    "stats": lstats,
+                    "statsZh": lstats_zh,
+                    "masteryEffects": [],
+                    "reminderText": [],
+                }
+            )
+
+    return records
+
+
+def ensure_treedata_index(
+    *,
+    pob_dir: Path | None = None,
+    runtime_dir: Path | None = None,
+    force_rebuild: bool = False,
+) -> tuple[Path, str]:
+    """Build (if missing/stale) and return `(db_path, tree_version)` for 0ms daemon-free passive tree queries."""
+    rt_dir = resolve_runtime_dir(runtime_dir)
+    resolved_pob = resolve_pob_dir(pob_dir, rt_dir)
+    poe1_dir, zh_dir = _resolve_poe1_data_dirs(resolved_pob)
+    tree_ver, tree_lua_path = _find_latest_tree_lua(poe1_dir)
+
+    hasher = hashlib.blake2b(digest_size=4)
+    st = tree_lua_path.stat()
+    hasher.update(f"{tree_ver}:{st.st_size}:{st.st_mtime_ns};".encode("utf-8"))
+    if zh_dir is not None and zh_dir.is_dir():
+        for fn in ("tree_dn.json", "tree_sd.json", "Z-S30.json"):
+            zp = zh_dir / fn
+            if zp.is_file():
+                zst = zp.stat()
+                hasher.update(f"{fn}:{zst.st_size}:{zst.st_mtime_ns};".encode("utf-8"))
+    data_hash = hasher.hexdigest()
+
+    cache_dir = _shared_cache_dir(runtime_dir, pob_root=resolved_pob)
+    db_path = cache_dir / f"treedata_{tree_ver}_{data_hash}.sqlite"
+    cache_key = (str(db_path), tree_ver, data_hash)
+
+    def _is_tree_db_valid() -> bool:
+        if not db_path.is_file():
+            return False
+        try:
+            c = sqlite3.connect(_sqlite_ro_uri(db_path), uri=True)
+            try:
+                m = dict(c.execute("SELECT key, value FROM meta").fetchall())
+                return (
+                    m.get("schema_version") == str(TREE_SCHEMA_VERSION)
+                    and m.get("tree_version") == tree_ver
+                    and m.get("data_hash") == data_hash
+                )
+            finally:
+                c.close()
+        except sqlite3.Error:
+            return False
+
+    if not force_rebuild:
+        if cache_key in _VALID_TREE_INDEX_CACHE and db_path.is_file():
+            return db_path, tree_ver
+        if _is_tree_db_valid():
+            _VALID_TREE_INDEX_CACHE.add(cache_key)
+            return db_path, tree_ver
+    else:
+        _VALID_TREE_INDEX_CACHE.discard(cache_key)
+
+    with _TREE_INDEX_LOCK:
+        if not force_rebuild and _is_tree_db_valid():
+            _VALID_TREE_INDEX_CACHE.add(cache_key)
+            return db_path, tree_ver
+
+        nodes = _parse_tree_lua_nodes(tree_lua_path, zh_dir)
+        tmp_path = cache_dir / f".treedata_{os.getpid()}_{threading.get_ident()}_{time.time_ns()}.sqlite.tmp"
+        try:
+            conn = sqlite3.connect(str(tmp_path))
+            try:
+                conn.execute("PRAGMA page_size = 8192")
+                conn.execute("PRAGMA journal_mode = OFF")
+                conn.execute("PRAGMA synchronous = OFF")
+                conn.executescript(
+                    """
+                    CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                    CREATE TABLE tree_nodes (
+                        id INTEGER PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        name_lower TEXT NOT NULL,
+                        zh_name TEXT,
+                        zh_lower TEXT,
+                        node_type TEXT NOT NULL,
+                        asc_id_lower TEXT,
+                        asc_name_lower TEXT,
+                        asc_zh_lower TEXT,
+                        is_asc INTEGER NOT NULL,
+                        is_bloodline INTEGER NOT NULL,
+                        is_alt_asc INTEGER NOT NULL,
+                        has_stats INTEGER NOT NULL,
+                        search_text_lower TEXT NOT NULL,
+                        data_json TEXT NOT NULL
+                    );
+                    CREATE INDEX idx_tn_type ON tree_nodes(node_type);
+                    CREATE INDEX idx_tn_asc ON tree_nodes(asc_name_lower);
+                    CREATE VIRTUAL TABLE tree_nodes_fts USING fts5(
+                        search_text_lower, content='tree_nodes', content_rowid='id', tokenize='trigram'
+                    );
+                    """
+                )
+                conn.executemany(
+                    "INSERT INTO meta (key, value) VALUES (?, ?)",
+                    [
+                        ("schema_version", str(TREE_SCHEMA_VERSION)),
+                        ("tree_version", tree_ver),
+                        ("data_hash", data_hash),
+                        ("zh_available", "1" if zh_dir is not None else "0"),
+                    ],
+                )
+                rows_to_insert = []
+                for nd in nodes:
+                    me_texts = []
+                    for me in nd["masteryEffects"]:
+                        me_texts.extend(me["stats"])
+                        me_texts.extend(me["statsZh"])
+                    s_txt = _fold_search_text(
+                        " ".join(
+                            p
+                            for p in (
+                                nd["name"],
+                                nd["zhName"] or "",
+                                nd["ascName"] or "",
+                                nd["ascNameZh"] or "",
+                                nd["ascId"] or "",
+                                nd["className"] or "",
+                                " ".join(nd["stats"]),
+                                " ".join(nd["statsZh"]),
+                                " ".join(me_texts),
+                            )
+                            if p
+                        )
+                    )
+                    rows_to_insert.append(
+                        (
+                            nd["id"],
+                            nd["name"],
+                            _fold_search_text(nd["name"]),
+                            nd["zhName"],
+                            _fold_search_text(nd["zhName"]) if nd["zhName"] else None,
+                            nd["type"],
+                            _fold_search_text(nd["ascId"]) if nd["ascId"] else None,
+                            _fold_search_text(nd["ascName"]) if nd["ascName"] else None,
+                            _fold_search_text(nd["ascNameZh"]) if nd["ascNameZh"] else None,
+                            int(nd["isAscendancy"]),
+                            int(nd["isBloodline"]),
+                            int(nd["isAlternateAsc"]),
+                            int(bool(nd["stats"] or nd["masteryEffects"])),
+                            s_txt,
+                            json.dumps(nd, ensure_ascii=False, separators=(",", ":")),
+                        )
+                    )
+                conn.executemany(
+                    "INSERT INTO tree_nodes VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    rows_to_insert,
+                )
+                conn.execute("INSERT INTO tree_nodes_fts(tree_nodes_fts) VALUES('rebuild')")
+                conn.commit()
+            finally:
+                conn.close()
+            try:
+                os.replace(tmp_path, db_path)
+            except PermissionError:
+                if not _is_tree_db_valid():
+                    raise
+            _VALID_TREE_INDEX_CACHE.add(cache_key)
+            return db_path, tree_ver
+        finally:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def query_tree_data(
+    queries: list[str] | str | None = None,
+    *,
+    node_type: str | None = None,
+    asc: str | None = None,
+    limit: int = 25,
+    pob_dir: Path | None = None,
+    runtime_dir: Path | None = None,
+    force_rebuild: bool = False,
+) -> dict[str, Any]:
+    """0ms daemon-free search directly over PoB's local `TreeData/3_30/tree.lua` + ZH translation overlay."""
+    from .guardrails import GuardrailScope, check_input
+
+    t0 = time.perf_counter()
+    if isinstance(queries, str):
+        raw_queries = [queries.strip()] if queries.strip() else []
+    else:
+        raw_queries = [str(q).strip() for q in (queries or []) if str(q or "").strip()]
+
+    asc_clean = str(asc or "").strip() or None
+    type_clean = str(node_type or "").strip() or None
+    warnings: list[dict[str, Any]] = []
+    for q in raw_queries:
+        ws = check_input(q, scope=GuardrailScope.DATA_QUERY, expected_game="poe1")
+        warnings.extend(w.to_dict() for w in ws)
+    if asc_clean:
+        ws_a = check_input(asc_clean, scope=GuardrailScope.DATA_QUERY, expected_game="poe1")
+        warnings.extend(w.to_dict() for w in ws_a)
+
+    # Resolve slang aliases on queries & --asc (e.g. "聚魂" -> "Polymath", "守望者" -> "Warden", "欺诈师" -> "Trickster")
+    resolved_aliases: list[dict[str, str]] = []
+    expanded_queries: list[tuple[str, str]] = []  # (folded_primary, folded_alt_or_empty)
+    for q in raw_queries:
+        qf = _fold_search_text(q)
+        sl = resolve_player_slang(q)
+        if sl is not None:
+            resolved_aliases.append({"from": q, "to": sl[0]})
+            expanded_queries.append((qf, _fold_search_text(sl[0])))
+        else:
+            expanded_queries.append((qf, ""))
+
+    asc_folded = ""
+    asc_alt = ""
+    if asc_clean:
+        asc_folded = _fold_search_text(asc_clean)
+        sl_a = resolve_player_slang(asc_clean)
+        if sl_a is not None:
+            resolved_aliases.append({"from": asc_clean, "to": sl_a[0]})
+            asc_alt = _fold_search_text(sl_a[0])
+
+    db_path, tree_ver = ensure_treedata_index(
+        pob_dir=pob_dir, runtime_dir=runtime_dir, force_rebuild=force_rebuild
+    )
+    limit = max(1, int(limit))
+    type_low = type_clean.lower() if type_clean else ""
+
+    conn = sqlite3.connect(_sqlite_ro_uri(db_path), uri=True)
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, name_lower, zh_lower, node_type, asc_id_lower, asc_name_lower, asc_zh_lower,
+                   is_asc, is_bloodline, is_alt_asc, has_stats, search_text_lower, data_json
+            FROM tree_nodes
+            """
+        ).fetchall()
+
+        # Check if --asc exactly matches an active (non-alternate) class ascendancy (e.g. Warden / 守望者)
+        # so we exclude legacy Affliction 3.23 "Warden of the Maji" unless explicitly queried!
+        asc_targets = [x for x in (asc_folded, asc_alt) if x]
+        asc_matches_active_exact = False
+        if asc_targets:
+            for r in rows:
+                if r[9] == 0 and (
+                    (r[5] and r[5] in asc_targets) or (r[6] and r[6] in asc_targets)
+                ):
+                    asc_matches_active_exact = True
+                    break
+
+        type_rank = {
+            "Keystone": 0,
+            "Ascendancy": 1,
+            "Bloodline": 1,
+            "Notable": 2,
+            "Mastery": 3,
+            "Socket": 4,
+            "Normal": 5,
+        }
+
+        scored: list[tuple[tuple[int, int, int, int, str], dict[str, Any]]] = []
+        for (
+            nid,
+            name_l,
+            zh_l,
+            ntype,
+            asc_id_l,
+            asc_name_l,
+            asc_zh_l,
+            is_asc,
+            is_bl,
+            is_alt_asc,
+            has_stats,
+            search_l,
+            dj,
+        ) in rows:
+            zh_l = zh_l or ""
+            asc_id_l = asc_id_l or ""
+            asc_name_l = asc_name_l or ""
+            asc_zh_l = asc_zh_l or ""
+
+            # Filter by --type
+            if type_low:
+                if type_low in ("asc", "ascend", "ascendancy"):
+                    if not is_asc:
+                        continue
+                elif type_low == "bloodline":
+                    if not is_bl:
+                        continue
+                elif ntype.lower() != type_low:
+                    continue
+
+            # Filter by --asc
+            if asc_targets:
+                if not is_asc:
+                    continue
+                if asc_matches_active_exact:
+                    if is_alt_asc:
+                        continue
+                    if not (asc_name_l in asc_targets or asc_zh_l in asc_targets):
+                        continue
+                else:
+                    if not any(
+                        (t in asc_name_l or t in asc_zh_l or t == asc_id_l)
+                        for t in asc_targets
+                    ):
+                        continue
+
+            # When listing an Ascendancy without text query, skip blank/minor passive nodes if notables exist
+            if not expanded_queries and asc_targets and ntype == "Normal" and not has_stats:
+                continue
+
+            # Match text queries (OR across multiple queries; within each query, match primary OR slang alt)
+            match_tier = 2
+            if expanded_queries:
+                best_q_tier = 99
+                for q_prim, q_alt in expanded_queries:
+                    for cand_q in (q_prim, q_alt):
+                        if not cand_q:
+                            continue
+                        toks = [t for t in cand_q.split() if t]
+                        if not toks:
+                            continue
+                        if cand_q == name_l or (zh_l and cand_q == zh_l):
+                            best_q_tier = min(best_q_tier, 0)
+                        elif name_l.startswith(cand_q) or (zh_l and zh_l.startswith(cand_q)):
+                            best_q_tier = min(best_q_tier, 1)
+                        elif cand_q in name_l or (zh_l and cand_q in zh_l):
+                            best_q_tier = min(best_q_tier, 2)
+                        elif all(t in search_l for t in toks):
+                            best_q_tier = min(best_q_tier, 3)
+                if best_q_tier >= 99:
+                    continue
+                match_tier = best_q_tier
+
+            scored.append(
+                (
+                    (
+                        is_alt_asc,
+                        match_tier,
+                        type_rank.get(ntype, 6),
+                        0 if has_stats else 1,
+                        name_l,
+                    ),
+                    json.loads(dj),
+                )
+            )
+
+        scored.sort(key=lambda item: item[0])
+        # Deduplicate identical (name, ascName, stats) small travel nodes when listing an ascendancy
+        results: list[dict[str, Any]] = []
+        seen_small: set[tuple[str, str, tuple[str, ...]]] = set()
+        for _, nd in scored:
+            if nd["type"] == "Normal" and not nd.get("isBloodline"):
+                skey = (nd["name"], str(nd.get("ascName") or ""), tuple(nd.get("stats") or ()))
+                if skey in seen_small:
+                    continue
+                seen_small.add(skey)
+            results.append(nd)
+            if len(results) >= limit:
+                break
+    finally:
+        conn.close()
+
+    elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+    out: dict[str, Any] = {
+        "kind": "tree",
+        "queries": raw_queries,
+        "filters": {"type": type_clean, "asc": asc_clean, "limit": limit},
+        "treeVersion": tree_ver,
+        "count": len(results),
+        "totalMatched": len(scored),
+        "elapsedMs": elapsed_ms,
+        "results": results,
+    }
+    if resolved_aliases:
+        out["resolvedAliases"] = resolved_aliases
+    if warnings:
+        out["warnings"] = warnings
+    return out
+
+
+_TICK_BASE_CD_PRESETS: dict[str, tuple[float, str]] = {
+    "coc": (0.15, "Cast On Critical Strike (0.15s)"),
+    "cospri": (0.25, "Cospri's Malice (0.25s)"),
+    "mjolner": (0.25, "Mjölner (0.25s)"),
+    "poet": (0.25, "The Poet's Pen (0.25s)"),
+    "cwdt": (0.25, "Cast when Damage Taken (0.25s)"),
+    "soa": (0.50, "The Sword of Ages / Temporal Mirage (0.50s)"),
+    "mirage": (0.50, "Temporal Mirage (0.50s)"),
+    "hidden": (0.50, "The Hidden Blade (0.50s)"),
+    "spellslinger": (0.60, "Spellslinger (0.60s)"),
+    "kitava": (0.10, "Kitava's Thirst (0.10s)"),
+}
+
+
+def query_tick_breakpoints(
+    base_cd_spec: str | float,
+    *,
+    cdr_pct: float | None = None,
+    aps: float | None = None,
+    triggered_spells: int = 1,
+) -> dict[str, Any]:
+    """Daemon-free 0ms PoE1 0.033s (33ms) server-tick cooldown breakpoint calculator."""
+    from .analyzer import build_server_tick_table
+
+    raw = str(base_cd_spec or "").strip()
+    low = raw.lower()
+    preset_label: str | None = None
+    if low in _TICK_BASE_CD_PRESETS:
+        base_cd, preset_label = _TICK_BASE_CD_PRESETS[low]
+    elif low.endswith("ms"):
+        try:
+            base_cd = float(low[:-2].strip()) / 1000.0
+        except ValueError as exc:
+            raise ValueError(f"Invalid base cooldown {base_cd_spec!r}; pass seconds (e.g. 0.15), ms (150ms), or preset ({', '.join(_TICK_BASE_CD_PRESETS)}).") from exc
+    else:
+        try:
+            base_cd = float(low.rstrip("s").strip())
+        except ValueError as exc:
+            raise ValueError(f"Invalid base cooldown {base_cd_spec!r}; pass seconds (e.g. 0.15), ms (150ms), or preset ({', '.join(_TICK_BASE_CD_PRESETS)}).") from exc
+    if base_cd <= 0:
+        raise ValueError(f"Base cooldown must be > 0 (got {base_cd}).")
+
+    tbl = build_server_tick_table(
+        base_cd,
+        cdr_pct=cdr_pct,
+        aps=aps,
+        triggered_spells=triggered_spells,
+    )
+    tbl["kind"] = "tick"
+    if preset_label:
+        tbl["preset"] = preset_label
+    return tbl
