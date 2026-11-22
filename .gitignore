@@ -9,6 +9,7 @@ exports/
 .runtime/
 .hc/
 .pit/
+.lore.json
 
 # Python build & test artifacts
 __pycache__/

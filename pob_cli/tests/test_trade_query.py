@@ -443,6 +443,54 @@ def test_build_query_status_currency_and_corrupted_mirrored_guards() -> None:
         tq.build_query(plan=plan_with_conv, category=None, rarity="rare", status="bogus")
 
 
+def test_weighted_sum_group_parsing_and_query_building() -> None:
+    grp = tq.parse_sum_group_argument(
+        "+#% to Fire Resistance*1.5|+#% to Cold Resistance|+#% to Lightning Resistance=20>=45"
+    )
+    assert grp.min_sum == 45.0
+    assert [(e.text, e.weight, e.min_value) for e in grp.entries] == [
+        ("+#% to Fire Resistance", 1.5, None),
+        ("+#% to Cold Resistance", 1.0, None),
+        ("+#% to Lightning Resistance", 1.0, 20.0),
+    ]
+
+    plan = tq.plan_stats(
+        [tq.parse_stat_argument("+# to maximum Life=70")],
+        SAMPLE_ENTRIES,
+        slot="ring1",
+        weighted_groups=[grp],
+    )
+    assert tq.parse_stat_argument("生命>=70") == tq.StatRequest(text="生命", min_value=70.0)
+    assert tq.parse_stat_argument("+# to maximum Life >= 75") == tq.StatRequest(
+        text="+# to maximum Life", min_value=75.0
+    )
+    assert len(plan.weighted_groups) == 1
+    body = tq.build_query(
+        plan=plan,
+        category="accessory.ring",
+        rarity="rare",
+        search_sort="sum",
+    )
+    stats = body["query"]["stats"]
+    # Weighted group placed first at index 0 for statgroup.0 sorting
+    assert stats[0] == {
+        "type": "weight",
+        "value": {"min": 45.0},
+        "filters": [
+            {"id": "explicit.stat_3372524247", "value": {"weight": 1.5}, "disabled": False},
+            {"id": "explicit.stat_4220027924", "value": {"weight": 1.0}, "disabled": False},
+            {"id": "explicit.stat_1671376347", "value": {"weight": 1.0, "min": 20.0}, "disabled": False},
+        ],
+    }
+    assert stats[1]["type"] == "and"
+    assert body["sort"] == {"statgroup.0": "desc"}
+
+    # --search-sort sum without any --sum group raises cleanly
+    empty_plan = tq.plan_stats([], SAMPLE_ENTRIES)
+    with pytest.raises(ValueError, match="--search-sort sum requires"):
+        tq.build_query(plan=empty_plan, category=None, rarity="rare", search_sort="sum")
+
+
 # ---------------------------------------------------------------------------
 # 5. Real local TradeSiteStats.lua integration tests (gracefully skipped in CI)
 # ---------------------------------------------------------------------------

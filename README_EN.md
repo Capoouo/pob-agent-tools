@@ -51,7 +51,9 @@ DPS, effective hit pool (TotalEHP), maximum hit taken (MaxHit), and the effects 
   - A SQLite/FTS5 index is built from PoB's Lua data and can be searched without starting PoB, usually within 15 ms. It includes Foulborn unique variants, bench/Eldritch/corrupted modifiers, and English↔Chinese names; one command can search multiple terms.
 - **Find gear and fill modifier gaps** (`pob trade` / `pob bench`): Search official trade listings, compare upgrades in PoB, inspect available bench crafts, and preview same-tier Harvest resistance conversions. Trade commands only search and calculate; they do not buy items for you.
   - Local `TradeSiteStats.lua` resolves English and Chinese trade stats and distinguishes local item modifiers from global ones. Searches respect rate limits reported in GGG response headers and support 3.30 instant buyout listings and `chaos_equiv` prices.
-  - `--allow-conversion` considers eligible same-tier Harvest resistance swaps and checks modifier-group conflicts. Candidate DPS / EHP changes are calculated by PoB in batches. `pob bench` combines `ModMaster.lua` with local cost and unlock data to suggest verifiable bench crafts.
+  - `--allow-conversion` considers eligible same-tier Harvest resistance swaps and checks modifier-group conflicts; `--sum` builds official trade Weighted Sum groups and sorts by sum. Candidate DPS / EHP changes are calculated by PoB in batches. `pob bench` combines `ModMaster.lua` with local cost and unlock data to suggest verifiable bench crafts.
+- **One-shot build diagnosis, anti-hallucination guardrails, and universal Agent Skill** (`pob diagnose` / `pob ground` / `skills/pob`): Built for fast/lightweight AI models as well as players, a single command reports dewatered Pinnacle numbers, Ascendancy and Bloodline node stats, all skill groups, zero-effect or conflicting supports, `0.033s` trigger cooldown breakpoints and overspeed checks, and Low-Life Chaos bypass bricks while blocking Path of Exile 2 and removed 3.23–3.25 mechanics from leaking into PoE 1 answers.
+  - `pob diagnose` supports `-c/--compare` for one-shot dual-build comparison and `-q/--ask` to ground terms in the user's prompt; build outputs carry an `[Env: PoE1 3.30 (NOT PoE2) | ... (rev=N)]` stamp so long multi-turn chats do not mix up stale numbers. The bundled [`skills/pob/SKILL.md`](skills/pob/SKILL.md) skill works out of the box in DeepSeek Harness, Claude Code, Codex, OpenCode, Cursor, and other skill-aware agents.
 
 ---
 
@@ -90,17 +92,19 @@ scoop update pob
 
 #### Option 3: Portable GitHub release
 
-Download `pob-v0.4.0-windows-x64.zip` from [GitHub Releases](https://github.com/exilemoulei/pob-agent-tools/releases/latest), extract it, and add the folder containing `pob.exe` to your `PATH`.
+Download `pob-v0.5.0-windows-x64.zip` from [GitHub Releases](https://github.com/exilemoulei/pob-agent-tools/releases/latest), extract it, and add the folder containing `pob.exe` to your `PATH`.
 
 #### Option 4: Python package (Python 3.11+, `uv` / `pipx` / `pip`)
 
 ```powershell
 # Use uv (recommended)
-uv tool install "git+https://github.com/exilemoulei/pob-agent-tools.git@v0.4.0#subdirectory=pob_cli"
+uv tool install "git+https://github.com/exilemoulei/pob-agent-tools.git@v0.5.0#subdirectory=pob_cli"
 
 # Or install the release wheel
-pip install "https://github.com/exilemoulei/pob-agent-tools/releases/download/v0.4.0/pob_cli-0.4.0-py3-none-any.whl"
+pip install "https://github.com/exilemoulei/pob-agent-tools/releases/download/v0.5.0/pob_cli-0.5.0-py3-none-any.whl"
 ```
+
+> **Load the bundled AI Agent Skill (optional, recommended)**: Copy [`skills/pob`](skills/pob) into your agent's skill folder (such as `~/.agents/skills/pob`, `~/.claude/skills/pob`, or DeepSeek Harness's `skills` directory) so fast models follow concise `pob` workflows and avoid cross-patch hallucinations.
 
 ---
 
@@ -214,9 +218,15 @@ pob export-code --target exp1
 
 ### 1. Inspect a build and its PoB configuration
 
-When you receive a PoB, start with `pob summary` to inspect its offence and defence. Then use `pob audit` to check resistance, accuracy, spell suppression, and other gaps, as well as temporary conditions that inflate its displayed numbers. The audit disables those conditions and recalculates the baseline:
+When you receive a PoB, run `pob diagnose` for a one-shot report covering original vs. dewatered Pinnacle numbers, Ascendancy and Bloodline stats, all skill groups and dead-support checks, `0.033s` trigger breakpoints, and top upgrades — or `--compare` to compare two builds at once. You can also run `pob summary` and `pob audit` individually:
 
 ```powershell
+# One-shot build diagnosis (-q grounds mechanics/gems mentioned in a question)
+pob diagnose "@D:\builds\my_build.xml" -q "Why is my boss DPS low and why am I getting one-shot?"
+
+# One-shot 3-baseline comparison and Pinnacle audit across two builds
+pob diagnose "@D:\builds\build_a.xml" --compare "@D:\builds\build_b.xml"
+
 # Offence, defence, minion summary, and native PoB warnings
 pob summary
 
@@ -426,9 +436,14 @@ pob timeless search --jewel "Militant Faith" --socket 41263 --stat TotalEHP --ex
 These commands accept multiple search terms. The local game data index works without starting PoB. poe.ninja prices cover 52 categories and are cached for 15 minutes; PoEDB queries can show modifier pools, weights, and fossil tags. Wiki results are also cached locally:
 
 ```powershell
-# --- Local game data: gems, uniques, modifiers, bases, and bilingual names ---
+# --- Local game data: gems, quality breakpoints, unique mod search, passive tree, ticks, and bilingual names ---
+pob ground "Does Divine Blessing with Hatred still grant more Cold Damage on spells?"
 pob data gem "Ice Nova of Frostbolts" "Archmage Support"
+pob data gem --quality-breakpoints --active-only --limit 20
 pob data unique "Mageblood" "Headhunter"
+pob data unique --mod "Chaos Damage taken does not bypass"
+pob data tree "Polymath" "Oath of Summer" --type Ascendancy
+pob data tick coc --cdr 14 --aps 8.28
 pob data mod "Spell Suppression" --slot Helmet --ilvl 85
 pob data base "Spirit Shield" --limit 10
 pob data translate "喋血之刃" "Whispers of Doom"
@@ -466,7 +481,8 @@ pob trade search --slot gloves --budget 25 --currency chaos_equiv `
   --allow-conversion `
   --sort pob --pob auto
 
-# 3. Find gear with an open suffix and inspect available bench crafts
+# 3. Search rings using a Weighted Sum resistance group, or require an open suffix for bench crafting
+pob trade search --slot ring1 --budget 5 --currency divine --stat "maximum Life>=60" --sum "Fire Resistance|Cold Resistance|Lightning Resistance>=80" --search-sort sum
 pob trade search --slot ring1 --budget 15 --stat "最大生命=65" --open-suffix --pob auto
 pob bench list --slot ring1 --affix suffix --search "抗性"
 pob bench suggest --slot gloves --stat "冰霜抗性"
@@ -512,7 +528,7 @@ pyinstaller --noconfirm --clean pob_cli/packaging/pob.spec
 **Tag-driven releases** (`.github/workflows/release.yml`):
 
 1. Update `__version__` in `pob_cli/src/pob_cli/__init__.py` and merge it into `main`.
-2. Create and push a version tag: `git tag -s v0.4.0 -m "pob-agent-tools v0.4.0" && git push origin main v0.4.0`.
+2. Create and push a version tag: `git tag -s v0.5.0 -m "pob-agent-tools v0.5.0" && git push origin main v0.5.0`.
 3. GitHub Actions checks the version, runs tests, builds and smoke-tests `pob-vX.Y.Z-windows-x64.zip`, the wheel / sdist, and `SHA256SUMS.txt`, publishes the GitHub Release, and updates the Scoop manifest at `bucket/pob.json`.
 
 For a compact command reference for agents, see [AGENTS.md](AGENTS.md).
@@ -529,7 +545,7 @@ For a compact command reference for agents, see [AGENTS.md](AGENTS.md).
 ### Community contributors
 
 - **[@ChangMenQAQ](https://github.com/ChangMenQAQ)** ([PR #1](https://github.com/exilemoulei/pob-agent-tools/pull/1)): official trade search, same-tier Harvest resistance conversion, and crafting bench suggestions.
-- **[@restartgr](https://github.com/restartgr)** ([PR #2](https://github.com/exilemoulei/pob-agent-tools/pull/2), [PR #4](https://github.com/exilemoulei/pob-agent-tools/pull/4)): inflated-panel audit, `--keep`, build restoration checks, and CLI exit codes.
+- **[@restartgr](https://github.com/restartgr)** ([PR #2](https://github.com/exilemoulei/pob-agent-tools/pull/2), [PR #4](https://github.com/exilemoulei/pob-agent-tools/pull/4), [PR #6](https://github.com/exilemoulei/pob-agent-tools/pull/6)): inflated-panel audit, `--keep`, build restoration checks, CLI exit codes, and bilingual README polish.
 - **[@Capoouo](https://github.com/Capoouo)** ([PR #3](https://github.com/exilemoulei/pob-agent-tools/pull/3)): PoB-calculated Timeless Jewel seed search and candidate filtering.
 
 ### License

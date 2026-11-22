@@ -51,7 +51,9 @@
   - 本地数据库由 PoB 的 Lua 数据建立 SQLite/FTS5 索引；无需启动 PoB，查询通常在 15ms 内完成。覆盖秽生传奇变体、工艺台/古灵/腐化词缀和中英名称互查，一条命令可同时查多个词。
 - **找装备、补词缀**（`pob trade` / `pob bench`）：搜索官方交易市集的在售装备，用 PoB 比较换装收益；还能查看工艺台可补的词缀，并试算丰收同阶元素抗性转换。交易功能只负责搜索和计算，不会代替玩家购买。
   - `TradeSiteStats.lua` 在本地匹配中英文交易词缀，并区分装备局部词缀与全局词缀；交易搜索遵守 GGG 响应头给出的请求频率限制，支持 3.30 一口价搜索和 `chaos_equiv` 折算。
-  - `--allow-conversion` 只在满足条件时考虑丰收同阶转抗，并检查词缀组冲突；候选装备的 DPS / EHP 变化由 PoB 批量计算。`pob bench` 结合 `ModMaster.lua` 与本地费用/解锁数据给出可验证的工艺台词缀建议。
+  - `--allow-conversion` 只在满足条件时考虑丰收同阶转抗，并检查词缀组冲突；`--sum` 支持官方市集的加权和（Weighted Sum）词缀分组与按总和降序排序；候选装备的 DPS / EHP 变化由 PoB 批量计算。`pob bench` 结合 `ModMaster.lua` 与本地费用/解锁数据给出可验证的工艺台词缀建议。
+- **一键构筑诊断、防幻觉校验与通用 Agent Skill**（`pob diagnose` / `pob ground` / `skills/pob`）：面向快速/轻量 AI 模型设计，单条命令输出去水面板、升华与血脉词条、全技能组、0% 失效或互斥辅助石、`0.033s` 触发冷却断点与超速（Overspeed）检查、低血防混沌穿透失效等构筑隐患，并拦截《流放之路 2》及 3.23–3.25 已移除机制的跨版本误用。
+  - `pob diagnose` 支持 `-c/--compare` 单命令双构筑去水横评与 `-q/--ask` 问题伴随核对；每次构筑输出附带 `[Env: PoE1 3.30 (NOT PoE2) | ... (rev=N)]` 状态标记，避免多轮长对话混淆历史面板。仓库内置跨宿主通用的 [`skills/pob/SKILL.md`](skills/pob/SKILL.md)，可在 DeepSeek Harness、Claude Code、Codex、OpenCode、Cursor 等环境中直接加载。
 
 ---
 
@@ -90,17 +92,19 @@ scoop update pob
 
 #### 方式三：GitHub Releases 便携压缩包
 
-前往 [GitHub Releases](https://github.com/exilemoulei/pob-agent-tools/releases/latest) 下载 `pob-v0.4.0-windows-x64.zip`，解压后将包含 `pob.exe` 的目录加入系统 `PATH`。
+前往 [GitHub Releases](https://github.com/exilemoulei/pob-agent-tools/releases/latest) 下载 `pob-v0.5.0-windows-x64.zip`，解压后将包含 `pob.exe` 的目录加入系统 `PATH`。
 
 #### 方式四：Python 包安装（Python 3.11+，`uv` / `pipx` / `pip`）
 
 ```powershell
 # 使用 uv（推荐）
-uv tool install "git+https://github.com/exilemoulei/pob-agent-tools.git@v0.4.0#subdirectory=pob_cli"
+uv tool install "git+https://github.com/exilemoulei/pob-agent-tools.git@v0.5.0#subdirectory=pob_cli"
 
 # 或直接安装 Release Wheel
-pip install "https://github.com/exilemoulei/pob-agent-tools/releases/download/v0.4.0/pob_cli-0.4.0-py3-none-any.whl"
+pip install "https://github.com/exilemoulei/pob-agent-tools/releases/download/v0.5.0/pob_cli-0.5.0-py3-none-any.whl"
 ```
+
+> **为 AI Agent 挂载通用 Skill（可选，推荐）**：将仓库内的 [`skills/pob`](skills/pob) 目录复制到你的 Agent 技能目录（如 `~/.agents/skills/pob`、`~/.claude/skills/pob` 或 DeepSeek Harness 的 `skills` 目录），即可让快速模型（如 DeepSeek Flash / Hydrogen / Haiku）按精简路由调用 `pob` 并规避跨版本幻觉。
 
 ---
 
@@ -214,9 +218,15 @@ pob export-code --target exp1
 
 ### 1. 检查构筑与 PoB 配置
 
-拿到别人的 PoB，建议先用 `pob summary` 看原始攻防面板，再用 `pob audit` 查抗性、命中、法术压制等缺口，并检查面板数值依赖了哪些临时条件。这里把暂时关掉这些条件、重算常态表现称为“去水”：
+拿到别人的 PoB，推荐直接用 `pob diagnose` 做一键完整体检（同时输出原面板与去水后的巅峰首领基准、升华与血脉词条、全技能组与失效辅助检查、`0.033s` 触发断点及候选提升点），或用 `--compare` 一次对比两套构筑；也可以分别运行 `pob summary` 和 `pob audit`（这里把暂时关掉临时条件、重算常态表现称为“去水”）：
 
 ```powershell
+# 一键加载并诊断单套构筑（-q 可附带玩家问题做版本陷阱与实体词条核对）
+pob diagnose "@D:\builds\my_build.xml" -q "为什么打Boss伤害低而且容易被秒？"
+
+# 一键对比两套构筑在三组基准（原面板 / 对齐环境 / Pinnacle 去水）下的表现与隐患
+pob diagnose "@D:\builds\build_a.xml" --compare "@D:\builds\build_b.xml"
+
 # 基础攻防与召唤物摘要 + PoB 原生告警
 pob summary
 
@@ -424,9 +434,14 @@ pob timeless search --jewel "Militant Faith" --socket 41263 --stat TotalEHP --ex
 这些查询命令一次可接收多个关键词。本地游戏数据无需启动 PoB；poe.ninja 物价覆盖 52 个分类并缓存 15 分钟，流亡编年史查询可查看词缀池、权重和化石标签；百科查询也会在本地缓存结果：
 
 ```powershell
-# --- 本地游戏数据库：宝石、传奇、词缀、底材和中英名称 ---
+# --- 本地游戏数据库：宝石、品质阈值、传奇词缀反查、天赋树、帧率断点与中英名称 ---
+pob ground "纯冰法术用神圣祝福开憎恨还有收益吗？"
 pob data gem "Ice Nova of Frostbolts" "Archmage Support"
+pob data gem --quality-breakpoints --active-only --limit 20
 pob data unique "Mageblood" "Headhunter"
+pob data unique --mod "Chaos Damage taken does not bypass"
+pob data tree "Polymath" "Oath of Summer" --type Ascendancy
+pob data tick coc --cdr 14 --aps 8.28
 pob data mod "Spell Suppression" --slot Helmet --ilvl 85
 pob data base "Spirit Shield" --limit 10
 pob data translate "喋血之刃" "Whispers of Doom"
@@ -464,7 +479,8 @@ pob trade search --slot gloves --budget 25 --currency chaos_equiv `
   --allow-conversion `
   --sort pob --pob auto
 
-# 3. 搜索有空余后缀的装备，再查可添加的工艺台词缀
+# 3. 用加权和（Weighted Sum）搜索补抗戒指并按抗性总和排序，或搜索有空余后缀的装备配合工艺台
+pob trade search --slot ring1 --budget 5 --currency divine --stat "最大生命>=60" --sum "火抗|冰抗|电抗>=80" --search-sort sum
 pob trade search --slot ring1 --budget 15 --stat "最大生命=65" --open-suffix --pob auto
 pob bench list --slot ring1 --affix suffix --search "抗性"
 pob bench suggest --slot gloves --stat "冰霜抗性"
@@ -510,7 +526,7 @@ pyinstaller --noconfirm --clean pob_cli/packaging/pob.spec
 **按版本标签发布**（`.github/workflows/release.yml`）：
 
 1. 修改 `pob_cli/src/pob_cli/__init__.py` 中的 `__version__`，并合入 `main`。
-2. 创建并推送版本标签：`git tag -s v0.4.0 -m "pob-agent-tools v0.4.0" && git push origin main v0.4.0`。
+2. 创建并推送版本标签：`git tag -s v0.5.0 -m "pob-agent-tools v0.5.0" && git push origin main v0.5.0`。
 3. GitHub Actions 检查版本号、运行测试、构建并冒烟测试 `pob-vX.Y.Z-windows-x64.zip`、Wheel / sdist 和 `SHA256SUMS.txt`，随后发布 GitHub Release，并更新 Scoop 清单 `bucket/pob.json`。
 
 Agent 命令速查见 [AGENTS.md](AGENTS.md)。
@@ -527,7 +543,7 @@ Agent 命令速查见 [AGENTS.md](AGENTS.md)。
 ### 社区贡献致谢
 
 - **[@ChangMenQAQ](https://github.com/ChangMenQAQ)**（[PR #1](https://github.com/exilemoulei/pob-agent-tools/pull/1)）：官方交易搜索、丰收同阶转抗与工艺台词缀方案。
-- **[@restartgr](https://github.com/restartgr)**（[PR #2](https://github.com/exilemoulei/pob-agent-tools/pull/2)、[PR #4](https://github.com/exilemoulei/pob-agent-tools/pull/4)）：面板“去水”分析、`--keep` 条件保留、构筑恢复校验与错误退出码。
+- **[@restartgr](https://github.com/restartgr)**（[PR #2](https://github.com/exilemoulei/pob-agent-tools/pull/2)、[PR #4](https://github.com/exilemoulei/pob-agent-tools/pull/4)、[PR #6](https://github.com/exilemoulei/pob-agent-tools/pull/6)）：面板“去水”分析、`--keep` 条件保留、构筑恢复校验、错误退出码与中英文文档润色。
 - **[@Capoouo](https://github.com/Capoouo)**（[PR #3](https://github.com/exilemoulei/pob-agent-tools/pull/3)）：永恒珠宝种子搜索与候选种子筛选。
 
 ### 开源协议

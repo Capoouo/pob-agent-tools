@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import sqlite3
@@ -124,13 +125,70 @@ _SLOT_COMPACT_ALIASES: dict[str, str] = {
     "ring_1": "ring1",
     "ring_2": "ring2",
     "ring_3": "ring3",
+    "left_ring": "ring1",
+    "leftring": "ring1",
+    "right_ring": "ring2",
+    "rightring": "ring2",
+    "左戒指": "ring1",
+    "左戒": "ring1",
+    "戒指1": "ring1",
+    "右戒指": "ring2",
+    "右戒": "ring2",
+    "戒指2": "ring2",
+    "戒指3": "ring3",
+    "戒指": "ring",
+    "衣服": "body_armour",
+    "胸甲": "body_armour",
+    "身甲": "body_armour",
+    "body_armor": "body_armour",
+    "bodyarmour": "body_armour",
+    "头盔": "helmet",
+    "头部": "helmet",
+    "head": "helmet",
+    "手套": "gloves",
+    "glove": "gloves",
+    "hands": "gloves",
+    "鞋子": "boots",
+    "靴子": "boots",
+    "boot": "boots",
+    "feet": "boots",
+    "shoes": "boots",
+    "项链": "amulet",
+    "护身符": "amulet",
+    "neck": "amulet",
+    "腰带": "belt",
+    "waist": "belt",
+    "盾牌": "shield",
+    "箭袋": "quiver",
     "weapon_1": "weapon1",
     "weapon_2": "weapon2",
+    "mainhand": "weapon1",
+    "main_hand": "weapon1",
+    "主手": "weapon1",
+    "主手武器": "weapon1",
+    "武器1": "weapon1",
+    "offhand": "weapon2",
+    "off_hand": "weapon2",
+    "副手": "weapon2",
+    "副手武器": "weapon2",
+    "武器2": "weapon2",
     "flask_1": "flask1",
     "flask_2": "flask2",
     "flask_3": "flask3",
     "flask_4": "flask4",
     "flask_5": "flask5",
+    "药剂": "flask",
+    "药剂1": "flask1",
+    "药剂2": "flask2",
+    "药剂3": "flask3",
+    "药剂4": "flask4",
+    "药剂5": "flask5",
+    "药水1": "flask1",
+    "药水2": "flask2",
+    "药水3": "flask3",
+    "药水4": "flask4",
+    "药水5": "flask5",
+    "珠宝": "jewel",
 }
 
 _WEAPON_SLOTS: frozenset[str] = frozenset(
@@ -500,9 +558,28 @@ class ConversionPlan:
 
 
 @dataclass
+class WeightedStatEntry:
+    """One modifier entry inside an official PoE1 ``type: "weight"`` (Weighted Sum) group."""
+
+    text: str
+    weight: float = 1.0
+    min_value: float | None = None
+    match: StatMatch | None = None
+
+
+@dataclass
+class WeightedGroup:
+    """An official PoE1 ``type: "weight"`` stat group whose values sum into ``Sum: XX``."""
+
+    entries: list[WeightedStatEntry] = field(default_factory=list)
+    min_sum: float | None = None
+
+
+@dataclass
 class StatPlan:
     plain: list[StatRequest] = field(default_factory=list)
     conversions: list[ConversionPlan] = field(default_factory=list)
+    weighted_groups: list[WeightedGroup] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -1251,19 +1328,80 @@ def resolve_requests(
 
 
 def parse_stat_argument(value: str) -> StatRequest:
-    """Parse ``"to Cold Resistance=40"`` or ``"冰霜抗性=40"`` into a ``StatRequest``."""
+    """Parse ``"to Cold Resistance=40"``, ``"生命>=70"``, or ``"冰霜抗性=40"`` into a ``StatRequest``."""
     text = (value or "").strip()
     minimum = 1.0
     if "=" in text:
         candidate_text, candidate_min = text.rsplit("=", 1)
         try:
             minimum = float(candidate_min.strip())
-            text = candidate_text.strip()
+            text = candidate_text.rstrip(">").strip()
         except ValueError:
             pass
     if not text:
         raise ValueError("--stat cannot be empty")
     return StatRequest(text=text, min_value=minimum)
+
+
+_SUM_MIN_SUFFIX_RE = re.compile(r">=\s*([+-]?\d+(?:\.\d+)?)\s*$")
+_WEIGHT_SUFFIX_RE = re.compile(r"\*\s*([+-]?\d+(?:\.\d+)?)\s*$")
+
+
+def parse_sum_group_argument(value: str) -> WeightedGroup:
+    """Parse a Weighted Sum group argument into a :class:`WeightedGroup`.
+
+    Format: ``"stat1[*w1][=min1]|stat2[*w2][=min2]|...[>=min_sum]"`` (``;`` also accepted
+    as separator). Example:
+    ``"+#% to Global Critical Strike Multiplier|+#% to Critical Strike Multiplier for Spell Damage>=25"``.
+    """
+    raw = (value or "").strip()
+    if not raw:
+        raise ValueError("--sum cannot be empty")
+
+    min_sum: float | None = None
+    m_min = _SUM_MIN_SUFFIX_RE.search(raw)
+    if m_min:
+        parsed_min = float(m_min.group(1))
+        if not math.isfinite(parsed_min):
+            raise ValueError(f"Invalid --sum minimum: {m_min.group(1)}")
+        min_sum = parsed_min
+        raw = raw[: m_min.start()].strip()
+
+    parts = [part.strip() for part in re.split(r"[|;]", raw) if part.strip()]
+    if not parts:
+        raise ValueError("--sum must include at least one modifier")
+
+    entries: list[WeightedStatEntry] = []
+    for part in parts:
+        text = part
+        weight = 1.0
+        entry_min: float | None = None
+
+        m_weight = _WEIGHT_SUFFIX_RE.search(text)
+        if m_weight:
+            parsed_w = float(m_weight.group(1))
+            if not math.isfinite(parsed_w):
+                raise ValueError(f"Invalid --sum weight: {m_weight.group(1)}")
+            weight = parsed_w
+            text = text[: m_weight.start()].strip()
+
+        if "=" in text:
+            candidate_text, candidate_min = text.rsplit("=", 1)
+            try:
+                parsed_entry_min = float(candidate_min.strip())
+            except ValueError:
+                parsed_entry_min = None
+            if parsed_entry_min is not None:
+                if not math.isfinite(parsed_entry_min):
+                    raise ValueError(f"Invalid --sum stat min: {candidate_min.strip()}")
+                entry_min = parsed_entry_min
+                text = candidate_text.strip()
+
+        if not text:
+            raise ValueError(f"Empty modifier entry in --sum: {value!r}")
+        entries.append(WeightedStatEntry(text=text, weight=weight, min_value=entry_min))
+
+    return WeightedGroup(entries=entries, min_sum=min_sum)
 
 
 def _conversion_plan(
@@ -1315,6 +1453,7 @@ def plan_stats(
     allow_conversion: bool = False,
     convert_to: str | None = None,
     rarity: str | None = "rare",
+    weighted_groups: list[WeightedGroup] | None = None,
 ) -> StatPlan:
     """Resolve requests and optionally expand Harvest-convertible ones into count groups."""
     if allow_conversion and (rarity or "").strip().lower() == "unique":
@@ -1340,6 +1479,29 @@ def plan_stats(
                 )
             conversion.target = target_override
         plan.conversions.append(conversion)
+
+    for group in weighted_groups or []:
+        resolved_entries: list[WeightedStatEntry] = []
+        for item in group.entries:
+            match = resolve_stat(item.text, entries, slot=slot)
+            if match is None:
+                lines = [f"Could not map this --sum modifier to a trade filter: {item.text}"]
+                for suggestion in suggest_stats(item.text, entries, slot=slot):
+                    lines.append(f"  - {suggestion.text}  ({suggestion.id})")
+                raise ValueError("\n".join(lines))
+            resolved_entries.append(
+                WeightedStatEntry(
+                    text=item.text,
+                    weight=item.weight,
+                    min_value=item.min_value,
+                    match=match,
+                )
+            )
+        if resolved_entries:
+            plan.weighted_groups.append(
+                WeightedGroup(entries=resolved_entries, min_sum=group.min_sum)
+            )
+
     return plan
 
 
@@ -1365,6 +1527,35 @@ def build_query(
         )
 
     stat_groups: list[dict[str, Any]] = []
+
+    # Place weighted sum groups first (index 0) matching PoB TradeQueryRequests.lua,
+    # so `statgroup.0` cleanly targets the primary weighted sum on the trade site.
+    first_weight_idx: int | None = None
+    for wgroup in plan.weighted_groups:
+        wfilters: list[dict[str, Any]] = []
+        for entry in wgroup.entries:
+            if entry.match is None:
+                continue
+            val: dict[str, Any] = {"weight": entry.weight}
+            if entry.min_value is not None:
+                val["min"] = entry.min_value
+            wfilters.append(
+                {
+                    "id": entry.match.id,
+                    "value": val,
+                    "disabled": False,
+                }
+            )
+        if wfilters:
+            if first_weight_idx is None:
+                first_weight_idx = len(stat_groups)
+            group_obj: dict[str, Any] = {
+                "type": "weight",
+                "filters": wfilters,
+            }
+            if wgroup.min_sum is not None:
+                group_obj["value"] = {"min": wgroup.min_sum}
+            stat_groups.append(group_obj)
 
     if plan.plain:
         stat_groups.append(
@@ -1439,4 +1630,14 @@ def build_query(
     if filter_block:
         query["filters"] = filter_block
 
-    return {"query": query, "sort": {"price": search_sort}}
+    sort_norm = (search_sort or "asc").strip().lower()
+    if sort_norm in ("sum", "weight"):
+        if first_weight_idx is None:
+            raise ValueError("--search-sort sum requires at least one --sum weighted group.")
+        sort_block: dict[str, str] = {f"statgroup.{first_weight_idx}": "desc"}
+    elif sort_norm in ("asc", "desc"):
+        sort_block = {"price": sort_norm}
+    else:
+        raise ValueError(f"Invalid search_sort {search_sort!r}; expected asc, desc, or sum.")
+
+    return {"query": query, "sort": sort_block}

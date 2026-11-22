@@ -15,6 +15,11 @@ datas = collect_data_files("certifi") + [
 hiddenimports = [
     "socksio",
     "pob_cli.errors",
+    "pob_cli.guardrails",
+    "pob_cli.analyzer",
+    "pob_cli.comparator",
+    "pob_cli.game_data",
+    "pob_cli.formatters",
     "pob_cli.daemon",
     "pob_cli.cli_trade",
     "pob_cli.timeless",

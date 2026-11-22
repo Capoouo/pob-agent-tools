@@ -113,6 +113,101 @@ def rank_nodes(
         }
 
 
+_ARCHETYPE_SWAP_SUPPORT_BUCKETS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "trigger",
+        (
+            "cast when stunned",
+            "cast on critical strike",
+            "cast when damage taken",
+            "cast on death",
+            "cast while channelling",
+            "cast on melee kill",
+            "cast on ward break",
+            "spellslinger",
+            "arcanist brand",
+            "manaforged arrows",
+            "mark on hit",
+            "hextouch",
+            "battlemage's cry",
+            "automation",
+            "autoexertion",
+        ),
+    ),
+    (
+        "totem",
+        (
+            "spell totem",
+            "ballista totem",
+            "earthbreaker",
+            "multiple totems",
+        ),
+    ),
+    (
+        "trap",
+        (
+            "trap support",
+            "cluster traps",
+            "multiple traps",
+            "charged traps",
+            "advanced traps",
+            "trap and mine damage",
+        ),
+    ),
+    (
+        "mine",
+        (
+            "high-impact mine",
+            "blastchain mine",
+            "minefield",
+            "swift assembly",
+            "charged mines",
+            "locus mine",
+        ),
+    ),
+)
+
+
+def _gem_archetype_bucket(name_en: str) -> str | None:
+    low = strip_pob_escapes(name_en or "").strip().lower()
+    if low.startswith("awakened "):
+        low = low[len("awakened ") :].strip()
+    if low == "trap":
+        return "trap"
+    for bucket, patterns in _ARCHETYPE_SWAP_SUPPORT_BUCKETS:
+        for pat in patterns:
+            if low == pat or low.startswith(pat + " ") or low == pat + " support":
+                return bucket
+    return None
+
+
+_SUPPORT_GEM_CAVEATS: tuple[tuple[str, str], ...] = (
+    ("immolate", "Requires Enemy Burning/Ignited"),
+    ("hypothermia", "Requires Enemy Chilled"),
+    ("trinity", "Requires 2+ alternating highest hit elements"),
+    ("elemental focus", "Cannot inflict Elemental Ailments (breaks Shock/Chill/Freeze/Ignite)"),
+    ("controlled destruction", "80% less Crit Chance"),
+    ("concentrated effect", "30% less Area of Effect (check overlap/clear)"),
+    ("brutality", "Deals NO Elemental or Chaos Damage"),
+    ("void manipulation", "Deals NO Elemental Damage"),
+    ("sacrifice", "Sacrifices 20% Current Life per cast (bricks CI / deadly on Low-Life)"),
+)
+
+
+def _gem_caveat(name_en: str, *, main_mana_cost: float | None = None) -> str | None:
+    low = strip_pob_escapes(name_en or "").strip().lower()
+    if low.startswith("awakened "):
+        low = low[len("awakened ") :].strip()
+    if low.endswith(" support"):
+        low = low[: -len(" support")].strip()
+    if low == "inspiration" and main_mana_cost is not None and main_mana_cost <= 0.0:
+        return "0 charges on 0-mana skill!"
+    for pat, note in _SUPPORT_GEM_CAVEATS:
+        if low == pat or low.startswith(pat + " "):
+            return note
+    return None
+
+
 def rank_gems(
     worker: BridgeWorker,
     *,
@@ -121,6 +216,7 @@ def rank_gems(
     add_link: bool = False,
     field: str = "CombinedDPS",
     top: int = 15,
+    exclude_archetype_swaps: bool = False,
 ) -> dict[str, Any]:
     """Rank candidate gems for a skill group slot (or a new link) by DPS gain."""
     with worker.lock:
@@ -131,6 +227,17 @@ def rank_gems(
             raise ValueError(f"Skill group #{g_idx} not found.")
         gems = group.get("gems", [])
 
+        main_mana_cost: float | None = None
+        try:
+            st_res = worker.call("get_stats", {})
+            raw_mc = (st_res.get("stats") or {}).get("ManaCost") if isinstance(st_res, dict) else None
+            if raw_mc is not None:
+                parsed_mc = _parse_numeric_or_none(raw_mc)
+                if parsed_mc is not None and math.isfinite(parsed_mc):
+                    main_mana_cost = float(parsed_mc)
+        except Exception:
+            main_mana_cost = None
+
         if add_link or slot_idx is None:
             target_idx = len(gems) + 1
             mode = f"add_link (slot #{target_idx})"
@@ -140,6 +247,29 @@ def rank_gems(
             mode = f"replace_slot (slot #{target_idx})"
             existing_gem = next((gm for gm in gems if gm.get("index") == target_idx), None)
             supportable_only = bool(existing_gem.get("support", True)) if existing_gem else True
+
+        existing_archetypes: set[str] = set()
+        if exclude_archetype_swaps:
+            for gm in gems:
+                if not gm.get("enabled", True):
+                    continue
+                # Item-granted / tree-granted triggers (e.g. The Sword of Ages'
+                # SupportUniqueSuspendInTimeCanUse / Temporal Mirage) MUST NOT unlock
+                # socketed trigger supports like CwC / CwDT / CwS / Cast on Ward Break.
+                if gm.get("fromItem") or gm.get("fromNode"):
+                    continue
+                nm = strip_pob_escapes(str(gm.get("name") or gm.get("nameSpec") or "")).lower()
+                b = _gem_archetype_bucket(nm)
+                if b:
+                    existing_archetypes.add(b)
+                if "totem" in nm:
+                    existing_archetypes.add("totem")
+                if "trap" in nm:
+                    existing_archetypes.add("trap")
+                if "mine" in nm:
+                    existing_archetypes.add("mine")
+
+        fetch_limit = top + 15 if exclude_archetype_swaps else top
 
         prev_opts = worker.call("get_gem_options", {})
         try:
@@ -157,10 +287,37 @@ def rank_gems(
                     "index": target_idx,
                     "byDps": True,
                     "supportableOnly": supportable_only,
-                    "limit": top,
+                    "limit": fetch_limit,
                 },
             )
-            ranked = search_res.get("gems", [])
+            raw_ranked = search_res.get("gems", [])
+            filtered_swaps: list[str] = []
+            if exclude_archetype_swaps:
+                ranked = []
+                for cand in raw_ranked:
+                    cname = str(cand.get("name") or "")
+                    cbucket = _gem_archetype_bucket(cname)
+                    if cbucket is not None and cbucket not in existing_archetypes:
+                        filtered_swaps.append(f"{cname} ({cbucket})")
+                        continue
+                    caveat = _gem_caveat(cname, main_mana_cost=main_mana_cost)
+                    if caveat == "0 charges on 0-mana skill!":
+                        filtered_swaps.append(f"{cname} (0-mana skill: 0 charges)")
+                        continue
+                    cand_copy = dict(cand)
+                    if caveat:
+                        cand_copy["caveat"] = caveat
+                    ranked.append(cand_copy)
+                    if len(ranked) >= top:
+                        break
+            else:
+                ranked = []
+                for cand in raw_ranked[:top]:
+                    cand_copy = dict(cand)
+                    caveat = _gem_caveat(str(cand.get("name") or ""), main_mana_cost=main_mana_cost)
+                    if caveat:
+                        cand_copy["caveat"] = caveat
+                    ranked.append(cand_copy)
             # Enrich top 5 with candidate tooltip details in ONE pipelined batch
             top_cands = [c for c in ranked[:5] if c.get("gemId")]
             if top_cands:
@@ -184,7 +341,7 @@ def rank_gems(
             except Exception:
                 pass
 
-        return {
+        out_res: dict[str, Any] = {
             "groupIndex": g_idx,
             "groupLabel": group.get("displayLabelZh") or group.get("displayLabel") or group.get("label"),
             "targetIndex": target_idx,
@@ -193,6 +350,9 @@ def rank_gems(
             "baseDps": search_res.get("baseDps"),
             "candidates": ranked,
         }
+        if filtered_swaps:
+            out_res["filteredArchetypeSwaps"] = filtered_swaps
+        return out_res
 
 
 def _extract_env_config_from_cfg(cfg: dict[str, Any]) -> dict[str, Any]:

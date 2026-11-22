@@ -508,14 +508,14 @@ def test_schema_v4_to_v5_auto_upgrade_and_explicit_pob_dir_isolation(
     finally:
         conn.close()
 
-    # ensure_gamedata_index must detect v4 != SCHEMA_VERSION (6) and auto-rebuild
-    assert game_data.SCHEMA_VERSION == 6
+    # ensure_gamedata_index must detect v4 != SCHEMA_VERSION and auto-rebuild
+    assert game_data.SCHEMA_VERSION >= 7
     rebuilt_path = ensure_gamedata_index(pob_dir=legacy_pob, runtime_dir=rt)
     assert rebuilt_path == db_path
     conn = sqlite3.connect(f"{rebuilt_path.resolve().as_uri()}?mode=ro", uri=True)
     try:
         meta = dict(conn.execute("SELECT key, value FROM meta").fetchall())
-        assert meta["schema_version"] == "6"
+        assert meta["schema_version"] == str(game_data.SCHEMA_VERSION)
     finally:
         conn.close()
 
