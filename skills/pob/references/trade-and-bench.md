@@ -23,12 +23,17 @@ pob trade search --slot ring1 --sum "火抗|冰抗|电抗>=100" --stat "生命>=
 # Applies ONLY to identified rare/magic explicit single-element mods; always keeps tier but rerolls value!
 pob trade search --slot ring2 --stat "冰霜抗性=42" --allow-conversion --convert-to cold --open-prefix --budget 2 --currency divine
 
+# Bench-craft max-roll PoB simulation (--bench-craft; keeps originals + legal craft variants, PoB-ranked by default)
+pob trade search --slot gloves --budget 20 --currency divine --stat "to Dexterity=55" --bench-craft "Area Damage" --pob on
+
 # Preview Harvest swap on a pasted item
 pob trade convert --file item.txt --to fire
 ```
 
-## 3. Hideout Crafting Bench (`ModMaster.lua` Authoritative)
+## 3. Rare Item Affix Inspection & Hideout Crafting Bench (`ModMaster.lua` Authoritative)
 ```powershell
+pob item inspect --slot "Ring 2" --want "Cold Resistance"
+pob item inspect --file item.txt --slot gloves --want "maximum Life"
 pob bench list --slot ring --search "生命"
 pob bench suggest --slot gloves --stat "攻速" --affix suffix
 ```

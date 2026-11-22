@@ -50,6 +50,7 @@ DPS, effective hit pool (TotalEHP), maximum hit taken (MaxHit), and the effects 
 - **Look up game data and prices** (`pob data` / `pob price` / `pob meta` / `pob poedb` / `pob wiki`): The local bilingual index covers gems, unique items, modifiers, and bases. Online queries cover poe.ninja prices and build trends, PoEDB, and PoE Wiki.
   - A SQLite/FTS5 index is built from PoB's Lua data and can be searched without starting PoB, usually within 15 ms. It includes Foulborn unique variants, bench/Eldritch/corrupted modifiers, and English↔Chinese names; one command can search multiple terms.
 - **Find gear and fill modifier gaps** (`pob trade` / `pob bench`): Search official trade listings, compare upgrades in PoB, inspect available bench crafts, and preview same-tier Harvest resistance conversions. Trade commands only search and calculate; they do not buy items for you.
+  - `pob item inspect` classifies rare-item prefixes, suffixes, hybrid modifiers, and existing bench crafts; uncertain matches never imply a free slot. Trade search uses `--bench-craft` to evaluate legal additions or replacements at maximum rolls and compare the resulting PoB gains.
   - Local `TradeSiteStats.lua` resolves English and Chinese trade stats and distinguishes local item modifiers from global ones. Searches respect rate limits reported in GGG response headers and support 3.30 instant buyout listings and `chaos_equiv` prices.
   - `--allow-conversion` considers eligible same-tier Harvest resistance swaps and checks modifier-group conflicts; `--sum` builds official trade Weighted Sum groups and sorts by sum. Candidate DPS / EHP changes are calculated by PoB in batches. `pob bench` combines `ModMaster.lua` with local cost and unlock data to suggest verifiable bench crafts.
 - **One-shot build diagnosis, anti-hallucination guardrails, and universal Agent Skill** (`pob diagnose` / `pob ground` / `skills/pob`): Built for fast/lightweight AI models as well as players, a single command reports dewatered Pinnacle numbers, Ascendancy and Bloodline node stats, all skill groups, zero-effect or conflicting supports, `0.033s` trigger cooldown breakpoints and overspeed checks, and Low-Life Chaos bypass bricks while blocking Path of Exile 2 and removed 3.23–3.25 mechanics from leaking into PoE 1 answers.
@@ -259,6 +260,10 @@ pob config list --all --search "boss" --with-options
 pob items
 pob items --slot "Weapon 1" --raw
 pob items --all --raw
+
+# Inspect affix occupancy and compatible crafts on equipped or pasted items
+pob item inspect --slot "Ring 2" --want "Cold Resistance"
+pob item inspect --file copied-item.txt --slot gloves --want "maximum Life"
 
 # Show skill groups or details for each gem in the main group
 pob skills
@@ -487,9 +492,16 @@ pob trade search --slot ring1 --budget 15 --stat "最大生命=65" --open-suffix
 pob bench list --slot ring1 --affix suffix --search "抗性"
 pob bench suggest --slot gloves --stat "冰霜抗性"
 
+# Compare listed items with maximum-roll added/replaced bench crafts
+pob trade search --slot gloves --budget 20 --currency divine --stat "to Dexterity=55" --bench-craft "Area Damage" --pob on
+
 # 4. Preview a Harvest resistance swap; the resulting value must be rerolled
 pob trade convert --file .\dropped_gloves.txt --to lightning
 ```
+
+Repeat `--bench-craft` for multiple craft targets. Results default to PoB ranking; `--pob-limit` counts source listings, each of which may produce multiple craft variants. `--budget` caps listing prices only: crafting, removal, and repeated crafting costs are additional. Hard `--stat` filters apply before crafting. JSON `bench_craft` includes crafted lines, removed lines, costs, the maximum-roll marker, and original listing text.
+
+`pob item inspect` is read-only and does not apply a craft. Unknown, ambiguous, or unresolved-base matches produce unknown open-slot counts, and suggestions require checking the item. Supply `--slot` when pasted text has no inferable item type. Trade craft simulation skips uncertain occupancy, corrupted/mirrored items, and unsupported special crafting cases.
 
 ---
 

@@ -51,6 +51,7 @@
   - 本地数据库由 PoB 的 Lua 数据建立 SQLite/FTS5 索引；无需启动 PoB，查询通常在 15ms 内完成。覆盖秽生传奇变体、工艺台/古灵/腐化词缀和中英名称互查，一条命令可同时查多个词。
 - **找装备、补词缀**（`pob trade` / `pob bench`）：搜索官方交易市集的在售装备，用 PoB 比较换装收益；还能查看工艺台可补的词缀，并试算丰收同阶元素抗性转换。交易功能只负责搜索和计算，不会代替玩家购买。
   - `TradeSiteStats.lua` 在本地匹配中英文交易词缀，并区分装备局部词缀与全局词缀；交易搜索遵守 GGG 响应头给出的请求频率限制，支持 3.30 一口价搜索和 `chaos_equiv` 折算。
+  - `pob item inspect` 识别稀有装备的前后缀、复合词缀和现有大师工艺；占用不确定时不会假定存在空位。交易搜索可用 `--bench-craft` 对可添加或替换的工艺按最高数值试算，并比较加工后的 PoB 收益。
   - `--allow-conversion` 只在满足条件时考虑丰收同阶转抗，并检查词缀组冲突；`--sum` 支持官方市集的加权和（Weighted Sum）词缀分组与按总和降序排序；候选装备的 DPS / EHP 变化由 PoB 批量计算。`pob bench` 结合 `ModMaster.lua` 与本地费用/解锁数据给出可验证的工艺台词缀建议。
 - **一键构筑诊断、防幻觉校验与通用 Agent Skill**（`pob diagnose` / `pob ground` / `skills/pob`）：面向快速/轻量 AI 模型设计，单条命令输出去水面板、升华与血脉词条、全技能组、0% 失效或互斥辅助石、`0.033s` 触发冷却断点与超速（Overspeed）检查、低血防混沌穿透失效等构筑隐患，并拦截《流放之路 2》及 3.23–3.25 已移除机制的跨版本误用。
   - `pob diagnose` 支持 `-c/--compare` 单命令双构筑去水横评与 `-q/--ask` 问题伴随核对；每次构筑输出附带 `[Env: PoE1 3.30 (NOT PoE2) | ... (rev=N)]` 状态标记，避免多轮长对话混淆历史面板。仓库内置跨宿主通用的 [`skills/pob/SKILL.md`](skills/pob/SKILL.md)，可在 DeepSeek Harness、Claude Code、Codex、OpenCode、Cursor 等环境中直接加载。
@@ -259,6 +260,10 @@ pob config list --all --search "boss" --with-options
 pob items
 pob items --slot "Weapon 1" --raw
 pob items --all --raw
+
+# 诊断装备前后缀占用，以及可添加或替换的大师工艺
+pob item inspect --slot "Ring 2" --want "Cold Resistance"
+pob item inspect --file copied-item.txt --slot gloves --want "maximum Life"
 
 # 查看全部技能组，或主技能组中每颗宝石的详细信息
 pob skills
@@ -485,9 +490,16 @@ pob trade search --slot ring1 --budget 15 --stat "最大生命=65" --open-suffix
 pob bench list --slot ring1 --affix suffix --search "抗性"
 pob bench suggest --slot gloves --stat "冰霜抗性"
 
+# 同时比较原商品与添加／替换大师工艺后的装备（最高数值）
+pob trade search --slot gloves --budget 20 --currency divine --stat "to Dexterity=55" --bench-craft "Area Damage" --pob on
+
 # 4. 预览丰收转换元素抗性后的物品文本；转换后的数值仍需重骰
 pob trade convert --file .\dropped_gloves.txt --to lightning
 ```
+
+`--bench-craft` 可重复指定工艺方向，默认按 PoB 收益排序；`--pob-limit` 限制原商品数量，每件商品可生成多个加工方案。`--budget` 仅限制挂牌价，工艺、移除与重复加工费用另计；`--stat` 硬性条件筛选加工前的装备。JSON 的 `bench_craft` 包含加工词条、移除词条、费用、最高数值标记和原商品文本。
+
+`pob item inspect` 只读，不会实际加工装备。无法匹配、存在歧义或未知底材时，空词缀数量会标为未知；工艺建议须核对装备。粘贴文本无法推断装备类型时，请提供 `--slot`。交易加工试算会跳过无法确认占用、腐化、镜像及不支持的特殊加工情况。
 
 ---
 

@@ -236,6 +236,7 @@ class Candidate:
     weighted_sum: float | None = None
     pob: PobEval | None = None
     pob_error: str | None = None
+    bench_craft: dict[str, Any] | None = None
 
     @property
     def display_name(self) -> str:
@@ -858,10 +859,14 @@ def format_report(
             ", ".join(f"{conv.element}->{conv.target}" for conv in candidate.conversions)
             or "-"
         )
+        item_label = candidate.display_name
+        if candidate.bench_craft:
+            craft = candidate.bench_craft
+            item_label += f" [bench: {' / '.join(craft['lines'])}; +{craft['cost']}]"
         score_str = f"{_finite_float(candidate.score):g}"
         row_cells: list[Any] = [
             index,
-            _escape(candidate.display_name),
+            _escape(item_label),
             _escape(candidate.price_text),
         ]
         if has_sum:
@@ -926,8 +931,8 @@ def format_report(
         lines.append("")
         lines.append(
             "> Bench modifiers roll below high-tier natural mods and need the matching "
-            "open prefix/suffix. Preview with the `{crafted}` minimum-roll floor line in PoB "
-            "before buying the base, then craft and re-check."
+            "open prefix/suffix. Hints show minimum-roll reference lines; `--bench-craft` "
+            "simulates maximum rolls. Re-check the crafted result in PoB."
         )
         lines.append("")
 
@@ -935,6 +940,15 @@ def format_report(
         lines.append(f"## {index}. {sanitize_text(candidate.display_name)} - {sanitize_text(candidate.price_text)}")
         if candidate.url:
             lines.append(f"[Trade listing]({candidate.url})")
+        if candidate.bench_craft:
+            craft = candidate.bench_craft
+            lines.append(
+                f"Bench ({craft['action']}, maximum roll): {' / '.join(craft['lines'])}; "
+                f"cost: {craft['cost']}" + (" + remove existing craft" if craft['action'] == 'replace_craft' else "")
+            )
+            if craft['action'] == 'replace_craft':
+                lines.append("Removed craft: " + "; ".join(_escape(line) for line in craft['removed_lines']))
+            lines.append("Maximum-roll target; repeated crafting/removal costs are not included.")
         lines.append("")
         if candidate.pob is not None:
             pob = candidate.pob
@@ -1016,6 +1030,7 @@ def report_json(candidates: list[Candidate]) -> list[dict[str, Any]]:
             "conversion_warnings": list(candidate.conversion_warnings),
             "pob": candidate.pob.as_dict() if candidate.pob is not None else None,
             "pob_error": candidate.pob_error,
+            "bench_craft": candidate.bench_craft,
             "gains": [
                 {
                     "mod": delta.example,
