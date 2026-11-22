@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import statistics
 import sys
 from pathlib import Path
 from typing import Any
@@ -20,21 +21,24 @@ from . import bench as bench_mod
 from .cli import _emit_json, _emit_text, _output_options, _resolve_output_flags
 from .daemon import BootstrapMissingError, call_daemon
 from .errors import CrossGameHallucinationError
-from .external_data import resolve_current_trade_league
+from .external_data import _fetch_dense_overviews, resolve_current_trade_league
 from .formatters import emit_json, render_table, render_update_warning
 from .guardrails import GuardrailScope, check_input, check_input_item_raw, validate_url
 from .importers import _get_cache_dir
 from .trade_client import (
+    MAX_FETCH_IDS,
     CookieRequired,
     NoResults,
     RateLimited,
     TradeClient,
     TradeError,
+    seller_url,
 )
 from .trade_eval import (
     Candidate,
     compare_items,
     format_report,
+    listing_age_hours,
     parse_weights,
     preferred_templates,
     report_json,
@@ -237,6 +241,77 @@ def _price_of(row: dict[str, Any]) -> tuple[float | None, str | None]:
     return parsed_amount, (str(currency) if currency else None)
 
 
+def _chaos_rates(client: Any, league: str, proxy: str | None) -> dict[str, float]:
+    """Trade currency id -> chaos value (poe.ninja); only chaos itself when a source is unreachable."""
+    rates = {"chaos": 1.0}
+    try:
+        ids = {
+            str(entry.get("text")): str(entry.get("id"))
+            for group in client.static()
+            for entry in group.get("entries") or []
+        }
+        for line in _fetch_dense_overviews(league, proxy=proxy).get("Currency") or []:
+            if line.get("name") in ids and line.get("chaos"):
+                rates.setdefault(ids[line["name"]], float(line["chaos"]))
+    except Exception:
+        pass
+    return rates
+
+
+def _price_chaos(row: dict[str, Any], rates: dict[str, float]) -> float | None:
+    amount, currency = _price_of(row)
+    rate = rates.get(currency or "")
+    return amount * rate if (amount is not None and rate) else None
+
+
+def _fetch_fresh(
+    client: Any, ids: list[str], query_id: str, *, want: int, max_age: float
+) -> tuple[list[dict[str, Any]], int]:
+    """Fetch price-ordered listings until ``want`` are within ``max_age`` hours.
+
+    The server's "listed" window is coarser than ``max_age``, so the cheapest page alone
+    can be all too old. Returns (fresh rows, rows fetched); stops after 5 requests.
+    """
+    fresh: list[dict[str, Any]] = []
+    fetched = 0
+    for start in range(0, min(len(ids), 5 * MAX_FETCH_IDS), MAX_FETCH_IDS):
+        if len(fresh) >= want:
+            break
+        chunk = client.fetch(ids[start : start + MAX_FETCH_IDS], query_id)
+        fetched += len(chunk)
+        # Listings with no readable time are kept: the server already bounded them.
+        fresh.extend(row for row in chunk if (listing_age_hours(row) or 0.0) <= max_age)
+    return fresh, fetched
+
+
+def _search_rows(
+    client: Any, league: str, body: dict[str, Any], *, want: int, max_age: float | None
+) -> tuple[str, int, list[dict[str, Any]], int]:
+    """Search, then fetch up to ``want`` listings (only fresh ones when ``max_age`` is set).
+
+    Returns (query id, total matches, rows, rows fetched).
+    """
+    found = client.search(league, body)
+    query_id = str(found.get("id") or "")
+    ids = [str(item) for item in found.get("result") or []]
+    total = int(found.get("total") or len(ids))
+    if max_age is None:
+        rows = client.fetch_many(ids, query_id, limit=want)
+        return query_id, total, rows, len(rows)
+    rows, fetched = _fetch_fresh(client, ids, query_id, want=want, max_age=max_age)
+    return query_id, total, rows, fetched
+
+
+def _market_chaos(cheapest: list[dict[str, Any]], rates: dict[str, float]) -> float | None:
+    """Going price in chaos: the median of the cheapest listings of the search, any age.
+
+    Comparing with old listings only does not work: cheap items sell, so what stays listed
+    is overpriced and every fresh listing looks like a bargain. None under 5 known prices.
+    """
+    prices = [price for row in cheapest if (price := _price_chaos(row, rates)) is not None]
+    return statistics.median(prices) if len(prices) >= 5 else None
+
+
 _PSEUDO_SUM_RE = re.compile(r"^\s*Sum:\s*([+-]?\d+(?:\.\d+)?)", re.IGNORECASE)
 
 
@@ -404,6 +479,20 @@ def cmd_trade_stats(
     show_default=True,
     help="Trade listing availability (available = instant buyout + online).",
 )
+@click.option(
+    "--max-age",
+    type=click.FloatRange(min=0, min_open=True),
+    help="Only listings indexed within this many hours (stale listings are usually overpriced), e.g. 15.",
+)
+@click.option(
+    "--bargain",
+    type=click.FloatRange(min=0),
+    help=(
+        "Flag listings at least this many percent below the going price (median of the 10 "
+        "cheapest listings of the same search, any age) and list them first; costs one more "
+        "search. Pair with --max-age to catch underpriced fresh listings, e.g. 30."
+    ),
+)
 @click.option("--league", help="League name (defaults to current softcore trade league).")
 @click.option("--rarity", default="rare", show_default=True, help="Rarity filter (any to disable).")
 @click.option("--ilvl-min", type=int, default=0, show_default=True, help="Minimum item level.")
@@ -492,6 +581,8 @@ def cmd_trade_search(
     budget: float | None,
     currency: str,
     status: str,
+    max_age: float | None,
+    bargain: float | None,
     league: str | None,
     rarity: str,
     ilvl_min: int,
@@ -667,7 +758,7 @@ def cmd_trade_search(
                 rarity=rarity,
                 weighted_groups=weighted_groups,
             )
-            query = build_query(
+            query_args: dict[str, Any] = dict(
                 plan=plan,
                 category=resolved_category,
                 rarity=rarity,
@@ -679,6 +770,7 @@ def cmd_trade_search(
                 pseudo_filters=pseudo_filters or None,
                 allow_corrupted=allow_corrupted,
             )
+            query = build_query(**query_args, max_age_hours=max_age)
         except ValueError as exc:
             _err_utf8(str(exc))
             ctx.exit(1)
@@ -698,23 +790,57 @@ def cmd_trade_search(
             _emit_json(payload, compact=compact, out_path=out_path, sanitize=True)
             return
 
+        want = max(0, min(fetch_limit, 20))
+        rows: list[dict[str, Any]] = []
+        stale_fallback = False
         try:
-            search_res = client.search(league_name, query)
+            try:
+                query_id, total, rows, fetched = _search_rows(
+                    client, league_name, query, want=want, max_age=max_age
+                )
+            except NoResults:
+                if max_age is None or not want:
+                    raise
+            if max_age is not None and not rows and want:
+                # Nothing that fresh: show the older listings rather than an empty report.
+                # `query` is replaced so the links and the JSON match what is listed.
+                query = build_query(**query_args)
+                query_id, total, rows, fetched = _search_rows(
+                    client, league_name, query, want=want, max_age=None
+                )
+                stale_fallback = True
         except TradeError as exc:
             _trade_error(ctx, exc)
             return
-
-        query_id = str(search_res.get("id") or "")
-        ids = [str(item) for item in search_res.get("result") or []]
-        total = int(search_res.get("total") or len(ids))
-
-        try:
-            rows = client.fetch_many(ids, query_id, limit=max(0, min(fetch_limit, 20)))
-        except TradeError as exc:
-            _trade_error(ctx, exc)
-            return
+        dropped_old = fetched - len(rows)
 
         search_url = client.search_url(league_name, query_id) if query_id else ""
+        # Looked up only when it changes the result, so a plain search needs no extra service.
+        needs_rates = bargain is not None or sort_by == "price"
+        rates = _chaos_rates(client, league_name, proxy) if needs_rates else {"chaos": 1.0}
+        market: float | None = None
+        market_note = ""
+        if bargain is not None:
+            if (max_age is None or stale_fallback) and search_sort == "asc" and want >= 10:
+                cheapest = rows[:10]  # this search already is "cheapest first, any age"
+            else:
+                try:
+                    cheapest = _search_rows(
+                        client,
+                        league_name,
+                        build_query(**{**query_args, "search_sort": "asc"}),
+                        want=10,
+                        max_age=None,
+                    )[2]
+                except TradeError:
+                    cheapest = []
+            market = _market_chaos(cheapest, rates)
+            market_note = (
+                f"median of the {len(cheapest)} cheapest listings (any age) is {market:g} chaos; "
+                f"BARGAIN = at least {bargain:g}% below that (price only - judge the item by the PoB columns)"
+                if market
+                else "no going price (under 5 priced listings, or the market search failed); nothing flagged"
+            )
 
     candidates: list[Candidate] = []
     for row in rows:
@@ -747,25 +873,32 @@ def cmd_trade_search(
         deltas = compare_items(current, item, weights=weight_map, preferred=preferred)
         amount, price_currency = _price_of(row)
         weighted_sum = _weighted_sum_of(raw_item)
-        candidates.append(
-            Candidate(
-                raw=row,
-                item=item,
-                item_text=text,
-                price_amount=amount,
-                price_currency=price_currency,
-                score=score_deltas(deltas),
-                deltas=deltas,
-                conversions=conversions,
-                conversion_warnings=conversion_warnings,
-                url=search_url,
-                listing_id=row.get("id"),
-                weighted_sum=weighted_sum,
-            )
+        candidate = Candidate(
+            raw=row,
+            item=item,
+            item_text=text,
+            price_amount=amount,
+            price_currency=price_currency,
+            score=score_deltas(deltas),
+            deltas=deltas,
+            conversions=conversions,
+            conversion_warnings=conversion_warnings,
+            url=search_url,
+            listing_id=row.get("id"),
+            weighted_sum=weighted_sum,
+            price_chaos=_price_chaos(row, rates),
         )
+        if candidate.seller:
+            # One seller rarely has two matching items, so this link lands on the item itself.
+            candidate.url = seller_url(league_name, query["query"], candidate.seller)
+        if market and candidate.price_chaos is not None and bargain is not None:
+            candidate.vs_market_pct = (candidate.price_chaos / market - 1) * 100
+            candidate.bargain = candidate.vs_market_pct <= -bargain
+        candidates.append(candidate)
 
     pre_sort = "sum" if (sort_by == "sum" or (search_sort == "sum" and sort_by != "price")) else "score"
     candidates = sort_candidates(candidates, pre_sort)
+    candidates.sort(key=lambda c: not c.bargain)  # stable: bargains get PoB-verified first
 
     verification_limit = max(0, pob_limit)
     if bench_crafts and not dump_query:
@@ -827,7 +960,9 @@ def cmd_trade_search(
                     "report only shows modifier deltas, not DPS."
                 )
 
-    ordered = sort_candidates(candidates, sort_by)[: max(0, max_results)]
+    ordered = sort_candidates(candidates, sort_by)
+    ordered.sort(key=lambda c: not c.bargain)  # stable: bargains first, order otherwise kept
+    ordered = ordered[: max(0, max_results)]
     conversion_note = ""
     if plan.conversions:
         parts = []
@@ -851,7 +986,12 @@ def cmd_trade_search(
             "query": query,
             "searchUrl": search_url,
             "total": total,
-            "fetched": len(rows),
+            "fetched": fetched,
+            "maxAgeHours": max_age,
+            "droppedOld": dropped_old,
+            "staleFallback": stale_fallback,
+            "bargainPct": bargain,
+            "marketChaos": market,
             "conversion": _conversion_payload(plan),
             "openAffixes": open_flags,
             "benchOptions": bench_options,
@@ -874,14 +1014,22 @@ def cmd_trade_search(
         candidates=ordered,
         league=league_name,
         status=status,
+        listed_note=(
+            ""
+            if max_age is None
+            else f"NOTHING within {max_age:g}h - showing older listings instead"
+            if stale_fallback
+            else f"within {max_age:g}h ({dropped_old} older dropped)"
+        ),
         budget=budget,
         currency=currency,
         search_url=search_url,
         total=total,
-        fetched=len(rows),
+        fetched=fetched,
         conversion_note=conversion_note,
         open_affixes=open_flags,
         bench_options=bench_options,
+        market_note=market_note,
     )
     _emit_text(_prepend_warning(body, update_warning), out_path=out_path)
     if current_error:

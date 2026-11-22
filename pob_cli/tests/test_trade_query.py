@@ -442,6 +442,18 @@ def test_build_query_status_currency_and_corrupted_mirrored_guards() -> None:
     with pytest.raises(ValueError, match="Invalid trade status"):
         tq.build_query(plan=plan_with_conv, category=None, rarity="rare", status="bogus")
 
+    # max_age_hours picks the smallest site window covering it, alongside the price filter
+    def window(hours: float) -> dict | None:
+        body = tq.build_query(plan=plan_with_conv, category=None, rarity="rare", budget=5, max_age_hours=hours)
+        filters = body["query"]["filters"]["trade_filters"]["filters"]
+        assert filters["price"] == {"max": 5}
+        return filters.get("indexed")
+
+    assert window(15) == {"option": "1day"}
+    assert window(12) == {"option": "12hours"}
+    assert window(0.5) == {"option": "1hour"}
+    assert window(5000) is None
+
 
 def test_weighted_sum_group_parsing_and_query_building() -> None:
     grp = tq.parse_sum_group_argument(

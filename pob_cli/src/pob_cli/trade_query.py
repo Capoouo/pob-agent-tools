@@ -349,6 +349,12 @@ OPEN_AFFIX_ID = "pseudo.pseudo_number_of_empty_affix_mods"
 
 VALID_STATUSES: tuple[str, ...] = ("available", "securable", "online", "onlineleague", "any")
 
+# `trade_filters.indexed` options of /api/trade/data/filters, as (hours covered, option id).
+INDEXED_WINDOWS: tuple[tuple[int, str], ...] = (
+    (1, "1hour"), (3, "3hours"), (12, "12hours"), (24, "1day"), (72, "3days"),
+    (168, "1week"), (336, "2weeks"), (720, "1month"), (1440, "2months"),
+)
+
 STAT_TYPE_ORDER: dict[str, int] = {
     "explicit": 0,
     "crafted": 1,
@@ -1518,6 +1524,7 @@ def build_query(
     pseudo_filters: list[dict[str, Any]] | None = None,
     exclude_corrupted_mirrored: bool | None = None,
     allow_corrupted: bool = False,
+    max_age_hours: float | None = None,
 ) -> dict[str, Any]:
     """Build an official PoE1 ``/api/trade/search`` JSON request body."""
     status_norm = (status or "available").strip().lower()
@@ -1606,13 +1613,22 @@ def build_query(
     if type_filters:
         filter_block["type_filters"] = {"filters": type_filters}
 
+    trade_filters: dict[str, Any] = {}
     if budget is not None and budget > 0:
         curr_norm = (currency or "").strip().lower()
         if curr_norm in ("", "chaos_equiv", "equiv"):
             price_filter: dict[str, Any] = {"max": budget}
         else:
             price_filter = {"option": curr_norm, "max": budget}
-        filter_block["trade_filters"] = {"filters": {"price": price_filter}}
+        trade_filters["price"] = price_filter
+    if max_age_hours is not None and max_age_hours > 0:
+        # The site only offers fixed windows: take the smallest one that covers the
+        # limit; the caller trims the remainder from each listing's `indexed` time.
+        window = next((opt for hours, opt in INDEXED_WINDOWS if max_age_hours <= hours), None)
+        if window:
+            trade_filters["indexed"] = {"option": window}
+    if trade_filters:
+        filter_block["trade_filters"] = {"filters": trade_filters}
 
     should_exclude = (
         (bool(plan.conversions) and not allow_corrupted)

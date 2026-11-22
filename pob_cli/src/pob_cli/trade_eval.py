@@ -11,6 +11,7 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Callable, Iterable
 
 from .formatters import _parse_numeric_or_none, fmt_delta, fmt_num, render_table
@@ -220,6 +221,26 @@ class PobEval:
         }
 
 
+def listing_age_hours(row: dict[str, Any], now: datetime | None = None) -> float | None:
+    """Hours since the trade site indexed a fetched listing row (None when unknown)."""
+    listing = row.get("listing") if isinstance(row, dict) else None
+    try:
+        then = datetime.fromisoformat(str((listing or {}).get("indexed")))
+    except ValueError:
+        return None
+    if then.tzinfo is None:
+        then = then.replace(tzinfo=timezone.utc)
+    return max(0.0, ((now or datetime.now(timezone.utc)) - then).total_seconds() / 3600)
+
+
+def _age_text(hours: float | None) -> str:
+    if hours is None:
+        return "-"
+    if hours < 1:
+        return f"{hours * 60:.0f}m"
+    return f"{hours:.1f}h" if hours < 48 else f"{hours / 24:.0f}d"
+
+
 @dataclass
 class Candidate:
     raw: dict[str, Any]
@@ -234,6 +255,9 @@ class Candidate:
     url: str = ""
     listing_id: str | None = None
     weighted_sum: float | None = None
+    price_chaos: float | None = None  # price in chaos when the currency rate is known
+    vs_market_pct: float | None = None  # price vs the going price; negative = cheaper
+    bargain: bool = False
     pob: PobEval | None = None
     pob_error: str | None = None
     bench_craft: dict[str, Any] | None = None
@@ -241,6 +265,17 @@ class Candidate:
     @property
     def display_name(self) -> str:
         return self.item.display_name
+
+    @property
+    def seller(self) -> str | None:
+        listing = self.raw.get("listing") if isinstance(self.raw, dict) else None
+        account = (listing or {}).get("account")
+        name = account.get("name") if isinstance(account, dict) else None
+        return str(name) if name else None
+
+    @property
+    def age_hours(self) -> float | None:
+        return listing_age_hours(self.raw)
 
     @property
     def price_text(self) -> str:
@@ -717,6 +752,19 @@ def eval_trade_items(
 # ---------------------------------------------------------------------------
 
 
+def _price_key(candidate: Candidate) -> tuple[bool, float]:
+    # shortcut: compares raw amounts across currencies when no rate is known (poe.ninja
+    # unreachable or an exotic currency); rank by the API's own order if that ever matters.
+    value = candidate.price_chaos if candidate.price_chaos is not None else candidate.price_amount
+    return (value is None or not math.isfinite(value), _finite_sort_key(value, 0.0))
+
+
+def _vs_market_text(candidate: Candidate) -> str:
+    if candidate.vs_market_pct is None:
+        return "-"
+    return f"{candidate.vs_market_pct:+.0f}%" + (" BARGAIN" if candidate.bargain else "")
+
+
 def sort_candidates(candidates: list[Candidate], sort: str = "score") -> list[Candidate]:
     """Sort candidates by ``score``, ``price``, ``sum``, or ``pob`` (always NaN-safe)."""
     if sort == "sum":
@@ -725,20 +773,12 @@ def sort_candidates(candidates: list[Candidate], sort: str = "score") -> list[Ca
             key=lambda c: (
                 c.weighted_sum is None or not math.isfinite(c.weighted_sum),
                 -_finite_sort_key(c.weighted_sum, 0.0),
-                c.price_amount is None or not math.isfinite(c.price_amount),
-                _finite_sort_key(c.price_amount, 0.0),
+                *_price_key(c),
                 -_finite_sort_key(c.score, 0.0),
             ),
         )
     if sort == "price":
-        return sorted(
-            candidates,
-            key=lambda c: (
-                c.price_amount is None or not math.isfinite(c.price_amount),
-                _finite_sort_key(c.price_amount, 0.0),
-                -_finite_sort_key(c.score, 0.0),
-            ),
-        )
+        return sorted(candidates, key=lambda c: (*_price_key(c), -_finite_sort_key(c.score, 0.0)))
     if sort == "pob":
         return sorted(
             candidates,
@@ -746,18 +786,10 @@ def sort_candidates(candidates: list[Candidate], sort: str = "score") -> list[Ca
                 c.pob is None,
                 -_finite_sort_key(c.pob.combined_pct if c.pob is not None else None, 0.0),
                 -_finite_sort_key(c.score, 0.0),
-                c.price_amount is None or not math.isfinite(c.price_amount),
-                _finite_sort_key(c.price_amount, 0.0),
+                *_price_key(c),
             ),
         )
-    return sorted(
-        candidates,
-        key=lambda c: (
-            -_finite_sort_key(c.score, 0.0),
-            c.price_amount is None or not math.isfinite(c.price_amount),
-            _finite_sort_key(c.price_amount, 0.0),
-        ),
-    )
+    return sorted(candidates, key=lambda c: (-_finite_sort_key(c.score, 0.0), *_price_key(c)))
 
 
 def _escape(value: str) -> str:
@@ -807,6 +839,8 @@ def format_report(
     conversion_note: str = "",
     open_affixes: dict[str, bool] | None = None,
     bench_options: list[dict[str, Any]] | None = None,
+    listed_note: str = "",
+    market_note: str = "",
 ) -> str:
     """Render a high-SNR GitHub-flavored Markdown report for trade upgrade candidates."""
     lines: list[str] = ["# Gear upgrade candidates (PoE1 official trade)", ""]
@@ -823,6 +857,10 @@ def format_report(
         lines.append(f"- Trade link: {search_url}")
     if conversion_note:
         lines.append(f"- Conversion: {sanitize_text(conversion_note)}")
+    if listed_note:
+        lines.append(f"- Listed: {sanitize_text(listed_note)}")
+    if market_note:
+        lines.append(f"- Market: {sanitize_text(market_note)}")
     if open_affixes and any(open_affixes.values()):
         wanted = [key for key, enabled in open_affixes.items() if enabled]
         lines.append(
@@ -843,7 +881,13 @@ def format_report(
         candidate.weighted_sum is not None and math.isfinite(candidate.weighted_sum)
         for candidate in candidates
     )
+    has_listing = any(candidate.seller or candidate.age_hours is not None for candidate in candidates)
+    has_market = any(candidate.vs_market_pct is not None for candidate in candidates)
     headers = ["#", "Item", "Price"]
+    if has_market:
+        headers.append("vs market")
+    if has_listing:
+        headers.extend(["Seller", "Listed"])
     if has_sum:
         headers.append("Sum")
     headers.append("Score")
@@ -869,6 +913,10 @@ def format_report(
             _escape(item_label),
             _escape(candidate.price_text),
         ]
+        if has_market:
+            row_cells.append(_vs_market_text(candidate))
+        if has_listing:
+            row_cells.extend([_escape(candidate.seller or "-"), _age_text(candidate.age_hours)])
         if has_sum:
             sum_str = (
                 f"{candidate.weighted_sum:g}"
@@ -940,6 +988,10 @@ def format_report(
         lines.append(f"## {index}. {sanitize_text(candidate.display_name)} - {sanitize_text(candidate.price_text)}")
         if candidate.url:
             lines.append(f"[Trade listing]({candidate.url})")
+        if has_listing:
+            lines.append(f"Seller: {_escape(candidate.seller or '-')} | Listed: {_age_text(candidate.age_hours)} ago")
+        if candidate.vs_market_pct is not None:
+            lines.append(f"Price vs market: {_vs_market_text(candidate)}")
         if candidate.bench_craft:
             craft = candidate.bench_craft
             lines.append(
@@ -1022,7 +1074,12 @@ def report_json(candidates: list[Candidate]) -> list[dict[str, Any]]:
             "price": {
                 "amount": _json_safe_optional_float(candidate.price_amount),
                 "currency": candidate.price_currency,
+                "chaos": _json_safe_optional_float(candidate.price_chaos),
             },
+            "vs_market_pct": _json_safe_optional_float(candidate.vs_market_pct),
+            "bargain": candidate.bargain,
+            "seller": candidate.seller,
+            "age_hours": _json_safe_optional_float(candidate.age_hours),
             "weighted_sum": _json_safe_optional_float(candidate.weighted_sum),
             "score": _finite_float(candidate.score),
             "url": candidate.url,

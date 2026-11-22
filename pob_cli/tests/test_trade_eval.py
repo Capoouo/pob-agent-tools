@@ -1466,3 +1466,33 @@ def test_eval_trade_items_sourceless_explode_group_and_chinese_raw_disable_fast_
         assert all(r["ok"] for r in res_cx["results"])
         assert len([b for b in w_cx.batch_calls if len(b) == 2 and b[0][0] == "equip_item"]) == 0
         assert sum(1 for m in w_cx.all_methods if m == "import_code") == 2
+
+
+def test_listing_seller_and_age_in_report() -> None:
+    from datetime import datetime, timedelta, timezone
+
+    from pob_cli.trade_eval import listing_age_hours
+
+    now = datetime(2026, 11, 23, 12, 0, tzinfo=timezone.utc)
+    row = {"listing": {"indexed": "2026-11-23T09:30:00Z", "account": {"name": "Seller#1234"}}}
+    assert listing_age_hours(row, now) == pytest.approx(2.5)
+    assert listing_age_hours({"listing": {"indexed": "garbage"}}, now) is None
+    assert listing_age_hours({}, now) is None
+
+    text = "Rarity: Rare\nTest Ring\nCoral Ring\n--------\n+70 to maximum Life"
+    plain = _make_candidate(text)
+    assert plain.seller is None and plain.age_hours is None
+    assert "Seller" not in format_report(
+        build_label="b", slot="ring1", current=None, candidates=[plain], league="Standard"
+    )
+
+    listed = _make_candidate(text)
+    recent = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
+    listed.raw = {"listing": {"indexed": recent, "account": {"name": "Seller#1234"}}}
+    report = format_report(
+        build_label="b", slot="ring1", current=None, candidates=[listed], league="Standard"
+    )
+    assert "| Seller" in report and "Seller: Seller#1234 | Listed: 3.0h ago" in report
+    payload = report_json([listed])[0]
+    assert payload["seller"] == "Seller#1234"
+    assert payload["age_hours"] == pytest.approx(3.0, abs=0.01)

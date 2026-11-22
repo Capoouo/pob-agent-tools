@@ -11,6 +11,7 @@ import pytest
 from click.testing import CliRunner
 
 from pob_cli import cli_trade
+from pob_cli.cli_trade import _chaos_rates as _real_chaos_rates  # conftest stubs the module attribute
 from pob_cli.cli import main
 from pob_cli.trade_client import CookieRequired, NoResults, RateLimited, TradeClient
 
@@ -1243,6 +1244,153 @@ def test_trade_search_weighted_sum_cli_and_pseudo_sum_extraction(
     data = json.loads(res.output)
     assert [c["name"] for c in data["candidates"]] == ["High Sum (Slink Gloves)", "Low Sum (Slink Gloves)"]
     assert [c["weighted_sum"] for c in data["candidates"]] == [88.0, 55.0]
+
+
+def test_chaos_rates_maps_trade_currency_ids(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Static:
+        def static(self) -> list[dict[str, Any]]:
+            return [{"id": "Currency", "entries": [{"id": "divine", "text": "Divine Orb"}, {"id": "alch", "text": "Orb of Alchemy"}]}]
+
+    ninja = {"Currency": [{"name": "Divine Orb", "chaos": 200}, {"name": "Orb of Alchemy", "chaos": 0.07}, {"name": "Not On Trade", "chaos": 5}]}
+    monkeypatch.setattr(cli_trade, "_fetch_dense_overviews", lambda *_a, **_kw: ninja)
+    assert _real_chaos_rates(_Static(), "Covens", None) == {"chaos": 1.0, "divine": 200.0, "alch": 0.07}
+    # Either source failing leaves only chaos, so prices in other currencies stay unconverted.
+    assert _real_chaos_rates(object(), "Covens", None) == {"chaos": 1.0}
+
+
+def test_trade_search_max_age_bargain_and_seller_link(monkeypatch: pytest.MonkeyPatch) -> None:
+    import base64
+    import gzip
+    from datetime import datetime, timedelta, timezone
+
+    monkeypatch.setattr(cli_trade, "load_trade_stats", _mock_trade_stats)
+    monkeypatch.setattr(cli_trade, "_resolve_league", lambda *_a, **_kw: "Covens")
+    monkeypatch.setattr(cli_trade, "_chaos_rates", lambda *_a, **_kw: {"chaos": 1.0, "divine": 200.0})
+
+    def _row(row_id: str, hours: float, amount: float, currency: str, seller: str) -> dict[str, Any]:
+        indexed = (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return {
+            "id": row_id,
+            "item": {**SAMPLE_FETCH_ROWS[1]["item"], "name": row_id},
+            "listing": {
+                "indexed": indexed,
+                "account": {"name": seller},
+                "price": {"amount": amount, "currency": currency},
+            },
+        }
+
+    # Cheapest page is all 20h old (inside the server's 1-day window, outside --max-age 15);
+    # its median price, 100 chaos, is the going price.
+    rows = {f"old{i}": _row(f"old{i}", 20, 95 + i if i < 5 else 96 + i, "chaos", f"Old#{i}") for i in range(10)}
+    rows["divine"] = _row("divine", 2, 1, "divine", "Rich#1")
+    rows["cheap"] = _row("cheap", 3, 50, "chaos", "Seller#2")
+    searches: list[dict[str, Any]] = []
+
+    class _FakeClient(TradeClient):
+        def search(self, league: str, query: dict[str, Any]) -> dict[str, Any]:
+            searches.append(query)
+            return {"id": "q1", "total": len(rows), "result": list(rows)}
+
+        def fetch(self, ids: list[str], query_id: str) -> list[dict[str, Any]]:
+            return [rows[item_id] for item_id in ids]
+
+    monkeypatch.setattr(cli_trade, "TradeClient", _FakeClient)
+
+    res = CliRunner().invoke(
+        main,
+        [
+            "trade", "search", "--slot", "gloves", "--stat", "to Cold Resistance=30",
+            "--status", "securable", "--max-age", "15", "--bargain", "30",
+            "--sort", "price", "--pob", "off", "--no-compare", "--json",
+        ],
+    )
+    assert res.exit_code == 0, res.output
+    data = json.loads(res.output)
+
+    # The fresh search asks for the 1-day window; the market search drops it.
+    assert searches[0]["query"]["filters"]["trade_filters"]["filters"]["indexed"] == {"option": "1day"}
+    assert "trade_filters" not in searches[1]["query"].get("filters", {})
+
+    # It kept fetching past the stale first page, and 1 divine does not sort before 50 chaos.
+    assert (data["fetched"], data["droppedOld"], data["marketChaos"]) == (12, 10, 100)
+    cheap, divine = data["candidates"]
+    assert (cheap["name"], cheap["bargain"], round(cheap["vs_market_pct"])) == ("cheap (Slink Gloves)", True, -50)
+    assert (divine["price"]["chaos"], divine["bargain"], round(divine["vs_market_pct"])) == (200, False, 100)
+
+    # Each link is the same search narrowed to that listing's seller.
+    blob = cheap["url"].rsplit("/", 1)[1]
+    linked = json.loads(gzip.decompress(base64.urlsafe_b64decode(blob + "=" * (-len(blob) % 4))))
+    assert linked["filters"]["trade_filters"]["filters"]["account"] == {"input": "Seller#2"}
+    assert linked["status"] == {"option": "securable"}
+    assert data["staleFallback"] is False
+
+
+def test_trade_search_plain_run_needs_no_currency_rates(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli_trade, "load_trade_stats", _mock_trade_stats)
+    monkeypatch.setattr(cli_trade, "_resolve_league", lambda *_a, **_kw: "Covens")
+    lookups: list[int] = []
+    monkeypatch.setattr(cli_trade, "_chaos_rates", lambda *_a, **_kw: lookups.append(1) or {"chaos": 1.0})
+
+    class _FakeClient(TradeClient):
+        def search(self, league: str, query: dict[str, Any]) -> dict[str, Any]:
+            return {"id": "q1", "total": 2, "result": ["row_fire", "row_cold"]}
+
+        def fetch_many(self, ids: list[str], query_id: str, limit: int = 10) -> list[dict[str, Any]]:
+            return SAMPLE_FETCH_ROWS[:limit]
+
+    monkeypatch.setattr(cli_trade, "TradeClient", _FakeClient)
+    args = ["trade", "search", "--slot", "gloves", "--stat", "to Cold Resistance=30", "--pob", "off", "--no-compare"]
+    assert CliRunner().invoke(main, args).exit_code == 0 and not lookups
+    assert CliRunner().invoke(main, [*args, "--sort", "price"]).exit_code == 0 and lookups == [1]
+
+
+@pytest.mark.parametrize("window_is_empty", [True, False])
+def test_trade_search_max_age_falls_back_to_older_listings(
+    monkeypatch: pytest.MonkeyPatch, window_is_empty: bool
+) -> None:
+    """Nothing fresh (window empty, or everything in it too old): list the older ones, clearly marked."""
+    import base64
+    import gzip
+    from datetime import datetime, timedelta, timezone
+
+    monkeypatch.setattr(cli_trade, "load_trade_stats", _mock_trade_stats)
+    monkeypatch.setattr(cli_trade, "_resolve_league", lambda *_a, **_kw: "Covens")
+
+    indexed = (datetime.now(timezone.utc) - timedelta(hours=20)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    old_row = {
+        **SAMPLE_FETCH_ROWS[1],
+        "listing": {**SAMPLE_FETCH_ROWS[1]["listing"], "indexed": indexed, "account": {"name": "Old#1"}},
+    }
+    searches: list[dict[str, Any]] = []
+
+    class _FakeClient(TradeClient):
+        def search(self, league: str, query: dict[str, Any]) -> dict[str, Any]:
+            searches.append(query)
+            windowed = "indexed" in json.dumps(query)
+            if windowed and window_is_empty:
+                raise NoResults()
+            return {"id": "q1", "total": 1, "result": ["row_cold"]}
+
+        def fetch(self, ids: list[str], query_id: str) -> list[dict[str, Any]]:
+            return [old_row]
+
+    monkeypatch.setattr(cli_trade, "TradeClient", _FakeClient)
+
+    args = ["trade", "search", "--slot", "gloves", "--stat", "to Cold Resistance=30",
+            "--max-age", "15", "--bargain", "30", "--pob", "off", "--no-compare"]
+    res = CliRunner().invoke(main, [*args, "--json"])
+    assert res.exit_code == 0, res.output
+    data = json.loads(res.output)
+    # Two searches, not three: the fallback already is the "any age" search --bargain needs.
+    assert data["staleFallback"] is True and len(searches) == 2
+    assert [round(c["age_hours"]) for c in data["candidates"]] == [20]
+
+    # The link must not carry the "listed" window, or it could not find the old listing.
+    blob = data["candidates"][0]["url"].rsplit("/", 1)[1]
+    assert b"indexed" not in gzip.decompress(base64.urlsafe_b64decode(blob + "=" * (-len(blob) % 4)))
+
+    report = CliRunner().invoke(main, args)
+    assert "- Listed: NOTHING within 15h - showing older listings instead" in report.output
 
 
 
