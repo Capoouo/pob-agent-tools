@@ -20,6 +20,9 @@ def expand_bench_candidates(candidates: list[Candidate], *, slot: str,
         report = item_inspect.inspect_item(candidate.item_text, slot=slot, wants=wants, limit=20)
         if not report['certain'] or not report['craftEligible'] or not report['item']['itemLevel']:
             continue
+        bench_slot = report.get('benchSlot', slot)
+        if not bench_slot:
+            continue
         crafted = [a for a in report['affixes'] if a['source'] == 'Bench']
         if len(crafted) > 1 or any('multimod' in str(a['group']).lower() for a in crafted):
             continue
@@ -32,7 +35,7 @@ def expand_bench_candidates(candidates: list[Candidate], *, slot: str,
                 continue
             if suggestion['affix'] in report['scaledAffixTypes']:
                 continue
-            recipe = next((r.recipe for r in bench.search(slot, suggestion['want'], limit=15,
+            recipe = next((r.recipe for r in bench.search(bench_slot, suggestion['want'], limit=15,
                            allow_engine=True) if r.recipe.id == suggestion['id']), None)
             if recipe is None:
                 continue

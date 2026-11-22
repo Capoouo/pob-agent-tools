@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pob_cli import item_inspect
 from pob_cli.trade_item import make_mod
+import pytest
 
 
 def _entry(ident: str, kind: str, group: str, *lines: str, level: int = 1, source: str = "Explicit") -> dict:
@@ -100,3 +101,27 @@ def test_replacing_suffix_does_not_free_a_prefix(monkeypatch) -> None:
     assert report['certain']
     assert report['open']['prefix'] == 0
     assert report['suggestions'] == []
+
+
+@pytest.mark.parametrize('identified', [True, False])
+def test_unidentified_item_has_unknown_capacity(monkeypatch, identified):
+    monkeypatch.setattr(item_inspect, '_load_entries', lambda *a, **k: ([], True))
+    monkeypatch.setattr(item_inspect.bench, 'search', lambda *a, **k: [])
+    raw = 'Rarity: RARE\nTest Ring\nIron Ring\nItem Level: 85\nImplicits: 0\n'
+    if not identified:
+        raw += 'Unidentified\n'
+    report = item_inspect.inspect_item(raw, slot='Ring 1')
+    assert report['certain'] is identified
+    assert report['open'] == ({'prefix': 3, 'suffix': 3} if identified else {'prefix': None, 'suffix': None})
+    assert report['craftEligible'] is identified
+
+
+@pytest.mark.parametrize('raw', ['', '   \n'])
+def test_inspect_empty_input_is_clean_cli_error(raw):
+    from click.testing import CliRunner
+    from pob_cli.cli import main
+    result = CliRunner().invoke(main, ['--offline', 'item', 'inspect', '--raw', raw])
+    assert result.exit_code == 1
+    assert 'Error:' in result.output
+    assert 'Traceback' not in result.output
+    assert not isinstance(result.exception, ValueError)

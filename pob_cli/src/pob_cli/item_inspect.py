@@ -75,6 +75,26 @@ def _affix_type(entry: dict[str, Any]) -> str | None:
     return None
 
 
+def _bench_slot(
+    slot: str | None, base_type: str, *, pob_dir: Path | None, runtime_dir: Path | None
+) -> str | None:
+    """Narrow equipment weapon slots to the base's actual crafting class."""
+    if not slot or bench.slot_key(slot) not in ("weapon1", "weapon2"):
+        return slot
+    db_path = game_data.ensure_gamedata_index(pob_dir=pob_dir, runtime_dir=runtime_dir)
+    conn = sqlite3.connect(game_data._sqlite_ro_uri(db_path), uri=True)
+    try:
+        row = conn.execute(
+            "SELECT item_type FROM bases WHERE name_lower=? OR zh_lower=? LIMIT 1",
+            (base_type.lower(), base_type.lower()),
+        ).fetchone()
+    finally:
+        conn.close()
+    slots = bench.POB_TYPE_TO_SLOTS.get(str(row[0]), ()) if row else ()
+    # Unknown classes must not fall back to the union of all weapon recipes.
+    return slots[0] if slots else None
+
+
 def _load_entries(
     slot: str | None, base_type: str, *, pob_dir: Path | None, runtime_dir: Path | None
 ) -> tuple[list[dict[str, Any]], bool]:
@@ -194,10 +214,11 @@ def inspect_item(
     item: Item = parse_item_text(raw)
     item_class = _item_class(raw)
     slot = slot or _infer_slot(item_class)
+    bench_slot = _bench_slot(slot, item.base_type, pob_dir=pob_dir, runtime_dir=runtime_dir)
     target_mods = [m for m in item.mods if m.kind in ("explicit", "crafted", "fractured", "veiled")]
     unsupported = [m.raw for m in target_mods if m.kind == "veiled"]
     matchable = [m for m in target_mods if m.kind in ("explicit", "crafted", "fractured")]
-    entries, base_resolved = _load_entries(slot, item.base_type, pob_dir=pob_dir, runtime_dir=runtime_dir)
+    entries, base_resolved = _load_entries(bench_slot, item.base_type, pob_dir=pob_dir, runtime_dir=runtime_dir)
     capacity = {"prefix": 3, "suffix": 3}
     scaled_types: set[str] = set()
     for mod in item.mods:
@@ -221,7 +242,7 @@ def inspect_item(
         for affix in classified["affixes"]
         if item.item_level and affix["tierLevels"] and min(affix["tierLevels"]) > item.item_level
     ]
-    if unsupported or item.rarity != "RARE" or not base_resolved or tier_conflicts:
+    if unsupported or item.unidentified or item.rarity != "RARE" or not base_resolved or tier_conflicts:
         classified["certain"] = False
         classified["open"] = {"prefix": None, "suffix": None}
     classified["unmatched"] = unmatched
@@ -230,9 +251,9 @@ def inspect_item(
     natural_groups = {str(a["group"]) for a in classified["affixes"] if a["source"] != "Bench"}
     existing_templates = [m.template for m in target_mods if m.kind != "crafted"]
     suggestions: list[dict[str, Any]] = []
-    if slot and item.rarity == "RARE" and not (item.corrupted or item.mirrored or item.unidentified):
+    if bench_slot and item.rarity == "RARE" and not (item.corrupted or item.mirrored or item.unidentified):
         for want in wants or _DEFAULT_WANTS:
-            candidates = bench.search(slot, want, limit=15, allow_engine=True)
+            candidates = bench.search(bench_slot, want, limit=15, allow_engine=True)
             best_score = candidates[0].score if candidates else 0
             for found in candidates:
                 if found.score < max(0.85, best_score - 0.015):
@@ -275,6 +296,7 @@ def inspect_item(
         "affixes": classified["affixes"], "unmatched": unmatched,
         "counts": classified["counts"], "open": classified["open"],
         "capacity": capacity,
+        "benchSlot": bench_slot,
         "scaledAffixTypes": sorted(scaled_types),
         "certain": classified["certain"], "baseResolved": base_resolved,
         "dataWarnings": tier_conflicts,

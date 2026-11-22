@@ -1605,7 +1605,10 @@ def cmd_item_inspect(
         if not raw_text:
             raise click.ClickException(f"Slot {slot!r} is empty or its item text is unavailable.")
         slot = (loaded.get("slot") or {}).get("name") or slot
-    report = inspect_item(raw_text, slot=slot, wants=wants, limit=limit)
+    try:
+        report = inspect_item(raw_text, slot=slot, wants=wants, limit=limit)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
     if as_json:
         _emit_json(report, compact=compact, out_path=out_path)
     else:

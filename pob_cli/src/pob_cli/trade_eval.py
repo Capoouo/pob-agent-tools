@@ -936,6 +936,8 @@ def format_report(
                 f"Bench ({craft['action']}, maximum roll): {' / '.join(craft['lines'])}; "
                 f"cost: {craft['cost']}" + (" + remove existing craft" if craft['action'] == 'replace_craft' else "")
             )
+            if craft['action'] == 'replace_craft':
+                lines.append("Removed craft: " + "; ".join(_escape(line) for line in craft['removed_lines']))
             lines.append("Maximum-roll target; repeated crafting/removal costs are not included.")
         lines.append("")
         if candidate.pob is not None:
