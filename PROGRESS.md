@@ -1,12 +1,16 @@
 # PROGRESS
 
 ## ACTIVE
-- 目标：pob4agents Hook 硬护栏全链路施工与 4 轮 DS 4.1F 实机验收已完成并提交推送 origin/main；待后续按需启动 v0.8.0 发版或新需求迭代
-- 已做：[x] 完成 docs/HOOK_GUARDRAILS_PLAN.md 三阶段施工（L0 reply_scanner + L1 turn_receipts + L4 cli_hook 三协议 + CLI 出口埋点 + DSH hook-bridge.mjs/item_inspect + hooks/{hooks,claude-hooks}.json + 文档同步）；[x] 经 bot:测试大肥鱼 4 轮多路 DeepSeek V4.1 Flash 实机对抗闭环（R1-R5 安全硬防线全过、R3 提速 -43.2%、R4 现场真拦强辅 CoC Lv20 幻觉并纠偏、R5 零误伤 PASS、POB_HOOK_SESSION_ID 并发 100% 隔离）及最后 3 处 P2 边角清零；[x] 29/29 实测草稿离线回放 0 误伤/5 真拦、全量 check.py (944 passed) 与 verify-plugin.mjs 全绿，已获主人确认提交并推送至 origin/main
-- 下一步：[ ] 监控 origin/main 推送触发的 GitHub Actions CI 全绿；按主人后续指令推进 v0.8.0 发版或新迭代
-- 验证：check.py --fast (1.44s, ruff=0, arch=0) + --self-test (5/5) + full check.py (944 passed, 0 failed, 1 skipped) + 29/29 R1-R4 实测草稿回放 0 误伤/5 真拦 + verify-plugin.mjs OK（2026-11-23 19:51）
+- 目标：由 bot:发版Bot 完成 pob4agents v0.8.0 发版就绪检查、CI 观察与 Release Notes 起草（待主人确认打 tag 发布）
+- 已做：[x] 已提交联网机制核验与 V5 硬护栏核心改动（e449872，23 文件），通过 check.py --fast/--self-test/全量 pytest 966 passed + verify-plugin.mjs OK + 测试大肥鱼两轮 DS V4.1 Flash + 2 路 Hydrogen 全满分验收；[x] 已按主人 item 15 确认将单一真源版本 pob_cli/__init__.py 升级至 0.8.0，推送 origin/main 并转交 bot:发版Bot 进入 v0.8.0 发版就绪检查与 Release Notes 起草
+- 下一步：[ ] 等待 bot:发版Bot 完成 v0.8.0 发版就绪检查与 Release Notes 起草，以及主人确认打 tag v0.8.0 发布；发布完成后发 status 给 bot:Workspace cleanup
+- 验证：check.py --fast (1.46s, ruff=0, arch=0) + full check.py (966 passed, 1 skipped) + PRE_RELEASE_CHECKS_OK version=0.8.0 + R1/R2 多模型实测 GO（2026-11-23 21:37）
 
 ## LOG
+### 2026-11-23 提交并推送 pob4agents 联网机制核验与 V5 护栏（e449872，23 文件）及 v0.8.0 版本升级，移交 bot:发版Bot 准备发版 → check.py --fast 1.46s + 全量 966 passed (1 skipped) + verify-plugin.mjs OK + 两轮多模型实测 GO + git push origin main exit 0
+### 2026-11-23 通过测试大肥鱼 Round 2 定向复测（DS Q2/Q3/Q4 与 Hydrogen Q2/Q3 全部 10/10 满分，DS 长句清零 18->0、Q3 耗时/步数 -41%/-50%、Hydrogen Q3 步数 17->6、DS Q4 实机拦死 grep *.lua 0 绕过），已更新 docs/WEB_RESEARCH_GUARDRAILS_PLAN.md 为完成态并在 item 15 请主人确认提交推送与 v0.8.0 发版 → check.py 全绿（966 passed, 1 skipped）+ verify-plugin.mjs OK + Round 2 REPORT.md GO
+### 2026-11-23 按测试大肥鱼 Round 1 实测报告（DS 5.5/6、Hydrogen 6.0/6、主动联网 100%、犹豫词 0%）全量修复 5 项 P0/P1/P2 缺陷（长句自动拆词 + queries 批量参数、--mods 常规词缀置顶 + --filter、grep/glob/read 禁扫引擎 Lua、万古之剑双 30% less 口径统一、Gate 1 @path：与 Q5 触发） → check.py 全绿（FAST 1.47s ruff=0 arch=0 max=641L/23902B + --self-test 5/5 + pytest 966 passed, 1 skipped）+ verify-plugin.mjs OK，已自动派发 Round 2 定向复测
+### 2026-11-23 完成联网机制核验与 V5 犹豫即强搜硬护栏 4 层落地（pob research + 本地 PoEDB 8,468 条官方双语索引精确匹配 + wiki 机制段落优先提取 + reply_patterns 拆分 + Gate 1/3 V5 独立开关 + DSH/Skill/文档同步） → check.py 全绿（FAST 1.41s ruff=0 arch=0 max=641L/23768B + --self-test 5/5 + pytest 962 passed, 1 skipped）+ verify-plugin.mjs OK + 29 份真实 DS 4.1F 草稿回放 0 误伤/5 真拦，已自动派发 bot:测试大肥鱼 跑 DS V4.1 Flash + 2 路 Hydrogen（Q1–Q6）
 ### 2026-11-23 完成 Hook 硬护栏 Round 4 收尾（R4 现场拦截强辅 Awakened CoC Lv20 幻觉并纠偏 PASS + 补齐最后 3 处 P2 边角误伤豁免），4 轮共 29 份真实 DS 4.1F 草稿回放 0 误伤/5 真拦 → check.py 全绿（FAST 1.44s ruff=0 arch=0 + --self-test 5/5 + pytest 944 passed, 1 skipped）+ verify-plugin.mjs OK，item 8 已结案
 ### 2026-11-23 修复 Round 3 暴露的「强辅<宝石名>」幻觉漏检（rules_legacy_gems.py）与「无用/如果按...计算/这就错了」边角误伤（reply_scanner.py），R1+R2+R3 全部 25 份真实 DS 4.1F 草稿回放 0 误伤且 4/4 真幻觉全命中 → check.py 全绿（FAST 1.43s ruff=0 arch=0 + --self-test 5/5 + pytest 944 passed, 1 skipped）+ verify-plugin.mjs OK，已自动派发 Round 4（R1/R4）收尾快测
 ### 2026-11-23 修复 Round 2 暴露的 7 类误伤（rules_legacy_gems 补赋能/增强/石，reply_scanner 扩充辟谣/PoE2归属/反事实词库与保留三石 Lv4/Lv5 豁免，index.mjs 补 target schema 说明），20 份实测草稿回放 0 误伤/2 真拦 → check.py 全绿（FAST 1.47s ruff=0 arch=0 + --self-test 5/5 + pytest 944 passed, 1 skipped）+ verify-plugin.mjs OK，已自动派发 Round 3（R1/R4/R5）快测
@@ -21,9 +25,3 @@
 ### 2026-11-22 完成 DSH 3/3 实机验收（H01/H02/H03 全 PASS）并落地二阶精修（Ramako 固定 -20% DoT 抗、Frost Bomb 禁回血、幽魂藏身处施法、diagnose 展示 Pantheon、PowerShell --return 空格容错、SKILL 步数纪律） → pytest 531/207 passed + 实机 smoke 全绿
 ### 2026-11-22 Swarm 3 路 + 文档落地 pob4agents 3.28–3.30 防幻觉与构筑守卫全栈加固（退场觉醒过滤/卓越上限硬拦截/台服繁简映射/冷却提取/CWS零盾与多里亚尼等8项诊断守卫/rank-nodes双修/Skill同步） → 全量 pytest 883 passed (1 skipped) + 最终复检 393 passed + 3 套真实 PoB 实机验收全绿
 ### 2026-11-22 完成项目改名 pob-agent-tools -> pob4agents（b7df897 + 合并 3dc7128 -> 0035f32），同步重命名 GitHub 仓库为 exilemoulei/pob4agents 并推送 origin/main → PYTHONPATH=F:/poe/pob_cli/src pytest 228 passed (1 skipped) + git push exit 0
-### 2026-11-22 将项目从 pob-agent-tools 重命名为 pob4agents（15 文件 + 旧运行态目录/PATH/缓存平滑兼容）并提交本地 main → PYTHONPATH=F:/poe/pob_cli/src pytest 228 passed (1 skipped) + install.ps1/JSON 校验通过
-### 2026-11-22 完成 PR #5 合并适配（d627bc5）并经确认推送 origin/main，PR #5 已自动 MERGED → pytest 全量通过 + git push origin main exit 0
-### 2026-11-22 本地合并 PR #5（d627bc5，pob item inspect + --bench-craft 交易试算），解决 3 处与 v0.5.0 冲突并补齐 PoE2 跨代护栏、pob.spec 打包项、无引擎容错与 skills/pob 索引 → pytest 全量 682+72 回归全绿（待确认是否推送 origin/main）
-### 2026-11-22 修复无引擎时 pob ground 崩溃（c859d5e）并完成 pob-agent-tools v0.5.0 正式发版（Win/Linux/macOS CI + Release + Scoop 清单全绿） → pytest 662 passed + CI #45018335612 & Release #45018339764 success
-### 2026-11-22 同步合并 origin/main (2abee10, PR #6 中英双语 README) 并准备 pob-agent-tools v0.5.0 发版（融合通用认知卸载 CLI 原语、反向跨代/补丁防幻觉护栏与跨宿主泛用 skills/pob） → pytest 662 passed + Wheel/AST/YAML/Spec 门禁全绿
-### 2026-11-22 泛化落地 pob_cli 全流派认知卸载层（diagnose -c/-q、引擎0%死链与Caveat、CoC超速/CwC非冷却/0.033s data tick、低血艾许之面/EB+CI探针、unique --mod、含永恒大点的 data tree、双段宝石合并、rev近因钢印）与 62 行跨宿主通用 SKILL.md → pytest 662 passed + 纯 Skill 模式 G01..G04 新流派盲测 4/4 全绿
