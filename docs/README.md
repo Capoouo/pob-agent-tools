@@ -2,12 +2,17 @@
 
 Everything about `pob` beyond the top-level README lives here. When a doc and the code disagree, the code wins.
 
+## Architecture
+
+[architecture.md](architecture.md): how a command reaches the engine, module layers, engine paths, environment variables, Chinese locale matching, the `R1`..`R13` constraints, verification and CI. Read it before changing code.
+
 ## Guides
 
 How to use a feature end to end.
 
 | Doc | What it covers |
 |---|---|
+| [guides/commands.md](guides/commands.md) | Every `pob` subcommand with its flags |
 | [guides/trade.md](guides/trade.md) | Read-only official PoE1 trade search and the crafting bench (`pob trade`, `pob bench`), with PoB-verified DPS/EHP for every candidate |
 
 ## Design notes
@@ -28,7 +33,7 @@ These stay outside `docs/` because tools expect them at fixed paths.
 | File | Purpose |
 |---|---|
 | [../README.md](../README.md) / [../README_EN.md](../README_EN.md) | User docs: install, engine setup, every command with examples |
-| [../AGENTS.md](../AGENTS.md) | Agent quick reference, architecture, env vars, hard constraints `R1`..`R13` |
+| [../AGENTS.md](../AGENTS.md) | Contributor guide for agents and people: commands, layout, hard rules, conventions, commit scopes. `CLAUDE.md` imports it |
 | [../skills/pob/SKILL.md](../skills/pob/SKILL.md) | Cross-harness agent skill, with topic references in [../skills/pob/references/](../skills/pob/references/) |
 | [../SECURITY.md](../SECURITY.md) | How to report a vulnerability |
 | [../PROGRESS.md](../PROGRESS.md) | Rolling progress log kept by the maintainers' agents (Chinese) |
