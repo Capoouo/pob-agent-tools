@@ -28,7 +28,7 @@ class _SlotSlugType(click.ParamType):
                 param,
                 ctx,
             )
-        return s
+        return s.lower()
 
 
 _SLOT_SLUG_TYPE = _SlotSlugType()
@@ -36,7 +36,7 @@ _SLOT_SLUG_TYPE = _SlotSlugType()
 
 def _default_target() -> str:
     val = (os.environ.get("POB_SLOT") or "main").strip()
-    return val or "main"
+    return (val or "main").lower()
 
 
 class LazyGroup(click.Group):

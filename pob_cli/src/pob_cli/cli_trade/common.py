@@ -40,7 +40,7 @@ class _TargetSlotType(click.ParamType):
                 param,
                 ctx,
             )
-        return s
+        return s.lower()
 
 
 _TARGET_SLOT_TYPE = _TargetSlotType()
@@ -48,7 +48,7 @@ _TARGET_SLOT_TYPE = _TargetSlotType()
 
 def _default_target_slot() -> str:
     val = (os.environ.get("POB_SLOT") or "main").strip()
-    return val or "main"
+    return (val or "main").lower()
 
 
 def _echo_utf8(text: str) -> None:

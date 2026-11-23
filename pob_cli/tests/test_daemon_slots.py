@@ -151,3 +151,21 @@ def test_daemon_diagnose_normalizes_single_and_dual_slot_names(
         ("main", "ref", "main", "ref"),
         ("gamma", "gamma", "gamma", "gamma"),
     ]
+
+
+def test_cli_slot_slug_types_and_defaults_lowercase(monkeypatch: pytest.MonkeyPatch) -> None:
+    from pob_cli.cli_common import _SLOT_SLUG_TYPE, _default_target
+    from pob_cli.cli_trade.common import _TARGET_SLOT_TYPE, _default_target_slot
+
+    assert _SLOT_SLUG_TYPE.convert("MAIN", None, None) == "main"
+    assert _SLOT_SLUG_TYPE.convert("Foo-Bar.1", None, None) == "foo-bar.1"
+    assert _TARGET_SLOT_TYPE.convert("MAIN", None, None) == "main"
+    assert _TARGET_SLOT_TYPE.convert("Alpha_2", None, None) == "alpha_2"
+
+    monkeypatch.setenv("POB_SLOT", "  MAIN ")
+    assert _default_target() == "main"
+    assert _default_target_slot() == "main"
+
+    monkeypatch.setenv("POB_SLOT", "MyBuild")
+    assert _default_target() == "mybuild"
+    assert _default_target_slot() == "mybuild"
