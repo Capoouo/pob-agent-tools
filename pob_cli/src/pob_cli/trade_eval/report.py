@@ -38,7 +38,8 @@ def _price_key(candidate: Candidate) -> tuple[bool, float]:
 def _vs_market_text(candidate: Candidate) -> str:
     if candidate.vs_market_pct is None:
         return "-"
-    return f"{candidate.vs_market_pct:+.0f}%" + (" BARGAIN" if candidate.bargain else "")
+    pct = round(candidate.vs_market_pct)
+    return f"{pct:+d}%" + (" BARGAIN" if candidate.bargain else "")
 
 
 def sort_candidates(candidates: list[Candidate], sort: str = "score") -> list[Candidate]:

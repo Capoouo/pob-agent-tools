@@ -453,3 +453,13 @@ def test_trade_search_bench_craft_preserves_bargain_seller_and_url(
     linked = _decode_seller_blob(crafted["url"])
     assert linked["filters"]["trade_filters"]["filters"]["account"] == {"input": "BargainSeller#7"}
     assert crafted["pob"]["dps_after"] == 1150.0
+
+
+def test_vs_market_text_avoids_negative_zero() -> None:
+    from pob_cli.trade_eval.report import _vs_market_text
+
+    item = parse_item_text("Rarity: Rare\nTest Ring\nCoral Ring\n--------\n+50 to maximum Life\n")
+    tiny_neg = Candidate(raw={}, item=item, item_text="", vs_market_pct=-0.2, bargain=False)
+    assert _vs_market_text(tiny_neg) == "+0%"
+    steal = Candidate(raw={}, item=item, item_text="", vs_market_pct=-30.4, bargain=True)
+    assert _vs_market_text(steal) == "-30% BARGAIN"
