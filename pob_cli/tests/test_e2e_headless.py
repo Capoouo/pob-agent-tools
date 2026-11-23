@@ -11,16 +11,18 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from engine_paths import find_runnable_engine
+from support import dead_proxy_url
 
 from pob_cli.importers import xml_to_share_code
 
 GOLDEN_URL = "https://poedb.tw/pob/AWqOLSSmyG"
-LEGACY_ENGINE_DIR = Path("F:/poe/PobTools[20261102]")
+LEGACY_ENGINE_DIR = find_runnable_engine()
 SRC_DIR = Path(__file__).resolve().parents[1] / "src"
 
 pytestmark = pytest.mark.skipif(
-    not (LEGACY_ENGINE_DIR / "pob-zh.exe").is_file(),
-    reason=f"Local PobTools engine not available at {LEGACY_ENGINE_DIR}",
+    LEGACY_ENGINE_DIR is None,
+    reason="No runnable PoB engine found (set POB_ROOT or run pob bootstrap)",
 )
 
 
@@ -94,7 +96,8 @@ def test_e2e_m1_load_summary_audit_calc(e2e_runtime_dir: Path, tmp_path: Path) -
     sum_res = _run_pob("summary", runtime_dir=e2e_runtime_dir)
     assert sum_res["offence"]["CombinedDPS"] > 100000
     assert sum_res["defence"]["Life"] == 3501
-    assert sum_res["defence"]["Mana"] == 9075
+    # Golden value from PoB 2.67.2; mana scaling shifted slightly in later PoB releases.
+    assert sum_res["defence"]["Mana"] == pytest.approx(9075, rel=0.01)
     assert sum_res["defence"]["TotalEHP"] > 50000
 
     # Verify audit non-destructiveness
@@ -307,10 +310,10 @@ def test_e2e_v02_build_ops_deadlock_recovery_and_local_data(e2e_runtime_dir: Pat
 
 
 def test_e2e_v02_degraded_network_alert_and_bootstrap_missing(tmp_path: Path) -> None:
-    """Verify Gate 1: dead proxy POB_PROXY=http://127.0.0.1:9 degrades fast with dual-channel warnings, and bootstrap_missing fails fast."""
+    """Verify Gate 1: a dead POB_PROXY degrades fast with dual-channel warnings, and bootstrap_missing fails fast."""
     degraded_rt = tmp_path / "degraded_rt"
     dead_proxy_env: dict[str, str | None] = {
-        "POB_PROXY": "http://127.0.0.1:9",
+        "POB_PROXY": dead_proxy_url(),
         "POB_OFFLINE": None,
     }
     try:
