@@ -20,6 +20,27 @@ _DASH_RE = re.compile(r"[\u2013\u2014\u2212]")
 _BENCH_RANGE_RE = re.compile(r"\(\s*(-?\d+(?:\.\d+)?)\s*-\s*(-?\d+(?:\.\d+)?)\s*\)")
 
 
+def _age_text(hours: float | None) -> str:
+    if hours is None:
+        return "-"
+    if hours < 1:
+        return f"{hours * 60:.0f}m"
+    return f"{hours:.1f}h" if hours < 48 else f"{hours / 24:.0f}d"
+
+
+def _price_key(candidate: Candidate) -> tuple[bool, float]:
+    # shortcut: compares raw amounts across currencies when no rate is known (poe.ninja
+    # unreachable or an exotic currency); rank by the API's own order if that ever matters.
+    value = candidate.price_chaos if candidate.price_chaos is not None else candidate.price_amount
+    return (value is None or not math.isfinite(value), _finite_sort_key(value, 0.0))
+
+
+def _vs_market_text(candidate: Candidate) -> str:
+    if candidate.vs_market_pct is None:
+        return "-"
+    return f"{candidate.vs_market_pct:+.0f}%" + (" BARGAIN" if candidate.bargain else "")
+
+
 def sort_candidates(candidates: list[Candidate], sort: str = "score") -> list[Candidate]:
     """Sort candidates by ``score``, ``price``, ``sum``, or ``pob`` (always NaN-safe)."""
     if sort == "sum":
@@ -28,20 +49,12 @@ def sort_candidates(candidates: list[Candidate], sort: str = "score") -> list[Ca
             key=lambda c: (
                 c.weighted_sum is None or not math.isfinite(c.weighted_sum),
                 -_finite_sort_key(c.weighted_sum, 0.0),
-                c.price_amount is None or not math.isfinite(c.price_amount),
-                _finite_sort_key(c.price_amount, 0.0),
+                *_price_key(c),
                 -_finite_sort_key(c.score, 0.0),
             ),
         )
     if sort == "price":
-        return sorted(
-            candidates,
-            key=lambda c: (
-                c.price_amount is None or not math.isfinite(c.price_amount),
-                _finite_sort_key(c.price_amount, 0.0),
-                -_finite_sort_key(c.score, 0.0),
-            ),
-        )
+        return sorted(candidates, key=lambda c: (*_price_key(c), -_finite_sort_key(c.score, 0.0)))
     if sort == "pob":
         return sorted(
             candidates,
@@ -49,18 +62,10 @@ def sort_candidates(candidates: list[Candidate], sort: str = "score") -> list[Ca
                 c.pob is None,
                 -_finite_sort_key(c.pob.combined_pct if c.pob is not None else None, 0.0),
                 -_finite_sort_key(c.score, 0.0),
-                c.price_amount is None or not math.isfinite(c.price_amount),
-                _finite_sort_key(c.price_amount, 0.0),
+                *_price_key(c),
             ),
         )
-    return sorted(
-        candidates,
-        key=lambda c: (
-            -_finite_sort_key(c.score, 0.0),
-            c.price_amount is None or not math.isfinite(c.price_amount),
-            _finite_sort_key(c.price_amount, 0.0),
-        ),
-    )
+    return sorted(candidates, key=lambda c: (-_finite_sort_key(c.score, 0.0), *_price_key(c)))
 
 
 def _escape(value: str) -> str:
@@ -108,6 +113,8 @@ def _format_report_header(
     fetched: int,
     conversion_note: str,
     open_affixes: dict[str, bool] | None,
+    listed_note: str = "",
+    market_note: str = "",
 ) -> list[str]:
     lines: list[str] = ["# Gear upgrade candidates (PoE1 official trade)", ""]
     lines.append(f"- Build: {sanitize_text(build_label) or 'unknown'}")
@@ -123,6 +130,10 @@ def _format_report_header(
         lines.append(f"- Trade link: {search_url}")
     if conversion_note:
         lines.append(f"- Conversion: {sanitize_text(conversion_note)}")
+    if listed_note:
+        lines.append(f"- Listed: {sanitize_text(listed_note)}")
+    if market_note:
+        lines.append(f"- Market: {sanitize_text(market_note)}")
     if open_affixes and any(open_affixes.values()):
         wanted = [key for key, enabled in open_affixes.items() if enabled]
         lines.append(
@@ -136,13 +147,18 @@ def _format_report_header(
     return lines
 
 
-def _format_candidates_table(candidates: list[Candidate]) -> list[str]:
+def _format_candidates_table(candidates: list[Candidate], *, has_listing: bool) -> list[str]:
     has_pob = any(candidate.pob is not None for candidate in candidates)
     has_sum = any(
         candidate.weighted_sum is not None and math.isfinite(candidate.weighted_sum)
         for candidate in candidates
     )
+    has_market = any(candidate.vs_market_pct is not None for candidate in candidates)
     headers = ["#", "Item", "Price"]
+    if has_market:
+        headers.append("vs market")
+    if has_listing:
+        headers.extend(["Seller", "Listed"])
     if has_sum:
         headers.append("Sum")
     headers.append("Score")
@@ -168,6 +184,10 @@ def _format_candidates_table(candidates: list[Candidate]) -> list[str]:
             _escape(item_label),
             _escape(candidate.price_text),
         ]
+        if has_market:
+            row_cells.append(_vs_market_text(candidate))
+        if has_listing:
+            row_cells.extend([_escape(candidate.seller or "-"), _age_text(candidate.age_hours)])
         if has_sum:
             sum_str = (
                 f"{candidate.weighted_sum:g}"
@@ -237,12 +257,16 @@ def _format_bench_options(slot: str, bench_options: list[dict[str, Any]]) -> lis
     return lines
 
 
-def _format_candidate_detail(index: int, candidate: Candidate) -> list[str]:
+def _format_candidate_detail(index: int, candidate: Candidate, *, has_listing: bool = False) -> list[str]:
     lines: list[str] = [
         f"## {index}. {sanitize_text(candidate.display_name)} - {sanitize_text(candidate.price_text)}"
     ]
     if candidate.url:
         lines.append(f"[Trade listing]({candidate.url})")
+    if has_listing:
+        lines.append(f"Seller: {_escape(candidate.seller or '-')} | Listed: {_age_text(candidate.age_hours)} ago")
+    if candidate.vs_market_pct is not None:
+        lines.append(f"Price vs market: {_vs_market_text(candidate)}")
     if candidate.bench_craft:
         craft = candidate.bench_craft
         lines.append(
@@ -324,6 +348,8 @@ def format_report(
     conversion_note: str = "",
     open_affixes: dict[str, bool] | None = None,
     bench_options: list[dict[str, Any]] | None = None,
+    listed_note: str = "",
+    market_note: str = "",
 ) -> str:
     """Render a high-SNR GitHub-flavored Markdown report for trade upgrade candidates."""
     lines = _format_report_header(
@@ -339,19 +365,22 @@ def format_report(
         fetched=fetched,
         conversion_note=conversion_note,
         open_affixes=open_affixes,
+        listed_note=listed_note,
+        market_note=market_note,
     )
 
     if not candidates:
         lines.append("No analysable candidates.")
         return "\n".join(lines)
 
-    lines.extend(_format_candidates_table(candidates))
+    has_listing = any(candidate.seller or candidate.age_hours is not None for candidate in candidates)
+    lines.extend(_format_candidates_table(candidates, has_listing=has_listing))
 
     if bench_options:
         lines.extend(_format_bench_options(slot, bench_options))
 
     for index, candidate in enumerate(candidates[:3], start=1):
-        lines.extend(_format_candidate_detail(index, candidate))
+        lines.extend(_format_candidate_detail(index, candidate, has_listing=has_listing))
 
     lines.append(
         "> Mod score is a weighted template delta, not PoB DPS. `-` means the candidate "
@@ -372,7 +401,12 @@ def report_json(candidates: list[Candidate]) -> list[dict[str, Any]]:
             "price": {
                 "amount": _json_safe_optional_float(candidate.price_amount),
                 "currency": candidate.price_currency,
+                "chaos": _json_safe_optional_float(candidate.price_chaos),
             },
+            "vs_market_pct": _json_safe_optional_float(candidate.vs_market_pct),
+            "bargain": candidate.bargain,
+            "seller": candidate.seller,
+            "age_hours": _json_safe_optional_float(candidate.age_hours),
             "weighted_sum": _json_safe_optional_float(candidate.weighted_sum),
             "score": _finite_float(candidate.score),
             "url": candidate.url,

@@ -338,6 +338,19 @@ OPEN_AFFIX_ID = "pseudo.pseudo_number_of_empty_affix_mods"
 
 VALID_STATUSES: tuple[str, ...] = ("available", "securable", "online", "onlineleague", "any")
 
+# `trade_filters.indexed` options of /api/trade/data/filters, as (hours covered, option id).
+INDEXED_WINDOWS: tuple[tuple[int, str], ...] = (
+    (1, "1hour"),
+    (3, "3hours"),
+    (12, "12hours"),
+    (24, "1day"),
+    (72, "3days"),
+    (168, "1week"),
+    (336, "2weeks"),
+    (720, "1month"),
+    (1440, "2months"),
+)
+
 STAT_TYPE_ORDER: dict[str, int] = {
     "explicit": 0,
     "crafted": 1,

@@ -152,6 +152,21 @@ def _fetch_dense_overviews(
     return type_to_lines
 
 
+def fetch_currency_chaos_rates(
+    league: str,
+    *,
+    proxy: str | None = None,
+) -> dict[str, float]:
+    """Return poe.ninja Currency name -> chaos value map (15m dense-overview cache)."""
+    rates: dict[str, float] = {}
+    for line in _pkg()._fetch_dense_overviews(league, proxy=proxy).get("Currency") or []:
+        name = line.get("name")
+        chaos = line.get("chaos")
+        if name and chaos:
+            rates.setdefault(str(name), float(chaos))
+    return rates
+
+
 def _stash_cache_path(league: str, item_type: str) -> Path:
     safe_league = re.sub(r"[^A-Za-z0-9_-]", "_", league)
     safe_type = re.sub(r"[^A-Za-z0-9_-]", "_", item_type)

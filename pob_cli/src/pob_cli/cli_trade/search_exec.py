@@ -11,7 +11,7 @@ from .. import bench as bench_mod
 from ..cli_common import _emit_json
 from ..errors import BootstrapMissingError, CrossGameHallucinationError
 from ..guardrails import GuardrailScope, check_input, validate_url
-from ..trade_client import TradeError
+from ..trade_client import TradeError, seller_url
 from ..trade_eval import Candidate, compare_items, score_deltas, verify_candidates_batch
 from ..trade_item import build_item_text, convert_item_text, parse_item_text, sanitize_text, trade_mod_tiers
 from ..trade_query import (
@@ -30,6 +30,7 @@ from .common import (
     _trade_error,
     _weighted_sum_of,
 )
+from .fresh_bargain import _fetch_with_fresh_and_market, _price_chaos
 
 
 def _validate_search_inputs(
@@ -92,6 +93,11 @@ def _build_candidates_from_rows(
     weight_map: dict[str, float],
     preferred: set[str],
     search_url: str,
+    league_name: str,
+    query: dict[str, Any],
+    rates: dict[str, float],
+    market: float | None,
+    bargain: float | None,
 ) -> list[Candidate]:
     candidates: list[Candidate] = []
     for row in rows:
@@ -118,22 +124,28 @@ def _build_candidates_from_rows(
 
         deltas = compare_items(current, item, weights=weight_map, preferred=preferred)
         amount, price_currency = _price_of(row)
-        candidates.append(
-            Candidate(
-                raw=row,
-                item=item,
-                item_text=text,
-                price_amount=amount,
-                price_currency=price_currency,
-                score=score_deltas(deltas),
-                deltas=deltas,
-                conversions=conversions,
-                conversion_warnings=conversion_warnings,
-                url=search_url,
-                listing_id=row.get("id"),
-                weighted_sum=_weighted_sum_of(raw_item),
-            )
+        candidate = Candidate(
+            raw=row,
+            item=item,
+            item_text=text,
+            price_amount=amount,
+            price_currency=price_currency,
+            score=score_deltas(deltas),
+            deltas=deltas,
+            conversions=conversions,
+            conversion_warnings=conversion_warnings,
+            url=search_url,
+            listing_id=row.get("id"),
+            weighted_sum=_weighted_sum_of(raw_item),
+            price_chaos=_price_chaos(row, rates),
         )
+        if candidate.seller:
+            # One seller rarely has two matching items, so this link lands on the item itself.
+            candidate.url = seller_url(league_name, query["query"], candidate.seller)
+        if market and candidate.price_chaos is not None and bargain is not None:
+            candidate.vs_market_pct = (candidate.price_chaos / market - 1) * 100
+            candidate.bargain = candidate.vs_market_pct <= -bargain + 1e-9  # float slack at the threshold
+        candidates.append(candidate)
     return candidates
 
 
@@ -244,7 +256,10 @@ def _execute_trade_api_query(
     status: str,
     currency: str,
     budget: float | None,
+    max_age: float | None,
+    bargain: float | None,
     search_sort: str,
+    sort_by: str,
     open_prefix: bool,
     open_suffix: bool,
     open_affix: bool,
@@ -310,18 +325,19 @@ def _execute_trade_api_query(
                 rarity=rarity,
                 weighted_groups=weighted_groups,
             )
-            query = build_query(
-                plan=plan,
-                category=resolved_category,
-                rarity=rarity,
-                item_level_min=ilvl_min,
-                status=status,
-                currency=currency,
-                budget=budget,
-                search_sort=search_sort,
-                pseudo_filters=pseudo_filters or None,
-                allow_corrupted=allow_corrupted,
-            )
+            query_args: dict[str, Any] = {
+                "plan": plan,
+                "category": resolved_category,
+                "rarity": rarity,
+                "item_level_min": ilvl_min,
+                "status": status,
+                "currency": currency,
+                "budget": budget,
+                "search_sort": search_sort,
+                "pseudo_filters": pseudo_filters or None,
+                "allow_corrupted": allow_corrupted,
+            }
+            query = build_query(**query_args, max_age_hours=max_age)
         except ValueError as exc:
             _err_utf8(str(exc))
             ctx.exit(1)
@@ -342,31 +358,27 @@ def _execute_trade_api_query(
             return None
 
         try:
-            search_res = client.search(league_name, query)
+            market_ctx = _fetch_with_fresh_and_market(
+                client=client,
+                league_name=league_name,
+                query=query,
+                query_args=query_args,
+                fetch_limit=fetch_limit,
+                max_age=max_age,
+                bargain=bargain,
+                search_sort=search_sort,
+                sort_by=sort_by,
+                proxy=proxy,
+            )
         except TradeError as exc:
             _trade_error(ctx, exc)
             return None
-
-        query_id = str(search_res.get("id") or "")
-        ids = [str(item) for item in search_res.get("result") or []]
-        total = int(search_res.get("total") or len(ids))
-
-        try:
-            rows = client.fetch_many(ids, query_id, limit=max(0, min(fetch_limit, 20)))
-        except TradeError as exc:
-            _trade_error(ctx, exc)
-            return None
-
-        search_url = client.search_url(league_name, query_id) if query_id else ""
 
     return {
         "league_name": league_name,
         "stats_source": stats_source,
         "plan": plan,
-        "query": query,
         "open_flags": open_flags,
         "bench_options": bench_options,
-        "rows": rows,
-        "total": total,
-        "search_url": search_url,
+        **market_ctx,
     }

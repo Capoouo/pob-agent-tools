@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..trade_item import ELEMENTS, convert_template, match_harvest
-from .aliases import VALID_STATUSES
+from .aliases import INDEXED_WINDOWS, VALID_STATUSES
 from .stats_index import StatMatch, resolve_stat, suggest_stats
 
 _SUM_MIN_SUFFIX_RE = re.compile(r">=\s*([+-]?\d+(?:\.\d+)?)\s*$")
@@ -270,6 +270,7 @@ def build_query(
     pseudo_filters: list[dict[str, Any]] | None = None,
     exclude_corrupted_mirrored: bool | None = None,
     allow_corrupted: bool = False,
+    max_age_hours: float | None = None,
 ) -> dict[str, Any]:
     """Build an official PoE1 ``/api/trade/search`` JSON request body."""
     status_norm = (status or "available").strip().lower()
@@ -358,13 +359,22 @@ def build_query(
     if type_filters:
         filter_block["type_filters"] = {"filters": type_filters}
 
+    trade_filters: dict[str, Any] = {}
     if budget is not None and budget > 0:
         curr_norm = (currency or "").strip().lower()
         if curr_norm in ("", "chaos_equiv", "equiv"):
             price_filter: dict[str, Any] = {"max": budget}
         else:
             price_filter = {"option": curr_norm, "max": budget}
-        filter_block["trade_filters"] = {"filters": {"price": price_filter}}
+        trade_filters["price"] = price_filter
+    if max_age_hours is not None and max_age_hours > 0:
+        # The site only offers fixed windows: take the smallest one that covers the
+        # limit; the caller trims the remainder from each listing's `indexed` time.
+        window = next((opt for hours, opt in INDEXED_WINDOWS if max_age_hours <= hours), None)
+        if window:
+            trade_filters["indexed"] = {"option": window}
+    if trade_filters:
+        filter_block["trade_filters"] = {"filters": trade_filters}
 
     should_exclude = (
         (bool(plan.conversions) and not allow_corrupted)

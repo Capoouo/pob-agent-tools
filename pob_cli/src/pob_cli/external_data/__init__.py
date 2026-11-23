@@ -31,6 +31,7 @@ from .ninja_http import (
     _fetch_stash_overviews_batch,
     _read_fresh_stash_cache,
     _stash_cache_path,
+    fetch_currency_chaos_rates,
     resolve_current_trade_league,
 )
 from .ninja_price import (
@@ -72,6 +73,7 @@ __all__ = [
     "_should_auto_detail",
     "_stash_cache_path",
     "_strip_html",
+    "fetch_currency_chaos_rates",
     "query_meta",
     "query_price",
     "query_price_multi",

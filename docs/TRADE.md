@@ -55,6 +55,8 @@ Resolves English or Chinese modifier text to an official PoE1 trade stat ID with
 | `--weight cat=val` | — | Override mod scoring weights (`life`, `resist`, `damage`, `speed`, `crit`, `skill_level`, ...). |
 | `--budget` / `--currency` | `chaos_equiv` | Price cap. `chaos_equiv` omits `price.option` so GGG evaluates Chaos Orb Equivalent across Chaos/Divine/Alch; pass `chaos` or `divine` for exact currency. |
 | `--status` | `available` | PoE1 3.30 trade status: `available` (instant buyout + online), `securable` (instant buyout only), `online`, `onlineleague`, `any`. |
+| `--max-age` | off | Only listings indexed within this many hours, e.g. `15`. Sends the smallest site "Listed" window that covers it, drops the rest (and any listing with no readable time) locally, and keeps fetching (up to 5 pages) until `--fetch-limit` fresh listings are found. If nothing is that fresh, the older listings are shown instead and the report says so (`staleFallback` in `--json`). The report shows each listing's seller and how long ago it was listed. |
+| `--bargain` | off | Percent, e.g. `30`. Flags listings at least that far below the going price (median of the 10 cheapest listings of the same search, any age) and lists them first. Price only: judge the item itself by the PoB columns. Costs one more search, unless the main search already is cheapest-first with no `--max-age`. Pair with `--max-age` to catch underpriced fresh listings. |
 | `--league` | auto | Defaults to current softcore trade league via `poe.ninja` / trade API. |
 | `--rarity` / `--ilvl-min` | `rare` / `0` | Rarity (`any` disables) and minimum item level. |
 | `--category` / `--no-category` | from `--slot` | Override trade category (e.g. `weapon.bow`, `armour.gloves`). |
@@ -65,10 +67,12 @@ Resolves English or Chinese modifier text to an official PoE1 trade stat ID with
 | `--pob auto\|on\|off` | `auto` | Batch-verify top `--pob-limit` candidates via daemon `trade_eval_items` (`on` exits `6` on failure; `auto` degrades to mod deltas). |
 | `--pob-limit` | `5` | Number of top candidates evaluated in PoB. |
 | `--fetch-limit` / `--max-results` | `10` / `8` | Listings fetched (max `20`) / rows displayed. |
-| `--sort score\|price\|pob` | `score` | Report ranking order (`pob` ranks by finite DPS + 0.25*EHP, `inf`/`NaN`-safe). |
+| `--sort score\|price\|pob` | `score` | Report ranking order (`pob` ranks by finite DPS + 0.25*EHP, `inf`/`NaN`-safe). `price` compares chaos values using poe.ninja currency rates, so `1 divine` sorts after `50 chaos`. |
 | `--dump-query` | off | Print trade query JSON and exit without calling `/api/trade/search`. |
 | `--proxy` | env | Explicit HTTP/SOCKS5 proxy (also honors `POB_PROXY` / `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY`). |
 | `--json` / `--verbose` | off | RFC-8259 strict JSON output / HTTP request logging (cookies never logged). |
+
+Each candidate's `Trade listing` link is the same search narrowed to that listing's seller account, so it opens on that item instead of the whole result list (a seller with several matching listings gets a link showing all of them).
 
 ### `pob trade convert (--text T | --file f) --to fire|cold|lightning [--out f] [--force] [--json]`
 

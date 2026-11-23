@@ -90,7 +90,6 @@ def _emit_search_results(
     ordered: list[Any],
     fetched_ctx: dict[str, Any],
     plan: Any,
-    rows: list[Any],
     current: Any,
     current_error: str | None,
     update_warning: str | None,
@@ -100,6 +99,8 @@ def _emit_search_results(
     status: str,
     budget: float | None,
     currency: str,
+    max_age: float | None,
+    bargain: float | None,
     compact: bool,
     out_path: str | None,
 ) -> None:
@@ -108,6 +109,10 @@ def _emit_search_results(
         f"(cost: {cp.cost}; {cp.patch} rules; tier kept, roll re-rolled)"
         for cp in plan.conversions
     )
+    fetched = fetched_ctx["fetched"]
+    dropped_old = fetched_ctx["dropped_old"]
+    stale_fallback = fetched_ctx["stale_fallback"]
+    market = fetched_ctx["market"]
     if as_json:
         payload: dict[str, Any] = {
             "league": fetched_ctx["league_name"],
@@ -119,7 +124,12 @@ def _emit_search_results(
             "query": fetched_ctx["query"],
             "searchUrl": fetched_ctx["search_url"],
             "total": fetched_ctx["total"],
-            "fetched": len(rows),
+            "fetched": fetched,
+            "maxAgeHours": max_age,
+            "droppedOld": dropped_old,
+            "staleFallback": stale_fallback,
+            "bargainPct": bargain,
+            "marketChaos": market,
             "conversion": _conversion_payload(plan),
             "openAffixes": fetched_ctx["open_flags"],
             "benchOptions": fetched_ctx["bench_options"],
@@ -142,14 +152,22 @@ def _emit_search_results(
         candidates=ordered,
         league=fetched_ctx["league_name"],
         status=status,
+        listed_note=(
+            ""
+            if max_age is None
+            else f"NOTHING within {max_age:g}h - showing older listings instead"
+            if stale_fallback
+            else f"within {max_age:g}h ({dropped_old} older or undated dropped)"
+        ),
         budget=budget,
         currency=currency,
         search_url=fetched_ctx["search_url"],
         total=fetched_ctx["total"],
-        fetched=len(rows),
+        fetched=fetched,
         conversion_note=conversion_note,
         open_affixes=fetched_ctx["open_flags"],
         bench_options=fetched_ctx["bench_options"],
+        market_note=fetched_ctx["market_note"],
     )
     _emit_text(_prepend_warning(body, update_warning), out_path=out_path)
     if current_error:
@@ -165,6 +183,20 @@ def _emit_search_results(
 @click.option("--budget", type=float, help="Maximum listing price.")
 @click.option("--currency", type=click.Choice(["chaos_equiv", "chaos", "divine"]), default="chaos_equiv", show_default=True)
 @click.option("--status", type=click.Choice(sorted(VALID_STATUSES)), default="available", show_default=True)
+@click.option(
+    "--max-age",
+    type=click.FloatRange(min=0, min_open=True),
+    help="Only listings indexed within this many hours (stale listings are usually overpriced), e.g. 15.",
+)
+@click.option(
+    "--bargain",
+    type=click.FloatRange(min=0),
+    help=(
+        "Flag listings at least this many percent below the going price (median of the 10 "
+        "cheapest listings of the same search, any age) and list them first; costs one more "
+        "search. Pair with --max-age to catch underpriced fresh listings, e.g. 30."
+    ),
+)
 @click.option("--league", help="PoE1 trade league (defaults to current challenge league).")
 @click.option("--rarity", type=click.Choice(["nonunique", "rare", "unique", "any"]), default="nonunique", show_default=True)
 @click.option("--ilvl-min", type=int, default=0, show_default=True)
@@ -201,6 +233,8 @@ def cmd_trade_search(
     budget: float | None,
     currency: str,
     status: str,
+    max_age: float | None,
+    bargain: float | None,
     league: str | None,
     rarity: str,
     ilvl_min: int,
@@ -291,7 +325,10 @@ def cmd_trade_search(
         status=status,
         currency=currency,
         budget=budget,
+        max_age=max_age,
+        bargain=bargain,
         search_sort=search_sort,
+        sort_by=sort_by,
         open_prefix=open_prefix,
         open_suffix=open_suffix,
         open_affix=open_affix,
@@ -313,10 +350,16 @@ def cmd_trade_search(
         weight_map=weight_map,
         preferred=preferred,
         search_url=fetched_ctx["search_url"],
+        league_name=fetched_ctx["league_name"],
+        query=fetched_ctx["query"],
+        rates=fetched_ctx["rates"],
+        market=fetched_ctx["market"],
+        bargain=bargain,
     )
 
     pre_sort = "sum" if (sort_by == "sum" or (search_sort == "sum" and sort_by != "price")) else "score"
     candidates = sort_candidates(candidates, pre_sort)
+    candidates.sort(key=lambda c: not c.bargain)  # stable: bargains get PoB-verified first
 
     verification_limit = max(0, pob_limit)
     if bench_crafts and not dump_query:
@@ -341,13 +384,14 @@ def cmd_trade_search(
     ):
         return
 
-    ordered = sort_candidates(candidates, sort_by)[: max(0, max_results)]
+    ordered = sort_candidates(candidates, sort_by)
+    ordered.sort(key=lambda c: not c.bargain)  # stable: bargains first, order otherwise kept
+    ordered = ordered[: max(0, max_results)]
     _emit_search_results(
         as_json=as_json,
         ordered=ordered,
         fetched_ctx=fetched_ctx,
         plan=plan,
-        rows=rows,
         current=current,
         current_error=current_error,
         update_warning=update_warning,
@@ -357,6 +401,8 @@ def cmd_trade_search(
         status=status,
         budget=budget,
         currency=currency,
+        max_age=max_age,
+        bargain=bargain,
         compact=compact,
         out_path=out_path,
     )

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import base64
+import copy
+import gzip
 import json
 import os
 import time
@@ -222,18 +225,25 @@ class TradeClient:
             return league_id
         return "Standard"
 
-    def stats(self, force_refresh: bool = False) -> list[dict[str, Any]]:
-        cache_path = self.cache_dir / "trade_stats.json"
+    def _cached_data(self, name: str, force_refresh: bool = False) -> list[dict[str, Any]]:
+        cache_path = self.cache_dir / f"trade_{name}.json"
         now = float(self._now())
         if not force_refresh:
             cached = _read_stats_cache(cache_path, now)
             if cached is not None:
                 return cached
 
-        payload = self._request("GET", "/api/trade/data/stats", policy="data")
+        payload = self._request("GET", f"/api/trade/data/{name}", policy="data")
         groups = list(payload.get("result") or [])
         _atomic_write_json(cache_path, {"fetchedAt": now, "result": groups})
         return groups
+
+    def stats(self, force_refresh: bool = False) -> list[dict[str, Any]]:
+        return self._cached_data("stats", force_refresh)
+
+    def static(self) -> list[dict[str, Any]]:
+        """Currency and other static item ids with their names (same 7-day cache as ``stats``)."""
+        return self._cached_data("static")
 
     # -- search / fetch -------------------------------------------------
 
@@ -272,6 +282,22 @@ class TradeClient:
 
     def search_url(self, league: str, query_id: str) -> str:
         return f"{BASE_URL}/trade/search/{_quote(league)}/{_quote(query_id)}"
+
+
+def seller_url(league: str, query: dict[str, Any], account: str) -> str:
+    """Search link narrowed to one seller, so the page shows only their matching listing(s).
+
+    The site's search id is the gzip + urlsafe-base64 of the ``query`` JSON, so it is built
+    locally and costs no request.
+    """
+    # shortcut: relies on the site accepting self-describing ids (checked against the ids the
+    # API issues); if it returns to stored ids, issue one search per listing instead.
+    narrowed = copy.deepcopy(query)
+    trade_filters = narrowed.setdefault("filters", {}).setdefault("trade_filters", {})
+    trade_filters.setdefault("filters", {})["account"] = {"input": account}
+    blob = gzip.compress(json.dumps(narrowed, separators=(",", ":")).encode("utf-8"), mtime=0)
+    query_id = base64.urlsafe_b64encode(blob).decode("ascii").rstrip("=")
+    return f"{BASE_URL}/trade/search/{_quote(league)}/{query_id}"
 
 
 def _api_error_from_response(response: httpx.Response) -> ApiError:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
 
 from ..formatters import _parse_numeric_or_none, fmt_delta, fmt_num
@@ -210,6 +211,18 @@ class PobEval:
         }
 
 
+def listing_age_hours(row: dict[str, Any], now: datetime | None = None) -> float | None:
+    """Hours since the trade site indexed a fetched listing row (None when unknown)."""
+    listing = row.get("listing") if isinstance(row, dict) else None
+    try:
+        then = datetime.fromisoformat(str((listing or {}).get("indexed")))
+    except ValueError:
+        return None
+    if then.tzinfo is None:
+        then = then.replace(tzinfo=UTC)
+    return max(0.0, ((now or datetime.now(UTC)) - then).total_seconds() / 3600)
+
+
 @dataclass
 class Candidate:
     raw: dict[str, Any]
@@ -224,6 +237,9 @@ class Candidate:
     url: str = ""
     listing_id: str | None = None
     weighted_sum: float | None = None
+    price_chaos: float | None = None  # price in chaos when the currency rate is known
+    vs_market_pct: float | None = None  # price vs the going price; negative = cheaper
+    bargain: bool = False
     pob: PobEval | None = None
     pob_error: str | None = None
     bench_craft: dict[str, Any] | None = None
@@ -231,6 +247,17 @@ class Candidate:
     @property
     def display_name(self) -> str:
         return self.item.display_name
+
+    @property
+    def seller(self) -> str | None:
+        listing = self.raw.get("listing") if isinstance(self.raw, dict) else None
+        account = (listing or {}).get("account")
+        name = account.get("name") if isinstance(account, dict) else None
+        return str(name) if name else None
+
+    @property
+    def age_hours(self) -> float | None:
+        return listing_age_hours(self.raw)
 
     @property
     def price_text(self) -> str:

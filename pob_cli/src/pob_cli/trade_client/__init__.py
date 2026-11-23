@@ -25,6 +25,7 @@ import tempfile
 from ..importers import _make_httpx_client
 from .client import (
     TradeClient,
+    seller_url,
 )
 from .client import (
     _api_error_from_response as _api_error_from_response,
@@ -119,5 +120,6 @@ __all__ = [
     "_env_cookie",
     "_make_httpx_client",
     "redact",
+    "seller_url",
     "tempfile",
 ]

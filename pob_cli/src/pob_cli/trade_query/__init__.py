@@ -29,6 +29,7 @@ from .aliases import (
 )
 from .aliases import (
     CATEGORY_BY_SLOT,
+    INDEXED_WINDOWS,
     OPEN_AFFIX_ID,
     OPEN_PREFIX_ID,
     OPEN_SUFFIX_ID,
@@ -171,6 +172,7 @@ from .stats_matcher import (
 
 __all__ = [
     "CATEGORY_BY_SLOT",
+    "INDEXED_WINDOWS",
     "OPEN_AFFIX_ID",
     "OPEN_PREFIX_ID",
     "OPEN_SUFFIX_ID",
