@@ -126,7 +126,7 @@ pip install "git+https://github.com/exilemoulei/pob4agents.git#subdirectory=pob_
 git clone https://github.com/exilemoulei/pob4agents.git
 cd pob4agents
 
-# 1. 安装 pob CLI
+# 1. 安装 pob4agents（命令 pob）
 pip install "./pob_cli"
 
 # 2. 编译原生 LuaJIT 2.1 + lua-utf8 运行时并放入托管引擎目录
@@ -146,7 +146,7 @@ pob status
 
 ### 3. 首次设置 PoB 引擎
 
-安装 `pob` 后，运行一次 `pob bootstrap` 下载 PoB 引擎。已有本地 `PobTools` 的话，也可以从该目录导入：
+安装 pob4agents 后，运行一次 `pob bootstrap` 下载 PoB 引擎。已有本地 `PobTools` 的话，也可以从该目录导入：
 
 ```powershell
 pob --version

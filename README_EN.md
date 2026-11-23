@@ -126,7 +126,7 @@ On macOS (Apple Silicon `arm64` / Intel `x86_64`) or Linux (`x86_64` / `aarch64`
 git clone https://github.com/exilemoulei/pob4agents.git
 cd pob4agents
 
-# 1. Install the pob CLI
+# 1. Install pob4agents (the pob command)
 pip install "./pob_cli"
 
 # 2. Build LuaJIT 2.1 + lua-utf8 and place it in the managed engine directory
@@ -146,7 +146,7 @@ pob status
 
 ### 3. Set up the PoB engine
 
-After installing `pob`, run `pob bootstrap` once to download the PoB engine. You can also import an existing local `PobTools` directory:
+After installing pob4agents, run `pob bootstrap` once to download the PoB engine. You can also import an existing local `PobTools` directory:
 
 ```powershell
 pob --version

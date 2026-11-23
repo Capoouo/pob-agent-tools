@@ -3,7 +3,7 @@ name: pob-poe1
 description: Path of Exile 1 (PoE1 3.30, 流放之路1) build diagnosis, headless PoB calculation, DPS/EHP Pinnacle audit, passive tree/gem/item what-if optimization, official PoE1 trade search, crafting bench, and timeless jewel seed lookup via local `pob` CLI. Trigger on PoE1, PoB, pobb.in, poe.ninja, 配装, 天赋, 宝石, 技能连法, 伤害计算, 脱水, 跑PoB, 市集, 工艺台, 永恒珠宝, 法血, 猎首, 尼米斯, 大法师, 正火, 闪打, 龙卷, 漩涡, 憎恨, 耐力球, 异灵之体, 异能魔力, 万古之剑, 圣宗, 喋血之刃, 暴击时施放, 吟唱时施放, 艾许之面.
 ---
 
-# PoE1 3.30 Universal Headless PoB Skill (`pob`)
+# PoE1 3.30 Universal Headless PoB Skill (pob4agents, command `pob`)
 
 **Golden Rules (NEVER VIOLATE)**
 1. **PoE1 3.30 ONLY** — never apply PoE2 rules (`Spirit`/`精魂`, `Charm 1..3`, `Waystone`, `Soul Core`/`{rune}`, `Distilled`/`涂灌`, 1-support limit, final-type-only conversion, PoE2 `EB`).
