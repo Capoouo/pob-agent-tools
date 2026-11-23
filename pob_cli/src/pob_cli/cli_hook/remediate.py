@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import contextlib
+import html as _html
+import json
 import os
+import re
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -15,6 +18,7 @@ from ..formatters import fmt_num, format_diagnose_markdown
 from ..game_data import ground_text_entities
 from ..item_inspect import format_inspection, inspect_item
 from ..ticks import build_server_tick_table
+from ..updater.paths import get_shared_cache_dir
 
 MAX_CORRECTION_CHARS = 2500
 DEFAULT_BUDGET_SEC = 2.5
@@ -203,6 +207,92 @@ def _remediate_v4(trigger_claims: list[str], assistant_text: str) -> str:
     return "\n".join(lines)
 
 
+def _strip_tags_compact(raw_html: str) -> str:
+    txt = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", raw_html, flags=re.DOTALL | re.IGNORECASE)
+    txt = re.sub(r"<[^>]+>", " ", txt)
+    return re.sub(r"\s+", " ", _html.unescape(txt)).strip()
+
+
+def _scan_local_web_cache(queries: list[str], *, runtime_dir: Path | None) -> list[str]:
+    """0ms local disk cache scan for poewiki_*.json and poedb_*.json (never makes HTTP calls)."""
+    needles = [q.strip().lower() for q in queries if isinstance(q, str) and len(q.strip()) >= 2]
+    if not needles:
+        return []
+    cache_dirs: list[Path] = []
+    if runtime_dir is not None:
+        local_c = Path(runtime_dir) / "cache"
+        if local_c.is_dir():
+            cache_dirs.append(local_c)
+    try:
+        shared_c = get_shared_cache_dir(runtime_dir=runtime_dir)
+        if shared_c.is_dir() and shared_c not in cache_dirs:
+            cache_dirs.append(shared_c)
+    except Exception:
+        pass
+
+    hits: list[str] = []
+    seen_titles: set[str] = set()
+    for cdir in cache_dirs:
+        candidates: list[Path] = []
+        with contextlib.suppress(OSError):
+            candidates.extend(cdir.glob("poewiki_*.json"))
+            candidates.extend(cdir.glob("poedb_*.json"))
+        candidates = [p for p in candidates if p.name != "poedb_autocomplete_index.json"]
+        candidates.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0.0, reverse=True)
+        for path in candidates[:60]:
+            if len(hits) >= 2:
+                return hits
+            try:
+                obj = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            src = "poewiki" if path.name.startswith("poewiki_") else "poedb"
+            data = obj.get("data") if isinstance(obj.get("data"), dict) else obj
+            title = str(data.get("title") or data.get("resolvedQuery") or data.get("query") or "").strip()
+            url = str(data.get("url") or obj.get("url") or "").strip()
+            summary = str(data.get("summary") or "").strip()
+            if not summary and isinstance(obj.get("html"), str):
+                h1_m = re.search(r"<h1[^>]*>(.*?)</h1>", obj["html"], flags=re.DOTALL | re.IGNORECASE)
+                t_m = re.search(r"<title[^>]*>(.*?)</title>", obj["html"], flags=re.DOTALL | re.IGNORECASE)
+                if not title:
+                    title = _strip_tags_compact(h1_m.group(1) if h1_m else (t_m.group(1) if t_m else ""))
+                summary = _strip_tags_compact(obj["html"][:6000])
+            haystack = f"{title} {data.get('query') or ''} {data.get('resolvedQuery') or ''} {url}".lower()
+            if not any(n in haystack or n.replace(" ", "_") in haystack for n in needles):
+                continue
+            key = f"{src}:{(title or url).lower()}"
+            if key in seen_titles or not summary:
+                continue
+            seen_titles.add(key)
+            label = title or path.stem
+            url_part = f" ({url})" if url else ""
+            hits.append(f"[Cached {src}] {label}{url_part}: {summary[:360]}")
+    return hits
+
+
+def _remediate_v5(v5_info: dict[str, Any], *, runtime_dir: Path | None) -> str:
+    queries = [str(q).strip() for q in (v5_info.get("suggestedQueries") or []) if str(q).strip()]
+    hesitations = [str(h).strip() for h in (v5_info.get("hesitations") or []) if str(h).strip()]
+    lines: list[str] = []
+    if hesitations:
+        lines.append(f"- 检出犹豫/猜测表述：`{hesitations[0][:100]}`")
+    cached_hits = _scan_local_web_cache(queries, runtime_dir=runtime_dir)
+    if cached_hits:
+        lines.append("- 本地磁盘缓存命中（0ms）：")
+        lines.extend(cached_hits)
+    first_q = queries[0] if queries else "<词条>"
+    q_args = " ".join(f'"{q}"' for q in queries[:3]) if queries else '"<词条>"'
+    lines.append(
+        f'- 必做查证命令：`pob research {q_args}`（或 `pob_lookup(kind="research", query="{first_q}")` / `pob wiki "{first_q}"` / `pob poedb "{first_q}"`）。'
+    )
+    lines.append(
+        "- 要求：请先执行上述联网查证（或依据已命中的本地缓存真值）核实机制交互与版本事实，再用明确权威结论重写回复，严禁凭记忆猜测或写“大概/应该/理论上/不确定/建议进游戏实测”。"
+    )
+    return "\n".join(lines).strip()
+
+
 def build_correction_prompt(
     reasons: list[str],
     evidence_blocks: list[str],
@@ -240,6 +330,7 @@ def run_remediation(
     v2_info: dict[str, Any] | None,
     v3_slots: list[str],
     v4_claims: list[str],
+    v5_info: dict[str, Any] | None = None,
     assistant_text: str,
     target_slot: str = "main",
     runtime_dir: Path | None = None,
@@ -274,5 +365,15 @@ def run_remediation(
         if v4_claims:
             reasons.append("V4 未执行 `pob diagnose` 或 `pob data tick` 即断言触发器 APS/CDR 断点")
             evidence.append(_remediate_v4(v4_claims, assistant_text))
+        if v5_info:
+            has_hes = bool(v5_info.get("hesitations"))
+            has_mech = bool(v5_info.get("mechNeed"))
+            if has_hes and has_mech:
+                reasons.append("V5 本轮未联网核验即对流派机制运作做出犹豫/猜测表述")
+            elif has_hes:
+                reasons.append("V5 终稿含犹豫/凭记忆猜测措辞且本轮未联网查证")
+            else:
+                reasons.append("V5 涉及流派机制运作/交互边界问题但本轮尚未调用 poedb/poewiki 核验")
+            evidence.append(_remediate_v5(v5_info, runtime_dir=runtime_dir))
 
     return build_correction_prompt(reasons, evidence)

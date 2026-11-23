@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import shlex
 import time
@@ -12,6 +13,8 @@ from typing import Any
 from ..game_data import ground_text_entities
 from ..guardrails import (
     detect_build_source_in_text,
+    detect_hesitation_claims,
+    detect_mechanics_research_need,
     detect_panel_or_delta_claims,
     detect_trigger_breakpoint_claims,
     extract_claimed_open_affix_slots,
@@ -39,12 +42,35 @@ _SHELL_TOOLS: frozenset[str] = frozenset(
     }
 )
 
+_FILE_INSPECT_TOOLS: frozenset[str] = frozenset(
+    {
+        "grep",
+        "grep_search",
+        "glob",
+        "find_by_name",
+        "find",
+        "search",
+        "read",
+        "read_file",
+        "file_read",
+        "view_file",
+        "list_dir",
+        "ls",
+        "rg",
+        "cat",
+    }
+)
+
 _RAW_LUA_READER_RE = re.compile(
-    r"\b(?:cat|get-content|gc|type|rg|ripgrep|select-string|findstr|grep|head|tail|more|less|python3?|py|node|pwsh|powershell)\b",
+    r"\b(?:cat|get-content|gc|type|rg|ripgrep|select-string|findstr|grep|head|tail|more|less|ls|dir|get-childitem|gci|python3?|py|node|pwsh|powershell)\b",
     re.IGNORECASE,
 )
 _RAW_LUA_PATH_RE = re.compile(
     r"(?:\.runtime[/\\]engine|PobTools[^/\s\"'`]*)[/\\][^\s\"'`]*\.lua\b",
+    re.IGNORECASE,
+)
+_RAW_ENGINE_DIR_RE = re.compile(
+    r"(?:\.runtime[/\\]engine|PobTools[^/\s\"'`]*[/\\]PoE1)(?:[/\\]|$)",
     re.IGNORECASE,
 )
 _MANUAL_XML_EXEC_RE = re.compile(
@@ -99,38 +125,62 @@ def handle_pre_prompt(
             "turnKey": turn_key,
             "turnStartTs": float(existing.get("turnStartTs") or time.time()),
             "hasBuildSource": bool(existing.get("hasBuildSource", False)),
+            "needsWebResearch": bool(existing.get("needsWebResearch", False)),
+            "suggestedResearchQueries": list(existing.get("suggestedResearchQueries") or []),
             "reusedTurn": True,
         }
 
     now_ts = int(time.time() * 1000) / 1000.0
     has_build_src, source_hint = detect_build_source_in_text(user_text)
+    mech_info = detect_mechanics_research_need(user_text)
+    needs_web = bool(mech_info["needsResearch"])
+    suggested_queries = list(mech_info["suggestedQueries"])
     state = {
         "sessionId": session_id,
         "turnKey": turn_key,
         "turnStartTs": now_ts,
         "hasBuildSource": has_build_src,
         "buildSourceHint": source_hint,
+        "needsWebResearch": needs_web,
+        "suggestedResearchQueries": suggested_queries,
         "userText": user_text[:2000],
         "stopRetries": 0,
     }
     save_turn_state(session_id, state, runtime_dir=runtime_dir)
 
-    inject_text = ""
+    ground_block = ""
     if user_text.strip():
         try:
             grounded = ground_text_entities(user_text, limit=6, runtime_dir=runtime_dir)
             if grounded.get("entities") or grounded.get("warnings") or grounded.get("resolvedSlang"):
-                block = str(grounded.get("contextBlock") or "").strip()
-                if block:
-                    inject_text = f'<pob-grounding patch="3.30">\n{block[:3500]}\n</pob-grounding>'
+                ground_block = str(grounded.get("contextBlock") or "").strip()
         except Exception:
-            inject_text = ""
+            ground_block = ""
+
+    parts: list[str] = []
+    if needs_web:
+        first_q = suggested_queries[0] if suggested_queries else "<词条>"
+        q_hint = f"（建议查词：{', '.join(suggested_queries[:3])}）" if suggested_queries else ""
+        parts.append(
+            "[MECHANICS-RESEARCH-REQUIRED] 本题涉及流派机制运作/交互边界（PoB 引擎可能未完整模拟）。"
+            f'严禁凭记忆猜或写“大概/应该/不确定”，请先调用 `pob research "{first_q}"`（并发查 poedb.tw + poewiki.net）'
+            f"或 `pob wiki` / `pob poedb` 核验真值。{q_hint}"
+        )
+    if ground_block:
+        parts.append(ground_block)
+
+    inject_text = ""
+    if parts:
+        combined = "\n".join(parts)[:3500]
+        inject_text = f'<pob-grounding patch="3.30">\n{combined}\n</pob-grounding>'
 
     return {
         "injectText": inject_text,
         "turnKey": turn_key,
         "turnStartTs": now_ts,
         "hasBuildSource": has_build_src,
+        "needsWebResearch": needs_web,
+        "suggestedResearchQueries": suggested_queries,
         "reusedTurn": False,
     }
 
@@ -208,8 +258,24 @@ def handle_pre_tool(
     *,
     runtime_dir: Path | None = None,
 ) -> dict[str, Any]:
-    """Gate 2: enforce 5 deterministic pre-tool rules (only for shell commands)."""
+    """Gate 2: enforce deterministic pre-tool rules (shell + file/grep engine-Lua guards)."""
     tool_name = str(req.get("toolName") or "").strip().lower()
+    if tool_name in _FILE_INSPECT_TOOLS:
+        cand_paths: list[str] = []
+        raw_tp = req.get("targetPaths")
+        if isinstance(raw_tp, list):
+            cand_paths.extend(str(p) for p in raw_tp if p)
+        for k in ("filePath", "path", "pattern", "commandLine"):
+            v = req.get(k)
+            if isinstance(v, str) and v.strip():
+                cand_paths.append(v.strip())
+        if any(_RAW_LUA_PATH_RE.search(p) or _RAW_ENGINE_DIR_RE.search(p) for p in cand_paths):
+            return _deny_tool(
+                "NO_RAW_ENGINE_LUA",
+                '禁止用 grep/glob/read 扫描 PoB 引擎 Lua 源码目录（NO_RAW_ENGINE_LUA）；请直接使用 pob data <gem|unique|mod|tree>、pob calc "<kw>" 或 pob research "<词条>"。',
+            )
+        return _allow_tool()
+
     if tool_name and tool_name not in _SHELL_TOOLS:
         return _allow_tool()
 
@@ -218,7 +284,7 @@ def handle_pre_tool(
         return _allow_tool()
 
     # Rule 1: NO_RAW_ENGINE_LUA
-    if _RAW_LUA_READER_RE.search(cmd) and _RAW_LUA_PATH_RE.search(cmd):
+    if _RAW_LUA_READER_RE.search(cmd) and (_RAW_LUA_PATH_RE.search(cmd) or _RAW_ENGINE_DIR_RE.search(cmd)):
         return _deny_tool(
             "NO_RAW_ENGINE_LUA",
             '禁止手撕引擎 Lua 源码（NO_RAW_ENGINE_LUA）；请直接使用 pob data <gem|unique|mod|tree> 或 pob calc "<kw>"（0ms 索引查询）。',
@@ -375,6 +441,34 @@ def handle_verify_stop(
         failed_checks.append("V4")
         v4_failed_claims = v4_claims
 
+    # V5: web-research mechanics verification & anti-hesitation gate
+    # NEVER infer offline from POB_OFFLINE=1 (set by `pob --offline hook ...` to skip GitHub update checks).
+    v5_enabled = (
+        req.get("disableV5") is not True
+        and os.environ.get("POB_HOOK_DISABLE_V5", "").strip() != "1"
+    )
+    web_ok = bool(
+        summary.get("hasWebResearch")
+        or summary.get("attemptedWebResearch")
+        or req.get("hostWebResearched") is True
+    )
+    state_needs_web = bool(state.get("needsWebResearch")) if same_turn else False
+    state_queries = list(state.get("suggestedResearchQueries") or []) if same_turn else []
+    v5_info: dict[str, Any] | None = None
+    if v5_enabled and not web_ok:
+        hesitations = detect_hesitation_claims(assistant_text)
+        mech_check = detect_mechanics_research_need(user_text, assistant_text)
+        mech_need = state_needs_web or bool(mech_check["needsResearch"])
+        if hesitations or mech_need:
+            failed_checks.append("V5")
+            merged_q = state_queries or list(mech_check.get("suggestedQueries") or [])
+            v5_info = {
+                "hesitations": hesitations[:3],
+                "mechNeed": mech_need,
+                "reasons": list(mech_check.get("reasons") or []),
+                "suggestedQueries": merged_q[:3],
+            }
+
     if not failed_checks:
         return _allow_stop(stop_retries)
 
@@ -385,6 +479,8 @@ def handle_verify_stop(
         "turnStartTs": turn_start_ts or time.time(),
         "hasBuildSource": has_build_src,
         "buildSourceHint": build_source_hint,
+        "needsWebResearch": state_needs_web or bool(v5_info and v5_info.get("mechNeed")),
+        "suggestedResearchQueries": (v5_info.get("suggestedQueries") if v5_info else state_queries) or [],
         "userText": (user_text or str(state.get("userText") or ""))[:2000],
         "stopRetries": next_retries,
     }
@@ -395,6 +491,7 @@ def handle_verify_stop(
         v2_info=v2_info,
         v3_slots=v3_missing,
         v4_claims=v4_failed_claims,
+        v5_info=v5_info,
         assistant_text=assistant_text,
         target_slot=target_slot,
         runtime_dir=runtime_dir,

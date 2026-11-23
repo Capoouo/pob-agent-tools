@@ -38,9 +38,11 @@ LEGACY_PATCH_TRAPS_328_330: tuple[LegacyPatchTrapRule, ...] = (
         canonical_term="The Sword of Ages / Temporal Mirage (3.30 Verified)",
         summary=(
             "**3.30 Live-vs-PoB Advisory (`The Sword of Ages` / `Temporal Mirage`)**: "
-            "(1) PoB 2.68.1 `other.lua` omits the `0.50s` base cooldown AND wrongly applies Saboteur `Perfect Crime` (`Triggerbots`) "
-            "`30% less` damage to Temporal Mirage clones (3.30 live game verified: clones do **NOT** take `-30% less`; "
-            "`43% more Spell Damage` in `customMods` is the exact PoB compensation). "
+            "(1) **Two separate `30% less` lines**: Temporal Mirage clones **DO** take their own innate `30% less Damage` "
+            "(`Skills used by Temporal Mirages deal 30% less Damage`, ALREADY modeled in PoB `other.lua` `SupportUniqueSuspendInTimeCanUse`), "
+            "and do **NOT** take a SECOND `-30% less` from Saboteur `Perfect Crime` (`Triggerbots`, since clones *use* the spell rather than your character triggering it). "
+            "PoB 2.68.1 omits the `0.50s` base cooldown AND double-penalizes `0.7 * 0.7 = 0.49` by wrongly applying `Perfect Crime` `-30% less` on top of Temporal Mirage's own `-30% less` "
+            "(`43% more Spell Damage` in `customMods` cancels ONLY that erroneous second penalty back to live `0.70` per-cast). "
             "(2) `on using a Movement Attack`: holding channelling `Cyclone` triggers ONLY ONCE on channel start (never continuously while held); "
             "requires tap-macro or discrete movement attacks (`Leap Slam`/`Flicker`/`Consecrated Path`). "
             "(3) `Greater Spell Cascade` shares `Firestorm of Pelting` global 12-storm cap (hurts single-target). "

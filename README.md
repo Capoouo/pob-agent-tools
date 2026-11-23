@@ -48,7 +48,7 @@
   - 单步和批量改动都在内存中的构筑快照上运行。`pob batch` 可组合 19 类操作并返回指定分析视图；`pob sweep` 在同一个已启动的引擎中比较多套配装、天赋或技能连法，单套方案出错不会中断其他结果。
 - **搜索永恒珠宝种子**（`pob timeless list` / `pob timeless search`）：按已点亮的珠宝孔和天赋，用 PoB 逐个计算候选种子的收益；支持中文和英文珠宝名。需要遍历所有候选时可加 `--exact`。
   - 从 PoB 的 `Data/Uniques/jewel.lua` 读取 11 种永恒珠宝数据。对致命的骄傲、残酷的约束、军团的信仰、优雅的狂妄、英雄的悲剧等珠宝，先按已分配及涂油取得的核心天赋去重，再预筛候选种子；`--exact` 跳过预筛。搜索可用多个临时引擎进程并行运行，并处理其他珠宝孔中冲突的 `Historic` 珠宝。
-- **查询游戏数据和物价**（`pob data` / `pob price` / `pob meta` / `pob poedb` / `pob wiki`）：本地中英双语索引可查宝石、传奇装备、词缀和底材；联网时还能查 poe.ninja 物价与构筑分布、流亡编年史和 PoE Wiki。
+- **查询游戏数据、机制与物价**（`pob data` / `pob research` / `pob poedb` / `pob wiki` / `pob price` / `pob meta`）：本地中英双语索引可查宝石、传奇装备、词缀和底材；联网时支持 `pob research` 并发核验流亡编年史（`poedb.tw`）与 PoE Wiki（`poewiki.net`，直接复用本地 PoEDB 官方双语索引精确匹配英文条目、0 翻译幻觉，并优先提取 `Mechanics` / `Skill functions and interactions` 段落），并查 poe.ninja 物价与构筑分布。
   - 本地数据库由 PoB 的 Lua 数据建立 SQLite/FTS5 索引；无需启动 PoB，查询通常在 15ms 内完成。覆盖秽生传奇变体、工艺台/古灵/腐化词缀和中英名称互查，一条命令可同时查多个词。
 - **找装备、补词缀**（`pob trade` / `pob bench`）：搜索官方交易市集的在售装备，用 PoB 比较换装收益；还能查看工艺台可补的词缀，并试算丰收同阶元素抗性转换。交易功能只负责搜索和计算，不会代替玩家购买。
   - `TradeSiteStats.lua` 在本地匹配中英文交易词缀，并区分装备局部词缀与全局词缀；交易搜索遵守 GGG 响应头给出的请求频率限制，支持 3.30 一口价搜索和 `chaos_equiv` 折算。
@@ -168,6 +168,7 @@ pob update --proxy http://127.0.0.1:7890        # 更新引擎，并刷新已加
 | `POB_PROXY` | 网络请求代理（支持 `http://`、`https://`、`socks5://`；亦兼容 `HTTPS_PROXY` / `ALL_PROXY`） |
 | `POB_GITHUB_MIRROR` | GitHub 下载镜像前缀（加速 `bootstrap` / `update`） |
 | `POB_OFFLINE` | 设为 `1` 时跳过启动期与定时 GitHub 更新检查（等价于全局 `--offline`） |
+| `POB_HOOK_DISABLE_V5` | 设为 `1` 时关闭 `verify-stop` 的 V5 联网机制核验闸门（独立于 `POB_OFFLINE`） |
 | `POESESSID` / `POE_COOKIE` | 官方交易接口返回 401/403 时可按需设置；请只通过环境变量提供，不要写进命令参数或日志 |
 
 ---
@@ -470,8 +471,10 @@ pob price "Forbidden Flame" --variant "Hierophant" --limit 30
 pob price "Awakened Spell Echo Support" --detailed
 pob meta --skill "Ice Nova of Frostbolts" --top 15
 
-# --- PoE Wiki：查机制说明 ---
-pob wiki "Eldritch Battery" "Leech"
+# --- 双源并发机制核验（poedb.tw + poewiki.net）与 PoE Wiki（本地 PoEDB 双语索引精确匹配 + 机制段落优先提取） ---
+pob research "Returning Projectiles" "Ice Spear"
+pob research "暮光法衣" --mods --lang cn
+pob wiki "异能魔力" "Eldritch Battery" "Leech"
 ```
 
 ---
@@ -516,9 +519,9 @@ pob trade convert --file .\dropped_gloves.txt --to lightning
 
 针对快速/轻量模型容易出现的“跳过 `pob` 手撕 XML/Lua、正文中裸奔 PoE2 或旧补丁幻觉、未验视装备就断言有空词缀、未算帧率就编造 CoC 断点”等问题，`pob4agents` 内置了零 LLM 裁判的进程外回执与三道确定性生命周期护栏（`pob --offline hook <pre-prompt|pre-tool|verify-stop> [--protocol raw|agy|claude]`）：
 
-- **前置核对与游标锚定（`pre-prompt`）**：新轮次开始时记录 `turnStartTs` 并离线注入 `<pob-grounding>` 3.30 事实卡与版本陷阱告警（`<15ms`）。
+- **前置核对与游标锚定（`pre-prompt`）**：新轮次开始时记录 `turnStartTs` 并离线注入 `<pob-grounding>` 3.30 事实卡与版本陷阱告警（`<15ms`）；遇到流派运作/技能交互问题时前置注入 `[MECHANICS-RESEARCH-REQUIRED]` 强搜指令。
 - **调用前违规拒止（`pre-tool`）**：拦截手撕引擎 Lua 源码、脚本手算构筑 XML（`R5`）、浪费上下文的 `pob --help`、无 `--out` 的裸 `--json`（支持重写时自动剥离）以及 `diagnose` 后的机械重复查询。
-- **收尾核验与自动代跑塞真值（`verify-stop`）**：基于不可篡改的 `turn_receipts.jsonl` 回执账本与终稿文本扫描（V1 幻觉/硬谬误、V2 面板数字算力回执、V3 空词缀验视回执、V4 触发器 `0.033s` 断点回执），不通过时同步代跑毫秒级取证并注入单次纠偏（`maxRetries = 1`，全链路 Fail-Open）。
+- **收尾核验与自动代跑塞真值（`verify-stop`）**：基于不可篡改的 `turn_receipts.jsonl` 回执账本与终稿文本扫描（`guardrails/reply_patterns.py` + `reply_scanner.py`：V1 幻觉/硬谬误、V2 面板数字算力回执、V3 空词缀验视回执、V4 触发器 `0.033s` 断点回执、V5 犹豫/机制问答未联网核验拦截，支持 `POB_HOOK_DISABLE_V5=1` 独立关闭），不通过时同步代跑毫秒级取证或回填本地缓存并注入单次纠偏（`maxRetries = 1`，全链路 Fail-Open）。
 
 跨宿主接线模板与插件：
 

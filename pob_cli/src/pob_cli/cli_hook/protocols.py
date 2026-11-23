@@ -8,7 +8,22 @@ from pathlib import Path
 from typing import Any
 
 _CMD_ARG_KEYS: tuple[str, ...] = ("CommandLine", "command", "cmd", "script")
+_PATH_ARG_KEYS: tuple[str, ...] = (
+    "path", "file_path", "filePath", "Path", "TargetFile", "SearchPath",
+    "DirectoryPath", "directory", "dir", "cwd", "glob", "pattern", "include",
+)
 _TRANSCRIPT_TAIL_BYTES = 131_072
+
+
+def _extract_target_paths(args: dict[str, Any]) -> list[str]:
+    out: list[str] = []
+    for key in _PATH_ARG_KEYS:
+        val = args.get(key)
+        if isinstance(val, str) and val.strip():
+            out.append(val.strip())
+        elif isinstance(val, list):
+            out.extend(str(v).strip() for v in val if isinstance(v, str) and v.strip())
+    return out
 
 
 def read_stdin_json() -> dict[str, Any]:
@@ -171,6 +186,7 @@ def decode_input(
                     "sessionId": session_id,
                     "toolName": str(tc.get("name") or payload.get("toolName") or ""),
                     "commandLine": cmd_line,
+                    "targetPaths": _extract_target_paths(args),
                     "supportsOverwrite": True,
                 },
                 meta,
@@ -216,6 +232,7 @@ def decode_input(
                     "sessionId": session_id,
                     "toolName": str(payload.get("tool_name") or payload.get("toolName") or ""),
                     "commandLine": cmd_line,
+                    "targetPaths": _extract_target_paths(tool_input),
                     "supportsOverwrite": False,
                 },
                 meta,

@@ -48,7 +48,7 @@ DPS, effective hit pool (TotalEHP), maximum hit taken (MaxHit), and the effects 
   - Single edits and batches run on an in-memory build snapshot. `pob batch` combines 19 operation types and returns selected analysis views. `pob sweep` compares multiple gear, passive, or gem setups in the same running engine; one failed variant does not stop the others.
 - **Search Timeless Jewel seeds** (`pob timeless list` / `pob timeless search`): Evaluate candidate seeds in PoB using your allocated socket and passives. English and Chinese jewel names are accepted. Use `--exact` to evaluate all candidates.
   - Jewel data comes from PoB's `Data/Uniques/jewel.lua` and covers 11 Timeless Jewel variants. For jewels such as Lethal Pride, Brutal Restraint, Militant Faith, Elegant Hubris, and Heroic Tragedy, the search deduplicates allocated and anointed notables before prefiltering seeds; `--exact` skips that prefilter. Multiple temporary engine workers can search in parallel, while conflicting `Historic` jewels in other sockets are handled automatically.
-- **Look up game data and prices** (`pob data` / `pob price` / `pob meta` / `pob poedb` / `pob wiki`): The local bilingual index covers gems, unique items, modifiers, and bases. Online queries cover poe.ninja prices and build trends, PoEDB, and PoE Wiki.
+- **Look up game data, mechanics, and prices** (`pob data` / `pob research` / `pob poedb` / `pob wiki` / `pob price` / `pob meta`): The local bilingual index covers gems, unique items, modifiers, and bases. Online queries support concurrent `pob research` (`poedb.tw` + `poewiki.net`), exact local PoEDB bilingual index matching for `pob wiki` with prioritized `Mechanics` / `Skill functions and interactions` extraction, and poe.ninja prices and build trends.
   - A SQLite/FTS5 index is built from PoB's Lua data and can be searched without starting PoB, usually within 15 ms. It includes Foulborn unique variants, bench/Eldritch/corrupted modifiers, and English↔Chinese names; one command can search multiple terms.
 - **Find gear and fill modifier gaps** (`pob trade` / `pob bench`): Search official trade listings, compare upgrades in PoB, inspect available bench crafts, and preview same-tier Harvest resistance conversions. Trade commands only search and calculate; they do not buy items for you.
   - `pob item inspect` classifies rare-item prefixes, suffixes, hybrid modifiers, and existing bench crafts; uncertain matches never imply a free slot. Trade search uses `--bench-craft` to evaluate legal additions or replacements at maximum rolls and compare the resulting PoB gains.
@@ -168,6 +168,7 @@ Common environment variables:
 | `POB_PROXY` | HTTP, HTTPS, or SOCKS5 proxy; `HTTPS_PROXY` and `ALL_PROXY` are also supported |
 | `POB_GITHUB_MIRROR` | Mirror prefix for GitHub downloads during `bootstrap` and `update` |
 | `POB_OFFLINE` | Set to `1` to skip startup and scheduled GitHub update checks; equivalent to global `--offline` |
+| `POB_HOOK_DISABLE_V5` | Set to `1` to disable the Gate 3 V5 web-research verification gate (independent of `POB_OFFLINE`) |
 | `POESESSID` / `POE_COOKIE` | Optional when the official trade API returns 401/403; provide them only as environment variables, never as CLI arguments or log entries |
 
 ---
@@ -472,8 +473,10 @@ pob price "Forbidden Flame" --variant "Hierophant" --limit 30
 pob price "Awakened Spell Echo Support" --detailed
 pob meta --skill "Ice Nova of Frostbolts" --top 15
 
-# --- PoE Wiki: mechanics ---
-pob wiki "Eldritch Battery" "Leech"
+# --- Concurrent dual-source research (poedb.tw + poewiki.net) & PoE Wiki (local PoEDB bilingual exact match + Mechanics priority) ---
+pob research "Returning Projectiles" "Ice Spear"
+pob research "Twilight Regalia" --mods --lang us
+pob wiki "异能魔力" "Eldritch Battery" "Leech"
 ```
 
 ---
@@ -518,9 +521,9 @@ Repeat `--bench-craft` for multiple craft targets. Results default to PoB rankin
 
 To prevent fast/lightweight models from bypassing `pob` (hand-parsing Lua/XML, hallucinating PoE2 or removed legacy mechanics in final answers, claiming open affixes without inspecting items, or inventing CoC breakpoints), `pob4agents` ships a deterministic, zero-LLM-judge hook kernel (`pob --offline hook <pre-prompt|pre-tool|verify-stop> [--protocol raw|agy|claude]`) backed by an out-of-band execution receipt ledger:
 
-- **Pre-prompt grounding & turn cursor (`pre-prompt`)**: anchors `turnStartTs` once per turn and injects compact `<pob-grounding>` PoE1 3.30 entity cards and trap alerts offline (`<15ms`).
+- **Pre-prompt grounding & turn cursor (`pre-prompt`)**: anchors `turnStartTs` once per turn and injects compact `<pob-grounding>` PoE1 3.30 entity cards and trap alerts offline (`<15ms`), plus `[MECHANICS-RESEARCH-REQUIRED]` when the user asks about build mechanics or skill interactions.
 - **Pre-tool hard deny / rewrite (`pre-tool`)**: blocks raw engine `.lua` reads, script-based XML calculations (`R5`), redundant `pob --help`, bare `--json` without `--out` (auto-stripped on hosts that support argument overwrite), and redundant post-`diagnose` fetches.
-- **Stop verification & auto-remediation (`verify-stop`)**: checks `turn_receipts.jsonl` and scans the final assistant text (V1 PoE2/legacy/mechanic fallacies, V2 compute receipts for DPS/EHP claims, V3 slot inspection receipts for open-affix claims, V4 `0.033s` tick receipts for trigger breakpoints). On failure, it runs fast in-process remediation and injects a single correction pass (`maxRetries = 1`, fail-open on errors).
+- **Stop verification & auto-remediation (`verify-stop`)**: checks `turn_receipts.jsonl` and scans the final assistant text (`guardrails/reply_patterns.py` + `reply_scanner.py`: V1 PoE2/legacy/mechanic fallacies, V2 compute receipts for DPS/EHP claims, V3 slot inspection receipts for open-affix claims, V4 `0.033s` tick receipts for trigger breakpoints, V5 web-research verification for hedging or mechanics-interaction answers — disable independently with `POB_HOOK_DISABLE_V5=1`). On failure, it runs fast in-process remediation or cached research lookup and injects a single correction pass (`maxRetries = 1`, fail-open on errors).
 
 Ready-to-use host templates and plugin integration:
 

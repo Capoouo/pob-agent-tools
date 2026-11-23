@@ -57,6 +57,7 @@ _COMPUTE_PAIR_CMDS = frozenset(
     }
 )
 _TWO_WORD_PARENTS = frozenset({"item", "skill", "tree", "config", "data", "timeless", "trade", "bench"})
+_WEB_RESEARCH_CMDS = frozenset({"poedb", "wiki", "research"})
 _BUILD_SLOT_ALIAS_CMDS = frozenset({"summary", "diagnose", "audit", "skills", "config", "matrix", "compare", "calc"})
 _FRESH_DIAGNOSE_RESET_CMDS = frozenset({"load", "new", "undo", "redo", "switch-main"})
 
@@ -130,6 +131,7 @@ def classify_cli_args(raw_args: Sequence[str]) -> dict[str, Any]:
             "category": "excluded",
             "isCompute": False,
             "hasTickCheck": False,
+            "isWebResearch": False,
             "slot": "main",
             "applied": False,
             "inspectedSlots": [],
@@ -148,6 +150,7 @@ def classify_cli_args(raw_args: Sequence[str]) -> dict[str, Any]:
             "category": "excluded",
             "isCompute": False,
             "hasTickCheck": False,
+            "isWebResearch": False,
             "slot": "main",
             "applied": False,
             "inspectedSlots": [],
@@ -174,6 +177,7 @@ def classify_cli_args(raw_args: Sequence[str]) -> dict[str, Any]:
         is_compute = pob_mode != "off"
 
     has_tick_check = subcommand in ("diagnose", "data tick")
+    is_web_research = top in _WEB_RESEARCH_CMDS
 
     inspected_slots: list[str] = []
     if subcommand in ("item inspect", "items"):
@@ -192,6 +196,8 @@ def classify_cli_args(raw_args: Sequence[str]) -> dict[str, Any]:
         category = "diagnose"
     elif subcommand == "data tick":
         category = "tick_check"
+    elif is_web_research:
+        category = "web_research"
     elif inspected_slots and not is_compute:
         category = "inspect_slot"
     elif is_compute:
@@ -205,6 +211,7 @@ def classify_cli_args(raw_args: Sequence[str]) -> dict[str, Any]:
         "category": category,
         "isCompute": is_compute,
         "hasTickCheck": has_tick_check,
+        "isWebResearch": is_web_research,
         "slot": build_slot,
         "applied": applied,
         "inspectedSlots": inspected_slots,
@@ -334,6 +341,7 @@ def receipt_context(
                 "category": frame["category"],
                 "isCompute": bool(frame["isCompute"]),
                 "hasTickCheck": bool(frame["hasTickCheck"]),
+                "isWebResearch": bool(frame.get("isWebResearch", False)),
                 "slot": frame["slot"],
                 "rev": frame.get("rev"),
                 "applied": bool(frame["applied"]),
@@ -390,6 +398,8 @@ def summarize_turn_receipts(receipts: Sequence[dict[str, Any]]) -> dict[str, Any
     has_tick_check = False
     has_diagnose = False
     has_fresh_diagnose = False
+    has_web_research = False
+    attempted_web_research = False
     inspected_slots: list[str] = []
     inspected_seen: set[str] = set()
     max_applied_rev: dict[str, int] = {}
@@ -397,14 +407,25 @@ def summarize_turn_receipts(receipts: Sequence[dict[str, Any]]) -> dict[str, Any
     last_slot: str | None = None
 
     for rec in receipts:
-        if not isinstance(rec, dict) or rec.get("exitCode", 0) != 0:
+        if not isinstance(rec, dict):
             continue
+        subcmd = str(rec.get("subcommand") or "")
+        is_web = (
+            bool(rec.get("isWebResearch"))
+            or rec.get("category") == "web_research"
+            or subcmd in _WEB_RESEARCH_CMDS
+        )
+        if is_web:
+            attempted_web_research = True
+        if rec.get("exitCode", 0) != 0:
+            continue
+        if is_web:
+            has_web_research = True
         is_compute = bool(rec.get("isCompute"))
         if is_compute:
             has_compute = True
         if rec.get("hasTickCheck"):
             has_tick_check = True
-        subcmd = str(rec.get("subcommand") or "")
         if rec.get("category") == "diagnose" or subcmd == "diagnose":
             has_diagnose = True
             has_fresh_diagnose = True
@@ -436,6 +457,8 @@ def summarize_turn_receipts(receipts: Sequence[dict[str, Any]]) -> dict[str, Any
         "hasTickCheck": has_tick_check,
         "hasDiagnose": has_diagnose,
         "hasFreshDiagnose": has_fresh_diagnose,
+        "hasWebResearch": has_web_research,
+        "attemptedWebResearch": attempted_web_research,
         "inspectedSlots": inspected_slots,
         "maxAppliedRevBySlot": max_applied_rev,
         "maxComputeRevBySlot": max_compute_rev,

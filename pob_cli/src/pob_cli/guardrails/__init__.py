@@ -14,9 +14,12 @@ from .build_gate import (
 from .reply_scanner import (
     ReplyIssue,
     detect_build_source_in_text,
+    detect_hesitation_claims,
+    detect_mechanics_research_need,
     detect_panel_or_delta_claims,
     detect_trigger_breakpoint_claims,
     extract_claimed_open_affix_slots,
+    extract_research_entities,
     scan_assistant_reply,
 )
 from .rules_false_friends import SAME_NAME_FALSE_FRIENDS_POE1, FalseFriendRule
@@ -85,10 +88,13 @@ __all__ = [
     "check_poe2_class_or_ascendancy",
     "check_poe2_timeless_jewel",
     "detect_build_source_in_text",
+    "detect_hesitation_claims",
+    "detect_mechanics_research_need",
     "detect_panel_or_delta_claims",
     "detect_trigger_breakpoint_claims",
     "emit_stderr_warnings_from_dicts",
     "extract_claimed_open_affix_slots",
+    "extract_research_entities",
     "extract_scannable_item_parts",
     "get_active_warning_dicts",
     "get_active_warnings",
