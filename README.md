@@ -572,7 +572,7 @@ pyinstaller --noconfirm --clean pob_cli/packaging/pob.spec
 2. 创建并推送版本标签：`git tag -s v0.5.0 -m "pob4agents v0.5.0" && git push origin main v0.5.0`。
 3. GitHub Actions 检查版本号、在 Windows / macOS / Linux 上跑真实引擎门禁（`engine.yml`）、运行测试、构建并冒烟测试 `pob-vX.Y.Z-windows-x64.zip`、Wheel / sdist 和 `SHA256SUMS.txt`，随后发布 GitHub Release，并更新 Scoop 清单 `bucket/pob.json`。每个 Release 还会附一份内容相同的永久别名 `pob-windows-x64.zip`，供 `releases/latest/download/pob-windows-x64.zip` 免改版本号直接下载（`latest` 指向最新正式版，跳过 prerelease）。
 
-Agent 命令速查见 [AGENTS.md](AGENTS.md)。
+参与贡献请先读 [CONTRIBUTING.md](CONTRIBUTING.md)。Agent 命令速查见 [AGENTS.md](AGENTS.md)。
 
 ---
 

@@ -33,6 +33,7 @@ These stay outside `docs/` because tools expect them at fixed paths.
 | File | Purpose |
 |---|---|
 | [../README.md](../README.md) / [../README_EN.md](../README_EN.md) | User docs: install, engine setup, every command with examples |
+| [../CONTRIBUTING.md](../CONTRIBUTING.md) | Where a new contributor starts: points to AGENTS.md, the architecture guide, the PR template and SECURITY.md |
 | [../AGENTS.md](../AGENTS.md) | Contributor guide for agents and people: commands, layout, hard rules, conventions, commit scopes. `CLAUDE.md` imports it |
 | [../skills/pob/SKILL.md](../skills/pob/SKILL.md) | Cross-harness agent skill, with topic references in [../skills/pob/references/](../skills/pob/references/) |
 | [../.github/pull_request_template.md](../.github/pull_request_template.md) | What every pull request states: summary, testing (platforms and engine), AI disclosure |
