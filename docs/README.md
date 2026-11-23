@@ -1,6 +1,6 @@
 # Documentation
 
-Everything about `pob` beyond the top-level README lives here. When a doc and the code disagree, the code wins.
+Everything about pob4agents beyond the top-level README lives here. When a doc and the code disagree, the code wins.
 
 ## Architecture
 

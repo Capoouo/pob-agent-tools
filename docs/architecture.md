@@ -1,6 +1,6 @@
 # Architecture
 
-How `pob` is built and the contracts it keeps. Read this before changing code; [AGENTS.md](../AGENTS.md) has the commands and the short rules. When this doc and the code disagree, the code wins and this doc gets fixed in the same change.
+How pob4agents is built and the contracts it keeps. Read this before changing code; [AGENTS.md](../AGENTS.md) has the commands and the short rules. When this doc and the code disagree, the code wins and this doc gets fixed in the same change.
 
 ## How a command runs
 
