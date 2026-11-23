@@ -4,7 +4,7 @@ Everything about `pob` beyond the top-level README lives here. When a doc and th
 
 ## Architecture
 
-[architecture.md](architecture.md): how a command reaches the engine, module layers, engine paths, environment variables, Chinese locale matching, the `R1`..`R13` constraints, verification and CI. Read it before changing code.
+[architecture.md](architecture.md): how a command reaches the engine, module layers, engine paths, environment variables, Chinese locale matching, the `R1`..`R13` constraints, the checklist for adding a command, verification and CI. Read it before changing code.
 
 ## Guides
 
@@ -35,6 +35,7 @@ These stay outside `docs/` because tools expect them at fixed paths.
 | [../README.md](../README.md) / [../README_EN.md](../README_EN.md) | User docs: install, engine setup, every command with examples |
 | [../AGENTS.md](../AGENTS.md) | Contributor guide for agents and people: commands, layout, hard rules, conventions, commit scopes. `CLAUDE.md` imports it |
 | [../skills/pob/SKILL.md](../skills/pob/SKILL.md) | Cross-harness agent skill, with topic references in [../skills/pob/references/](../skills/pob/references/) |
+| [../.github/pull_request_template.md](../.github/pull_request_template.md) | What every pull request states: summary, testing (platforms and engine), AI disclosure |
 | [../SECURITY.md](../SECURITY.md) | How to report a vulnerability |
 | [../PROGRESS.md](../PROGRESS.md) | Rolling progress log kept by the maintainers' agents (Chinese) |
 

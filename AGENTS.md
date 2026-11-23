@@ -2,7 +2,7 @@
 
 `pob` is a command-line tool that lets AI agents inspect, test and optimize Path of Exile 1 builds with the real Path of Building engine, run headless. It is a Python package (`pob_cli/`, Python 3.11+) whose daemon on `127.0.0.1` drives PobTools-zh's `pob-zh.exe` on Windows and PoB on a pinned LuaJIT runtime on macOS and Linux.
 
-**Read [docs/architecture.md](docs/architecture.md) before changing code.** It covers how a command reaches the engine, the module layers, engine paths and runtime state, environment variables, Chinese locale matching, the `R1`..`R13` constraints, verification and CI.
+**Read [docs/architecture.md](docs/architecture.md) before changing code.** It covers how a command reaches the engine, the module layers, engine paths and runtime state, environment variables, Chinese locale matching, the `R1`..`R13` constraints, adding a command, verification and CI.
 
 This file is for working on `pob`. To use it, see [skills/pob/SKILL.md](skills/pob/SKILL.md), the [README](README_EN.md) and every flag in [docs/guides/commands.md](docs/guides/commands.md).
 
@@ -56,3 +56,5 @@ Releases are cut by bumping `__version__` in `pob_cli/src/pob_cli/__init__.py` a
 ## Commits
 
 Conventional Commits, `type(scope): description`. Types: `feat fix perf refactor test docs ci build chore`. Scopes are areas: `cli`, `daemon`, `bridge`, `updater`, `game-data`, `analyzer`, `mutators`, `comparator`, `trade`, `bench`, `timeless`, `hooks`, `guardrails`, `research`, `external-apis`, `packaging`, `posix`, `deps`, `release`, `scoop`, `docs`, `workspace` (root files and scripts). Combine them as `trade,bench`.
+
+Pull requests fill in every section of [.github/pull_request_template.md](.github/pull_request_template.md), the AI disclosure included. To add a command, follow "Adding a command" in the architecture guide.
