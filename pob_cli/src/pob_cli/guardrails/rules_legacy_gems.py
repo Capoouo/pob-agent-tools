@@ -169,7 +169,9 @@ LEGACY_PATCH_TRAPS_328_330: tuple[LegacyPatchTrapRule, ...] = (
             "awakened edwa",
         ),
         regex=re.compile(
-            r"(?:觉醒|覺醒)\s*[·・.．]?\s*(?!赋予|賦予|增幅|启蒙|啟蒙|六分仪|六分儀|宝石|寶石|辅助|輔助|者|之|的|后|後|了|吗|嗎|被|已|都|和|与|與)[\u4e00-\u9fff]{2,}"
+            r"(?:觉醒|覺醒|强辅|強輔)\s*[·・.．]?\s*(?!赋予|賦予|赋能|賦能|增幅|增强|增強|启蒙|啟蒙|六分仪|六分儀|"
+            r"宝石|寶石|辅助|輔助|石|者|之|的|后|後|了|吗|嗎|被|已|都|和|与|與|或|别|別|不|没|沒|无|無|只|仅|僅|"
+            r"在|是|为|為|等|同样|體系|体系|上限|等级|掉落|替代|取代)[\u4e00-\u9fff]{2,}"
         ),
         canonical_term="Exceptional Supports (3.28+) / Only Awakened Empower, Enhance, Enlighten remain",
         summary=(

@@ -25,6 +25,7 @@ DPS, effective hit pool (TotalEHP), maximum hit taken (MaxHit), and the effects 
   - [6. Search Timeless Jewel seeds](#6-search-timeless-jewel-seeds)
   - [7. Look up game data, prices, and build trends](#7-look-up-game-data-prices-and-build-trends)
   - [8. Search trade listings and bench crafts](#8-search-trade-listings-and-bench-crafts)
+- [AI Agent lifecycle hook guardrails (`pob hook`)](#ai-agent-lifecycle-hook-guardrails-pob-hook)
 - [Exit codes](#exit-codes)
 - [Development, tests, and releases](#development-tests-and-releases)
 - [Credits and license](#credits-and-license)
@@ -510,6 +511,24 @@ pob trade convert --file .\dropped_gloves.txt --to lightning
 Repeat `--bench-craft` for multiple craft targets. Results default to PoB ranking; `--pob-limit` counts source listings, each of which may produce multiple craft variants. `--budget` caps listing prices only: crafting, removal, and repeated crafting costs are additional. Hard `--stat` filters apply before crafting. JSON `bench_craft` includes crafted lines, removed lines, costs, the maximum-roll marker, and original listing text.
 
 `pob item inspect` is read-only and does not apply a craft. Unknown, ambiguous, or unresolved-base matches produce unknown open-slot counts, and suggestions require checking the item. Supply `--slot` when pasted text has no inferable item type. Trade craft simulation skips uncertain occupancy, corrupted/mirrored items, and unsupported special crafting cases.
+
+---
+
+## AI Agent lifecycle hook guardrails (`pob hook`)
+
+To prevent fast/lightweight models from bypassing `pob` (hand-parsing Lua/XML, hallucinating PoE2 or removed legacy mechanics in final answers, claiming open affixes without inspecting items, or inventing CoC breakpoints), `pob4agents` ships a deterministic, zero-LLM-judge hook kernel (`pob --offline hook <pre-prompt|pre-tool|verify-stop> [--protocol raw|agy|claude]`) backed by an out-of-band execution receipt ledger:
+
+- **Pre-prompt grounding & turn cursor (`pre-prompt`)**: anchors `turnStartTs` once per turn and injects compact `<pob-grounding>` PoE1 3.30 entity cards and trap alerts offline (`<15ms`).
+- **Pre-tool hard deny / rewrite (`pre-tool`)**: blocks raw engine `.lua` reads, script-based XML calculations (`R5`), redundant `pob --help`, bare `--json` without `--out` (auto-stripped on hosts that support argument overwrite), and redundant post-`diagnose` fetches.
+- **Stop verification & auto-remediation (`verify-stop`)**: checks `turn_receipts.jsonl` and scans the final assistant text (V1 PoE2/legacy/mechanic fallacies, V2 compute receipts for DPS/EHP claims, V3 slot inspection receipts for open-affix claims, V4 `0.033s` tick receipts for trigger breakpoints). On failure, it runs fast in-process remediation and injects a single correction pass (`maxRetries = 1`, fail-open on errors).
+
+Ready-to-use host templates and plugin integration:
+
+| Host | Template / Plugin | Protocol |
+|---|---|---|
+| **Antigravity** | [`hooks/hooks.json`](hooks/hooks.json) (copy to `.agents/hooks.json`) | `--protocol agy` |
+| **Claude Code** | [`hooks/claude-hooks.json`](hooks/claude-hooks.json) (merge into `.claude/settings.json`) | `--protocol claude` |
+| **DeepSeek Harness (DSH)** | `dsh-pob-assistant` plugin (`agent/pre-step`, `tools/pre-execute`, `agent/turn-stopping`) | `--protocol raw` |
 
 ---
 

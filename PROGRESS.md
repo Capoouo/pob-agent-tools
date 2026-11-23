@@ -1,12 +1,19 @@
 # PROGRESS
 
 ## ACTIVE
-- 目标：推送 Windows CI 修复与 v0.6.0 正式发版标签并验收 GitHub Actions CI + Release 全绿
-- 已做：[x] 完成 pob_cli 5层严格单向 DAG 重构、Ruff + check.py 三模门禁落地及 3 路 DeepSeek V4.1F 实战验收（a5f100c）；[x] 修复 GitHub Actions windows-latest 上的 CRLF 字节膨胀（.gitattributes *.py eol=lf + 拆薄 parsers_special/batch_ops_skills/mutation_md + arch_lint 按最坏 CRLF 字节上限校验 <=24000B）、cp1252 控制台编码报错及 pwsh 退出码检查，升级版本号至 v0.6.0；[x] 编写重构后 Hook 防假执行硬护栏施工方案 docs/HOOK_GUARDRAILS_PLAN.md
-- 下一步：[ ] 经用户确认后执行 git push origin main 与 v0.6.0 tag 推送，监控 CI 与 Release 全绿及 Scoop 清单自动更新，随后按 docs/HOOK_GUARDRAILS_PLAN.md 落地 pob hook
-- 验证：python pob_cli/scripts/check.py --fast (max CRLF=23768B) && PYTHONIOENCODING=cp1252 python pob_cli/scripts/check.py --self-test (5/5 PASS) && pytest 78+ passed && pob --version (0.6.0)（2026-11-23 03:08）
+- 目标：pob4agents Hook 硬护栏全链路施工与 4 轮 DS 4.1F 实机验收已完成并提交推送 origin/main；待后续按需启动 v0.8.0 发版或新需求迭代
+- 已做：[x] 完成 docs/HOOK_GUARDRAILS_PLAN.md 三阶段施工（L0 reply_scanner + L1 turn_receipts + L4 cli_hook 三协议 + CLI 出口埋点 + DSH hook-bridge.mjs/item_inspect + hooks/{hooks,claude-hooks}.json + 文档同步）；[x] 经 bot:测试大肥鱼 4 轮多路 DeepSeek V4.1 Flash 实机对抗闭环（R1-R5 安全硬防线全过、R3 提速 -43.2%、R4 现场真拦强辅 CoC Lv20 幻觉并纠偏、R5 零误伤 PASS、POB_HOOK_SESSION_ID 并发 100% 隔离）及最后 3 处 P2 边角清零；[x] 29/29 实测草稿离线回放 0 误伤/5 真拦、全量 check.py (944 passed) 与 verify-plugin.mjs 全绿，已获主人确认提交并推送至 origin/main
+- 下一步：[ ] 监控 origin/main 推送触发的 GitHub Actions CI 全绿；按主人后续指令推进 v0.8.0 发版或新迭代
+- 验证：check.py --fast (1.44s, ruff=0, arch=0) + --self-test (5/5) + full check.py (944 passed, 0 failed, 1 skipped) + 29/29 R1-R4 实测草稿回放 0 误伤/5 真拦 + verify-plugin.mjs OK（2026-11-23 19:51）
 
 ## LOG
+### 2026-11-23 完成 Hook 硬护栏 Round 4 收尾（R4 现场拦截强辅 Awakened CoC Lv20 幻觉并纠偏 PASS + 补齐最后 3 处 P2 边角误伤豁免），4 轮共 29 份真实 DS 4.1F 草稿回放 0 误伤/5 真拦 → check.py 全绿（FAST 1.44s ruff=0 arch=0 + --self-test 5/5 + pytest 944 passed, 1 skipped）+ verify-plugin.mjs OK，item 8 已结案
+### 2026-11-23 修复 Round 3 暴露的「强辅<宝石名>」幻觉漏检（rules_legacy_gems.py）与「无用/如果按...计算/这就错了」边角误伤（reply_scanner.py），R1+R2+R3 全部 25 份真实 DS 4.1F 草稿回放 0 误伤且 4/4 真幻觉全命中 → check.py 全绿（FAST 1.43s ruff=0 arch=0 + --self-test 5/5 + pytest 944 passed, 1 skipped）+ verify-plugin.mjs OK，已自动派发 Round 4（R1/R4）收尾快测
+### 2026-11-23 修复 Round 2 暴露的 7 类误伤（rules_legacy_gems 补赋能/增强/石，reply_scanner 扩充辟谣/PoE2归属/反事实词库与保留三石 Lv4/Lv5 豁免，index.mjs 补 target schema 说明），20 份实测草稿回放 0 误伤/2 真拦 → check.py 全绿（FAST 1.47s ruff=0 arch=0 + --self-test 5/5 + pytest 944 passed, 1 skipped）+ verify-plugin.mjs OK，已自动派发 Round 3（R1/R4/R5）快测
+### 2026-11-23 按测试大肥鱼 Round 1 实测报告修复 Hook 硬护栏 4 项缺陷（reply_scanner 7误伤清零+因果分句捕获 Exceptional 辅助 Lv20、DSH pob_lookup 新增 item_inspect+items raw 补 --all、turn_receipts/gates/index.mjs 透传 POB_HOOK_SESSION_ID 防并发串台），全量 9 份实测草稿回放 100% 精准 → check.py 全绿（FAST 1.44s ruff=0 arch=0 + --self-test 5/5 + pytest 944 passed, 1 skipped）+ verify-plugin.mjs OK，已自动派发 Round 2 回归
+### 2026-11-23 完成 docs/HOOK_GUARDRAILS_PLAN.md 三阶段施工（L0 reply_scanner + L1 turn_receipts + L4 cli_hook 三协议 + CLI 出口埋点 + DSH 三钩子 hook-bridge.mjs + hooks/{hooks,claude-hooks}.json + 文档同步） → check.py --fast (1.49s, ruff=0, arch=0) + --self-test (5/5) + 全量 pytest 941 passed (1 skipped) + DSH verify-plugin.mjs (4红队+零重试 VERIFY_PLUGIN_OK)
+### 2026-11-23 隔离双路 Worker 合入 PR #8（a351cd9/836a339/6cb5ae7）与移植 PR #7 至 5 层 DAG（950a685/3c9d75a），并经 3 路 DeepSeek V4.1 Flash 实机验收（11/11 PASS） → python pob_cli/scripts/check.py 全绿（FAST 1.32s ruff=0 arch=0 + pytest 922 passed, 1 skipped）
+### 2026-11-23 完成 pob4agents v0.6.0 正式发版（修复 Windows CI CRLF/cp1252 门禁，d550e95 + tag v0.6.0 + Scoop 自动提交 c37f51e） → Win/Linux/macOS CI #45059154417 与 Release #45059159332 全部 success
 ### 2026-11-23 修复 Windows CI CRLF 字节膨胀与 cp1252 编码报错（.gitattributes + 3 子模块拆薄 + arch_lint 最坏 CRLF 字节校验 <=23768B + check.py UTF-8 加固）并准备 pob4agents v0.6.0 发版 → cp1252 --self-test (5/5) + --fast + 回归单测全绿
 ### 2026-11-23 通过 Paseo 拉起 3 路 DeepSeek V4.1 Flash 子代理完成新架构实战验收（3/3 主动全文 Read 模块，捕获并修复 pyproject.toml known-first-party 排序差异，新增 test_ticks_unit.py 17 用例） → 双目录 check.py --fast + --self-test (5/5) + 902+5 passed 全绿
 ### 2026-11-23 完成 pob_cli 5层严格单向 DAG 重构（149受检文件全部<=641L/<=23995B，避开24KB钩子墙）并接入 Ruff + check.py 三模门禁与 CI/pob.spec → check.py --self-test (5/5) + --fast (0.97s) + 全量 pytest 890 passed (1 skipped) + 实机 daemon/wheel 全绿
@@ -20,9 +27,3 @@
 ### 2026-11-22 修复无引擎时 pob ground 崩溃（c859d5e）并完成 pob-agent-tools v0.5.0 正式发版（Win/Linux/macOS CI + Release + Scoop 清单全绿） → pytest 662 passed + CI #45018335612 & Release #45018339764 success
 ### 2026-11-22 同步合并 origin/main (2abee10, PR #6 中英双语 README) 并准备 pob-agent-tools v0.5.0 发版（融合通用认知卸载 CLI 原语、反向跨代/补丁防幻觉护栏与跨宿主泛用 skills/pob） → pytest 662 passed + Wheel/AST/YAML/Spec 门禁全绿
 ### 2026-11-22 泛化落地 pob_cli 全流派认知卸载层（diagnose -c/-q、引擎0%死链与Caveat、CoC超速/CwC非冷却/0.033s data tick、低血艾许之面/EB+CI探针、unique --mod、含永恒大点的 data tree、双段宝石合并、rev近因钢印）与 62 行跨宿主通用 SKILL.md → pytest 662 passed + 纯 Skill 模式 G01..G04 新流派盲测 4/4 全绿
-### 2026-11-22 打通 F:/dsh -> Magpie (opencode-go/deepseek-v4.1-flash)，提取 6 道玩家历史真题 (R01..R06) 拷打验收并经 Neon Swarm 全栈加固（一站式 pob diagnose + 0.033s 帧率器 + 喋血之刃保酊剂 + 0ms 品质台阶检索 + dsh-pob-assistant Markdown/timeless/sum/compare_with） → pytest 650 passed + 二轮真机 6/6 全过（步数 -82%、pwsh 144->0、耗时 -68%）
-### 2026-11-22 落地弱模型 P0/P1 防幻觉优化（pob ground + pob diagnose + 同名异义/3.23-3.25 补丁陷阱 + 黑话/模糊兜底 + 极简 SKILL.md）与 F:/dsh 原生 Cordis 插件测试台，并通过 Paseo 内 pi/deepseek-v4.1-flash 两轮真机压测捕获修完 7 处实战坑 → pytest 640 passed (0 failed) + DSH verify-plugin & 8/8 ground 全绿
-### 2026-11-21 落地 Lore 建仓自动 link（routes.json 回退 + lore link --auto + git-template 钩子）与 AGY lore_record 写入工具并双机同步（moule-host + tui7），同时挂载 F:/poe -> lore-vaults/poe1 (v3.30) → LORE check.mjs --host 34 pass (0 skip) + git-template E2E 与 MCP lore_record 实测通过
-### 2026-11-21 按用户反馈完成 poedb_wiki 去 AI 味与 60%+ 首屏减法重构（原生 nav-tabs 净颜方案 A + fa-info-circle 悬浮提示 + collapse/details 按需展开 + 极简 5 键 MD 编辑器） → pytest 76 passed (ec=0) + 真机 CN/US 263/263 (100%) 零误差
-### 2026-11-21 同步落地 PoE1 (pob_cli) 反向跨代防幻觉护栏 guardrails.py 与 test_cross_game_guardrails.py（136 项），拦截 <PathOfBuilding2>、trade2/poe2db/poe.ninja-poe2、PoE2 专属职业/珠宝/精魂/护符/符文/涂灌并精确豁免元素集中/灵盾/愤怒狂灵等合法词条 → 全量隔离 pytest 502 passed (0 failed)
-### 2026-11-21 重写 v0.4.0 详尽中文主文档 README.md 并新增英文版 README_EN.md（补齐 macOS/Linux 安装、多槽位/pob serve、audit --keep 逐项归因、19-op batch、sweep、timeless 永恒珠宝搜索与退出码契约完整实战示例）

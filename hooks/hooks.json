@@ -1,0 +1,30 @@
+{
+  "pob-guardrails": {
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "pob --offline hook pre-prompt --protocol agy",
+        "timeout": 10
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "run_command|Bash|bash|powershell",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "pob --offline hook pre-tool --protocol agy",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "pob --offline hook verify-stop --protocol agy",
+        "timeout": 10
+      }
+    ]
+  }
+}

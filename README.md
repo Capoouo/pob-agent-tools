@@ -25,6 +25,7 @@
   - [6. 搜索永恒珠宝种子 (`pob timeless`)](#6-搜索永恒珠宝种子-pob-timeless)
   - [7. 查询游戏数据、物价与构筑分布](#7-查询游戏数据物价与构筑分布)
   - [8. 搜索交易装备与工艺台词缀](#8-搜索交易装备与工艺台词缀)
+- [AI Agent 生命周期硬护栏 (`pob hook`)](#ai-agent-生命周期硬护栏-pob-hook)
 - [退出码说明](#退出码说明)
 - [本地开发、测试与发版](#本地开发测试与发版)
 - [致谢与开源协议](#致谢与开源协议)
@@ -508,6 +509,24 @@ pob trade convert --file .\dropped_gloves.txt --to lightning
 `--bench-craft` 可重复指定工艺方向，默认按 PoB 收益排序；`--pob-limit` 限制原商品数量，每件商品可生成多个加工方案。`--budget` 仅限制挂牌价，工艺、移除与重复加工费用另计；`--stat` 硬性条件筛选加工前的装备。JSON 的 `bench_craft` 包含加工词条、移除词条、费用、最高数值标记和原商品文本。
 
 `pob item inspect` 只读，不会实际加工装备。无法匹配、存在歧义或未知底材时，空词缀数量会标为未知；工艺建议须核对装备。粘贴文本无法推断装备类型时，请提供 `--slot`。交易加工试算会跳过无法确认占用、腐化、镜像及不支持的特殊加工情况。
+
+---
+
+## AI Agent 生命周期硬护栏 (`pob hook`)
+
+针对快速/轻量模型容易出现的“跳过 `pob` 手撕 XML/Lua、正文中裸奔 PoE2 或旧补丁幻觉、未验视装备就断言有空词缀、未算帧率就编造 CoC 断点”等问题，`pob4agents` 内置了零 LLM 裁判的进程外回执与三道确定性生命周期护栏（`pob --offline hook <pre-prompt|pre-tool|verify-stop> [--protocol raw|agy|claude]`）：
+
+- **前置核对与游标锚定（`pre-prompt`）**：新轮次开始时记录 `turnStartTs` 并离线注入 `<pob-grounding>` 3.30 事实卡与版本陷阱告警（`<15ms`）。
+- **调用前违规拒止（`pre-tool`）**：拦截手撕引擎 Lua 源码、脚本手算构筑 XML（`R5`）、浪费上下文的 `pob --help`、无 `--out` 的裸 `--json`（支持重写时自动剥离）以及 `diagnose` 后的机械重复查询。
+- **收尾核验与自动代跑塞真值（`verify-stop`）**：基于不可篡改的 `turn_receipts.jsonl` 回执账本与终稿文本扫描（V1 幻觉/硬谬误、V2 面板数字算力回执、V3 空词缀验视回执、V4 触发器 `0.033s` 断点回执），不通过时同步代跑毫秒级取证并注入单次纠偏（`maxRetries = 1`，全链路 Fail-Open）。
+
+跨宿主接线模板与插件：
+
+| 宿主环境 | 配置文件 / 插件 | 协议 |
+|---|---|---|
+| **Antigravity** | [`hooks/hooks.json`](hooks/hooks.json)（复制到 `.agents/hooks.json`） | `--protocol agy` |
+| **Claude Code** | [`hooks/claude-hooks.json`](hooks/claude-hooks.json)（合入 `.claude/settings.json`） | `--protocol claude` |
+| **DeepSeek Harness (DSH)** | `dsh-pob-assistant` 插件（内置 `agent/pre-step`、`tools/pre-execute`、`agent/turn-stopping`） | `--protocol raw` |
 
 ---
 
