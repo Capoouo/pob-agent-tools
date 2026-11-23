@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any
 from ..bridge_client import BridgeError, BridgeWorker
 from ..errors import CrossGameHallucinationError, DaemonRequestError
 from .rpc_mutate import MUTATE_ACTION_HANDLERS, norm_keep
-from .runtime import _call_compat
+from .runtime import _call_compat, normalize_slot_name
 
 if TYPE_CHECKING:
     from .slots import DaemonManager
@@ -89,9 +89,13 @@ def dispatch_dual_slot_action(
         from ..analyzer import diagnose_compare_builds
 
         top_val = int(params["top"]) if params.get("top") is not None else 5
-        main_slot_name = str(params.get("target") or getattr(mw, "slot_name", "main") or "main")
+        main_slot_name = normalize_slot_name(
+            params.get("main_target") or params.get("target") or getattr(mw, "slot_name", None)
+        )
         default_ref_name = "ref" if main_slot_name == "main" else f"{main_slot_name}_ref"
-        ref_slot_name = str(params.get("ref_target") or getattr(rw, "slot_name", default_ref_name) or default_ref_name)
+        ref_slot_name = normalize_slot_name(
+            params.get("ref_target") or getattr(rw, "slot_name", None) or default_ref_name
+        )
         diag_cmp = diagnose_compare_builds(
             mw,
             rw,
@@ -194,7 +198,7 @@ def _h_diagnose(m: DaemonManager, params: dict[str, Any], w: BridgeWorker) -> di
         ask=params.get("ask"),
         pob_dir=m.pob_dir,
         runtime_dir=m.runtime_dir,
-        target=str(params.get("target") or getattr(w, "slot_name", "main") or "main"),
+        target=normalize_slot_name(params.get("target") or getattr(w, "slot_name", None)),
     )
     return m._attach_warning_if_degraded(diag_res)
 
