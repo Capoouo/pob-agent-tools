@@ -490,7 +490,9 @@ _BRACE_NUM_RE = re.compile(r"\{\d+\}")
 def _normalize_slot(slot: str | None) -> str:
     if not slot:
         return ""
-    cleaned = re.sub(r"[\s\-]+", "_", slot.strip().lower()).strip("_")
+    from ..game_data import fold_han  # the Chinese slot aliases are Simplified (头盔, not 頭盔)
+
+    cleaned = re.sub(r"[\s\-]+", "_", fold_han(slot.strip().lower())).strip("_")
     cleaned = re.sub(r"_+", "_", cleaned)
     return _SLOT_COMPACT_ALIASES.get(cleaned, cleaned)
 

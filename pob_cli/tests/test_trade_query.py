@@ -80,6 +80,9 @@ def test_slot_category_and_pob_slot_mappings() -> None:
     assert tq.category_for_slot("flask3") == "flask"
     assert tq.category_for_slot("abyss_jewel") == "jewel.abyss"
     assert tq.category_for_slot("cluster_jewel") == "jewel.cluster"
+    # Chinese slot names resolve in either script.
+    assert tq.category_for_slot("頭盔") == tq.category_for_slot("头盔") == "armour.helmet"
+    assert tq.category_for_slot("腰帶") == "accessory.belt"
 
     assert tq.pob_slot_for_slot("Body Armour") == "Body Armour"
     assert tq.pob_slot_for_slot("chest") == "Body Armour"
