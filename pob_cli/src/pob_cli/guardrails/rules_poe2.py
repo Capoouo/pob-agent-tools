@@ -151,18 +151,23 @@ POE2_ONLY_REVERSE_TRAPS_FOR_POB1: tuple[TrapRule, ...] = (
     TrapRule(
         rule_id="POE2_FOCUS_AND_QUARTERSTAFF_SLOT_ONLY",
         scopes=frozenset({S.SLOT, S.CATEGORY}),
-        # The bare words are PoE1 base names too (the staff base Quarterstaff; Goathide, Crusader
-        # ... Buckler shields), so they are refused only where a slot or category is expected.
-        en_exact=("focus", "armour.focus", "quarterstaff", "weapon.quarterstaff", "buckler"),
+        en_exact=("focus", "armour.focus", "quarterstaff", "weapon.quarterstaff"),
         zh_exact=("法器", "细柄长杖", "节杖"),
         error=(
-            "`Focus` (`法器`), `Quarterstaff` (`节杖`) and `Buckler` as equipment slots/categories are "
-            "PoE2-only (PoE1 uses `shield`/`quiver` and `staff`/`warstaff`)."
+            "`Focus` (`法器`) and `Quarterstaff` (`节杖`) as equipment slots/categories are PoE2-only "
+            "(PoE1 uses `shield`/`quiver` and `staff`/`warstaff`)."
         ),
-        remediation=(
-            "Use `pob2` for PoE2 Focus/Quarterstaff/Buckler slots, or `--slot shield` / `--slot staff` in `pob`."
-        ),
+        remediation="Use `pob2` for PoE2 Focus/Quarterstaff slots, or `--slot shield` / `--slot staff` in `pob`.",
         equivalent_command="pob2 trade search --slot quarterstaff",
+    ),
+    TrapRule(
+        rule_id="POE2_BUCKLER_SLOT_ONLY",
+        # Refused only as a slot or category: Goathide, Crusader ... Buckler are PoE1 shield bases.
+        scopes=frozenset({S.SLOT, S.CATEGORY}),
+        en_exact=("buckler",),
+        error="`Buckler` as an equipment slot/category is PoE2-only (in PoE1 a buckler is a `shield` base).",
+        remediation="Use `pob2` for the PoE2 Buckler slot, or `--slot shield` in `pob`.",
+        equivalent_command="pob2 trade search --slot buckler",
     ),
     TrapRule(
         rule_id="POE2_CHARM_BELT_SLOTS",

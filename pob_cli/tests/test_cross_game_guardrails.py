@@ -467,7 +467,7 @@ def test_reverse_cli_trap_commands(argv: list[str], expected_rule: str, expected
         (["data", "base", "Crossbow", "--json"], "POE2_WEAPONS_AND_FOCUS_OFFHAND"),
         (["trade", "search", "--slot", "focus", "--json"], "POE2_FOCUS_AND_QUARTERSTAFF_SLOT_ONLY"),
         (["trade", "search", "--slot", "quarterstaff", "--json"], "POE2_FOCUS_AND_QUARTERSTAFF_SLOT_ONLY"),
-        (["trade", "search", "--slot", "buckler", "--json"], "POE2_FOCUS_AND_QUARTERSTAFF_SLOT_ONLY"),
+        (["trade", "search", "--slot", "buckler", "--json"], "POE2_BUCKLER_SLOT_ONLY"),
         (["trade", "search", "--category", "armour.buckler", "--json"], "POE2_WEAPONS_AND_FOCUS_OFFHAND"),
         (["trade", "search", "--slot", "charm1", "--json"], "POE2_CHARM_BELT_SLOTS"),
         (["trade", "search", "--category", "armour.focus", "--json"], "POE2_WEAPONS_AND_FOCUS_OFFHAND"),
