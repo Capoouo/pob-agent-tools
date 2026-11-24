@@ -51,11 +51,13 @@ def _github_first(fetch: Any, fallback: Any) -> Any:
     file and its hash together. With no route to GitHub the mirror's copy is used, and the engine
     files are then only as trustworthy as that mirror.
     """
+    from xml.etree.ElementTree import ParseError  # a cut-off manifest.xml; not a ValueError
+
     import httpx
 
     try:
         return fetch(lambda url: url)
-    except (httpx.HTTPError, UpdateError, ValueError):
+    except (httpx.HTTPError, UpdateError, ValueError, ParseError):
         return fallback()
 
 

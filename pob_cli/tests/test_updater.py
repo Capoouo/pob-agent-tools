@@ -539,6 +539,7 @@ def test_mirror_serves_the_routine_check_but_hashes_come_from_github(
 
     seen: list[str] = []
     github_up = True
+    github_cut_off = False
 
     def handler(request: httpx.Request) -> httpx.Response:
         url = str(request.url)
@@ -554,6 +555,8 @@ def test_mirror_serves_the_routine_check_but_hashes_come_from_github(
         if plain == POB_MANIFEST_URL:
             if request.headers.get("If-None-Match"):
                 return httpx.Response(304)
+            if github_cut_off and not via_mirror:
+                return httpx.Response(200, text=pob_xml("2.68.1")[:60])
             return httpx.Response(200, text=pob_xml("9.9.9" if via_mirror else "2.68.1"))
         return httpx.Response(200, content=b"not the zip the manifest hashed")
 
@@ -577,6 +580,11 @@ def test_mirror_serves_the_routine_check_but_hashes_come_from_github(
     (status, manifest, _etag), urls = requests_of(lambda: fetch_pob_manifest_remote(mirror=mirror))
     assert (status, manifest.version) == ("ok", "2.68.1")
     assert urls == [f"{mirror}/{POB_MANIFEST_URL}", POB_MANIFEST_URL]
+
+    # A cut-off answer from GitHub is no answer: the mirror's copy stands.
+    github_cut_off = True
+    assert fetch_pob_manifest_remote(mirror=mirror)[1].version == "9.9.9"
+    github_cut_off = False
 
     # Without a route to GitHub the mirror's copy is used, so those users can still update.
     github_up = False
