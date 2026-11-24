@@ -23,8 +23,9 @@ MAX_RECEIPT_BYTES = 256 * 1024
 _EXCLUDED_TOP_COMMANDS = frozenset({"hook", "serve", "_daemon"})
 _HELP_VERSION_FLAGS = frozenset({"--help", "-h", "--version"})
 _GLOBAL_VALUE_FLAGS = frozenset({"--target", "--runtime-dir", "--pob-root", "--cache-dir", "--proxy"})
-# The `user:password@` part of a URL, wherever it appears on the command line.
-_URL_USERINFO_RE = re.compile(r"(://)[^/?#@\s]+@")
+# The `user:password@` part of a URL inside one argument: everything up to the last `@` of the
+# authority, so an e-mail user name or a space in the password is covered too.
+_URL_USERINFO_RE = re.compile(r"(://)[^/?#]*@")
 
 _COMPUTE_SINGLE_CMDS = frozenset(
     {
@@ -133,7 +134,7 @@ def classify_cli_args(raw_args: Sequence[str]) -> dict[str, Any]:
     """Classify CLI argv into receipt metadata without side effects."""
     args = [str(a) for a in raw_args if a is not None]
     # The ledger is a plain file: a proxy or mirror URL can carry a password (http://user:pass@host).
-    cmd_str = _URL_USERINFO_RE.sub(r"\g<1>***@", " ".join(args))[:240]
+    cmd_str = " ".join(_URL_USERINFO_RE.sub(r"\g<1>***@", a) for a in args)[:240]
 
     if not args or any(tok in _HELP_VERSION_FLAGS for tok in args):
         return {
