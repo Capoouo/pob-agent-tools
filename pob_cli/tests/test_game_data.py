@@ -343,6 +343,29 @@ def test_a_new_index_prunes_superseded_ones_but_keeps_the_newest_other(
     assert (cache_dir / "trade_stats.json").is_file()
 
 
+def test_tree_index_rebuilds_when_any_dictionary_file_it_reads_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pob_cli.game_data import ensure_treedata_index
+
+    monkeypatch.delenv("POB_ROOT", raising=False)
+    monkeypatch.delenv("POB_CACHE_DIR", raising=False)
+    rt = tmp_path / "rt"
+    engine_dir = _create_synthetic_pob_dir(rt / "engine")
+    tree_dir = engine_dir / "PoE1" / "TreeData" / "3_30"
+    tree_dir.mkdir(parents=True)
+    (tree_dir / "tree.lua").write_text("return {}", encoding="utf-8")
+    zh_dir = engine_dir / "Data" / "poe1" / "zh-rCN"
+    zh_dir.mkdir(parents=True)
+    season = zh_dir / "Z-S29.json"
+    season.write_text('{"entries": {}}', encoding="utf-8")
+
+    first, _ = ensure_treedata_index(runtime_dir=rt)
+    season.write_text('{"entries": {"Some Notable": "某个天赋"}}', encoding="utf-8")
+    second, _ = ensure_treedata_index(runtime_dir=rt)
+    assert second != first and second.is_file()
+
+
 def test_fold_search_text_diacritics_and_punctuation() -> None:
     assert _fold_search_text("Doppelgänger Guise") == "doppelganger guise"
     assert _fold_search_text("Mjölner") == "mjolner"

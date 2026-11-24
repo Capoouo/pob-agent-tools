@@ -41,6 +41,20 @@ _TREE_LUA_STR_RE = re.compile(r'"((?:\\[\s\S]|[^"\\])*)"')
 _TREE_ASC_ID_NAME_RE = re.compile(r'\["id"\]\s*=\s*"([^"]+)"\s*,\s*\["name"\]\s*=\s*"([^"]+)"')
 
 
+# Every dictionary file _load_tree_zh_maps reads besides tree_sd.json. The index hash covers the
+# same list: it used to cover three of them, so a change to the others left stale Chinese names.
+_TREE_ZH_NAME_FILES: tuple[str, ...] = (
+    "tree_dn.json",
+    "Z-S25.json",
+    "Z-S26.json",
+    "Z-S27.json",
+    "Z-S28.json",
+    "Z-S29.json",
+    "Z-S30.json",
+    "Z-S30-Pearl_of_Tsoatha-Passive_Tree.json",
+)
+
+
 def _find_latest_tree_lua(poe1_dir: Path) -> tuple[str, Path]:
     tree_root = poe1_dir / "TreeData"
     if not tree_root.is_dir():
@@ -91,16 +105,7 @@ def _load_tree_zh_maps(zh_dir: Path | None) -> tuple[dict[str, str], dict[str, s
     sd_map: dict[str, str] = {}
     if zh_dir is None or not zh_dir.is_dir():
         return dn_map, sd_map
-    for fn in (
-        "tree_dn.json",
-        "Z-S25.json",
-        "Z-S26.json",
-        "Z-S27.json",
-        "Z-S28.json",
-        "Z-S29.json",
-        "Z-S30.json",
-        "Z-S30-Pearl_of_Tsoatha-Passive_Tree.json",
-    ):
+    for fn in _TREE_ZH_NAME_FILES:
         p = zh_dir / fn
         if not p.is_file():
             continue
@@ -332,7 +337,7 @@ def ensure_treedata_index(
     st = tree_lua_path.stat()
     hasher.update(f"{tree_ver}:{st.st_size}:{st.st_mtime_ns};".encode())
     if zh_dir is not None and zh_dir.is_dir():
-        for fn in ("tree_dn.json", "tree_sd.json", "Z-S30.json"):
+        for fn in (*_TREE_ZH_NAME_FILES, "tree_sd.json"):
             zp = zh_dir / fn
             if zp.is_file():
                 zst = zp.stat()
