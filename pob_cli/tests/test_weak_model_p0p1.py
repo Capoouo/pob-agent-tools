@@ -1023,6 +1023,7 @@ def test_traditional_slot_names_resolve_like_simplified_ones() -> None:
             {"name": "Helmet", "labelZh": "頭部"},
             {"name": "Flask 1", "labelZh": "藥劑 1"},
             {"name": "Jewel 7", "labelZh": "珠寶插槽 7"},
+            {"name": "Jewel 9", "label": "珠寶插槽 9"},
         ]
     }
     for query, expected in (
@@ -1031,6 +1032,7 @@ def test_traditional_slot_names_resolve_like_simplified_ones() -> None:
         ("藥劑1", "Flask 1"),
         ("珠宝插槽 7", "Jewel 7"),
         ("珠寶插槽 7", "Jewel 7"),
+        ("珠寶插槽 9", "Jewel 9"),
     ):
         assert analyzer.resolve_slot_name(None, query, items_res=items) == expected  # type: ignore[arg-type]
         assert _resolve_slot_from_items(items, query) == expected

@@ -355,7 +355,7 @@ def _resolve_slot_from_items(items_res: dict[str, Any], slot_query: str) -> str:
     for s in slots:
         if (
             s.get("name", "").lower() == q_lower
-            or (s.get("label") or "").lower() == q_lower
+            or _game_data.fold_han(s.get("label") or "").lower() == q_lower
             or _game_data.fold_han(s.get("labelZh") or "").lower() == q_lower
         ):
             return s["name"]
