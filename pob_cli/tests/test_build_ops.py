@@ -1415,6 +1415,49 @@ def test_create_new_build_buildinfo_safe_ele_max_hit_and_compact_calcs_cjk() -> 
     assert w_en.translate_enabled is False
 
 
+def test_calc_names_the_calcs_tab_skill_and_warns_when_it_is_not_the_main_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PoB's Calcs tab keeps its own skill selection, so `pob calc` says whose numbers it shows."""
+    from click.testing import CliRunner
+
+    from pob_cli import cli_inspect_parts
+    from pob_cli.cli import main
+
+    groups = [{"val": 1, "label": "Arc", "labelZh": "电弧"}, {"val": 2, "label": "Hexblast"}]
+    row = {"label": "Average Hit", "cells": [{"raw": "327610", "text": "327,610"}]}
+    w = _FakeBridgeWorker()
+
+    def _call(method: str, params: dict | None = None, timeout: float | None = None) -> dict:
+        if method == "get_calcs":
+            return {
+                "sections": [{"id": "SkillHitDamage", "subsections": [{"label": "Hit Damage", "rows": [row]}]}],
+                "selectors": {"mainSocketGroup": {"index": 1, "list": groups}},
+            }
+        if method == "get_build_header":
+            return {"mainSocketGroup": {"index": main_group, "list": groups}}
+        raise AssertionError(method)
+
+    w.call = _call  # type: ignore[method-assign]
+
+    main_group = 2
+    res = search_calcs_breakdown(w, "Average Hit", no_breakdown=True)
+    skill = res["calcsSkill"]
+    assert (skill["socketGroup"], skill["label"], skill["mainSocketGroup"]) == (1, "Arc", 2)
+    assert skill["isMainSkill"] is False
+
+    monkeypatch.setattr(cli_inspect_parts, "invoke_daemon", lambda *_a, **_kw: res)
+    out = CliRunner().invoke(main, ["calc", "Average Hit"]).output
+    assert "- Calcs tab skill: #1 电弧" in out
+    assert "[WARN]" in out and "not the main skill (#2 Hexblast)" in out
+
+    main_group = 1
+    same = search_calcs_breakdown(w, "Average Hit", no_breakdown=True)
+    assert same["calcsSkill"]["isMainSkill"] is True
+    monkeypatch.setattr(cli_inspect_parts, "invoke_daemon", lambda *_a, **_kw: same)
+    assert "[WARN]" not in CliRunner().invoke(main, ["calc", "Average Hit"]).output
+
+
 # ---------------------------------------------------------------------------
 # Real headless PoB integration tests for standalone helpers, expanded batch & sweep
 # ---------------------------------------------------------------------------
