@@ -253,3 +253,17 @@ class TestLocalModMasterSource:
         by_lvl = {r.level: r for r in mana_recipes}
         assert by_lvl[20].cost == "3x Orb of Augmentation"
         assert by_lvl[40].cost == "6x Orb of Augmentation"
+
+
+def test_slot_key_takes_the_chinese_slot_names_other_commands_take() -> None:
+    for name, key in (
+        ("手套", "gloves"),
+        ("頭盔", "helmet"),
+        ("头盔", "helmet"),
+        ("腰帶", "belt"),
+        ("左戒指", "ring1"),
+        ("Body Armour", "body_armour"),
+        ("shield", "shield"),
+        ("no-such-slot", "no_such_slot"),
+    ):
+        assert bench.slot_key(name) == key
