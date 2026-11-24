@@ -71,6 +71,7 @@ Runtime state in `<POB_RUNTIME_DIR>/`: `daemon.json`, `update_state.json`, `slot
 - Both sides are folded to Simplified with `game_data.fold_han` (mutator search folds, `analyzer/calcs.py`, class and ascendancy, item DB, gems).
 - A Chinese entity name that still finds nothing is retried by its English name from `game_data.english_for_zh`, because the engine always carries the English name.
 - The local index folds the same way: `game_data._fold_search_text` builds every `*_lower` column and folds every `pob data`, `pob ground` and `--slot` query, and `pob bench` search and trade stat names fold too, so 圖騰 finds 图腾. Fold both sides, never the query alone: Simplified text keeps a few foldable characters (覆盖 would turn into 复盖 and miss). A change to the fold bumps `SCHEMA_VERSION` and `TREE_SCHEMA_VERSION`, which rebuilds the index.
+- Equipment slot names fold at the caller. The slot aliases live in `guardrails/` (L0), which cannot import `fold_han` (L1), so `analyzer.resolve_slot_name`, the mutators' slot lookup, `bench.slot_key` and turn receipts fold before they call `normalize_equipment_slot`; a new caller must do the same. The reply scanner stays in L0 and only knows the slot words spelled out in its own tables.
 
 `game_data/tables_han.py` is generated from Unicode's Unihan data by `pob_cli/scripts/gen_han_fold.py <Unihan.zip>`; hand-picked PoE terms in `tw_norm.py` override it.
 
