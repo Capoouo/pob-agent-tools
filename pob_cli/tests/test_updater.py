@@ -902,8 +902,13 @@ def test_get_shared_cache_dir_priority_and_isolation(
     monkeypatch.setenv("POB_ROOT", str(other_eng))
     assert get_shared_cache_dir(swarm_rt) == swarm_rt / "cache"
 
-    # 4. If parent ALREADY has an existing `cache/` directory -> shares it
+    # 4. A folder next to the engine that is only *named* cache is somebody else's: leave it alone
     (tmp_path / "custom_parent" / "cache").mkdir()
+    (tmp_path / "custom_parent" / "cache" / "thumbnails.db").write_bytes(b"not ours")
+    assert get_shared_cache_dir(swarm_rt) == swarm_rt / "cache"
+
+    # 4a. Once pob has written to it (an index or a trade cache file) -> shares it
+    (tmp_path / "custom_parent" / "cache" / "trade_ratelimit.json").write_text("{}", encoding="utf-8")
     assert get_shared_cache_dir(swarm_rt) == tmp_path / "custom_parent" / "cache"
 
     # 4b. Explicit pob_root parameter takes precedence over env POB_ROOT (isolates legacy/custom engines)
