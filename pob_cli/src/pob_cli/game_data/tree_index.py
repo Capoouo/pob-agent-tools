@@ -21,7 +21,7 @@ from .paths import (
 )
 from .tw_norm import _fold_search_text
 
-TREE_SCHEMA_VERSION = 4
+TREE_SCHEMA_VERSION = 5
 _TREE_INDEX_LOCK = threading.RLock()
 _VALID_TREE_INDEX_CACHE: set[tuple[str, str, str]] = set()
 

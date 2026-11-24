@@ -27,6 +27,14 @@ def _has_local_engine() -> bool:
 class TestEmbeddedSnapshot:
     """Zero-engine embedded snapshot tests (always runnable in CI without PoB engine)."""
 
+    def test_traditional_query_scores_like_its_simplified_form(self):
+        def hits(text: str) -> list[tuple[str, float]]:
+            found = bench.search("ring1", text, limit=3, allow_engine=False)
+            return [(h.recipe.id, round(h.score, 4)) for h in found]
+
+        assert hits("攻擊速度") == hits("攻击速度") != []
+        assert hits("暴擊率") == hits("暴击率") != []
+
     def test_snapshot_loads_with_zero_unknown_affixes_and_clean_text(self):
         recipes, meta = bench.load_recipes(allow_engine=False)
         assert meta["mode"] == "embedded_snapshot"

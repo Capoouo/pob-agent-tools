@@ -527,9 +527,10 @@ def infer_weapon_category_from_base(base_type: str, pob_root: Path | None = None
             db_path = game_data.ensure_gamedata_index(pob_dir=resolved_root)
             conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
             try:
+                folded = game_data._fold_search_text(cleaned)  # the index's own fold
                 row = conn.execute(
                     "SELECT item_type, sub_type FROM bases WHERE name_lower = ? OR zh_lower = ? LIMIT 1",
-                    (lowered, lowered),
+                    (folded, folded),
                 ).fetchone()
             finally:
                 conn.close()
