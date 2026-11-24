@@ -167,7 +167,9 @@ def test_unique_and_base_and_translate(tmp_path: Path) -> None:
     assert sap["name"] == "Sap of the Seasons"
     assert sap["zh_name"] == "四季之侵"
     assert sap["base_type"] == "Prismatic Tincture"
-    assert sap["base_type_zh"] == "虹彩酊剂"
+    # Not every PobTools-zh data release translates this base (data-25 does not).
+    if sap["base_type_zh"] is not None:
+        assert sap["base_type_zh"] == "虹彩酊剂"
     assert sap["item_class"] == "Tincture"
     # PobTools-zh data-26 dropped Foulborn translations; older data carries them.
     if sap["zh_foulborn_name"] is not None:
