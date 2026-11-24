@@ -1425,6 +1425,8 @@ def test_calc_names_the_calcs_tab_skill_and_warns_when_it_is_not_the_main_one(
     from pob_cli.cli import main
 
     groups = [{"val": 1, "label": "Arc", "labelZh": "电弧"}, {"val": 2, "label": "Hexblast"}]
+    skills = [{"val": 1, "label": "Vaal Arc"}, {"val": 2, "label": "Arc"}]
+    main_skill = 1
     row = {"label": "Average Hit", "cells": [{"raw": "327610", "text": "327,610"}]}
     w = _FakeBridgeWorker()
 
@@ -1432,10 +1434,16 @@ def test_calc_names_the_calcs_tab_skill_and_warns_when_it_is_not_the_main_one(
         if method == "get_calcs":
             return {
                 "sections": [{"id": "SkillHitDamage", "subsections": [{"label": "Hit Damage", "rows": [row]}]}],
-                "selectors": {"mainSocketGroup": {"index": 1, "list": groups}},
+                "selectors": {
+                    "mainSocketGroup": {"index": 1, "list": groups},
+                    "mainSkill": {"index": 1, "list": skills},
+                },
             }
         if method == "get_build_header":
-            return {"mainSocketGroup": {"index": main_group, "list": groups}}
+            return {
+                "mainSocketGroup": {"index": main_group, "list": groups},
+                "mainSkill": {"index": main_skill, "list": skills},
+            }
         raise AssertionError(method)
 
     w.call = _call  # type: ignore[method-assign]
@@ -1448,10 +1456,17 @@ def test_calc_names_the_calcs_tab_skill_and_warns_when_it_is_not_the_main_one(
 
     monkeypatch.setattr(cli_inspect_parts, "invoke_daemon", lambda *_a, **_kw: res)
     out = CliRunner().invoke(main, ["calc", "Average Hit"]).output
-    assert "- Calcs tab skill: #1 电弧" in out
-    assert "[WARN]" in out and "not the main skill (#2 Hexblast)" in out
+    assert "- Calcs tab skill: #1 电弧 / Vaal Arc" in out
+    assert "[WARN]" in out and "not the main skill (#2 Hexblast" in out
 
-    main_group = 1
+    # Same socket group, another active skill in it: the two must not read as the same thing.
+    main_group, main_skill = 1, 2
+    other = search_calcs_breakdown(w, "Average Hit", no_breakdown=True)
+    assert other["calcsSkill"]["isMainSkill"] is False
+    monkeypatch.setattr(cli_inspect_parts, "invoke_daemon", lambda *_a, **_kw: other)
+    assert "not the main skill (#1 电弧 / Arc)" in CliRunner().invoke(main, ["calc", "Average Hit"]).output
+
+    main_skill = 1
     same = search_calcs_breakdown(w, "Average Hit", no_breakdown=True)
     assert same["calcsSkill"]["isMainSkill"] is True
     monkeypatch.setattr(cli_inspect_parts, "invoke_daemon", lambda *_a, **_kw: same)

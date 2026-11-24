@@ -328,21 +328,24 @@ def _calcs_skill(worker: BridgeWorker, calcs: dict[str, Any]) -> dict[str, Any]:
     group_idx, group = _pick(selectors.get("mainSocketGroup"))
     if group_idx is None:
         return {}
-    try:
-        header = worker.call("get_build_header", {})
-    except Exception:
-        header = {}
+    # Not guarded: a failed call can make the worker restore its last good build, and rows read
+    # before that must not be paired with breakdowns read after it.
+    header = worker.call("get_build_header", {})
     header = header if isinstance(header, dict) else {}
     main_idx, main_group = _pick(header.get("mainSocketGroup"))
-    skill_idx, _ = _pick(selectors.get("mainSkill"))
-    main_skill_idx, _ = _pick(header.get("mainSkill"))
+    skill_idx, skill = _pick(selectors.get("mainSkill"))
+    main_skill_idx, main_skill = _pick(header.get("mainSkill"))
     info: dict[str, Any] = {
         "socketGroup": group_idx,
         "label": group.get("label"),
         "labelZh": group.get("labelZh"),
+        "skillLabel": skill.get("label"),
+        "skillLabelZh": skill.get("labelZh"),
         "mainSocketGroup": main_idx,
         "mainLabel": main_group.get("label"),
         "mainLabelZh": main_group.get("labelZh"),
+        "mainSkillLabel": main_skill.get("label"),
+        "mainSkillLabelZh": main_skill.get("labelZh"),
         "isMainSkill": None if main_idx is None else (
             group_idx == main_idx and (skill_idx or 1) == (main_skill_idx or 1)
         ),
