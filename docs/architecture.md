@@ -55,7 +55,7 @@ Runtime state in `<POB_RUNTIME_DIR>/`: `daemon.json`, `update_state.json`, `slot
 | `POB_CACHE_DIR` | Game-data index and online query cache |
 | `POB_SLOT` | Default build slot slug |
 | `POB_PROXY` / `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` | Proxy for every download and query |
-| `POB_GITHUB_MIRROR` | Mirror prefix for GitHub downloads in `bootstrap` / `update` |
+| `POB_GITHUB_MIRROR` | Mirror prefix for GitHub downloads in `bootstrap` / `update`. The latest tag and the manifests (the hashes downloads are checked against) come straight from GitHub first, through the mirror only when that fails (`updater/remote.py`, `_direct_first`) |
 | `POB_OFFLINE=1` | Skip update checks (same as `pob --offline`) |
 | `POB_NO_UPDATE_NOTICE=1` | No "pob X is available" line on interactive terminals |
 | `POB_LEGACY_DIR` | Read-only legacy PobTools seed |

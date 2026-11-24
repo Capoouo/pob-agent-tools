@@ -518,6 +518,62 @@ def test_clean_bootstrap_from_github_dual_upstream(tmp_path: Path, monkeypatch: 
     assert (target / "PoE1" / "Modules" / "Main.lua").read_bytes() == pob_main
 
 
+def test_mirror_serves_downloads_but_metadata_comes_from_github_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Hashes read through a mirror prove nothing about files that mirror serves."""
+    from pob_cli.updater import UpdateError, fetch_pob_manifest_remote, fetch_pobtools_latest_info
+    from pob_cli.updater.remote import _download_and_stage_release_zip
+
+    mirror = "https://mirror.example.com"
+    manifest_url = f"{POBTOOLS_DOWNLOAD_BASE}/v1.8.12/PobTools-manifest-v1.8.12.json"
+    pob_xml = (
+        "<?xml version='1.0' encoding='UTF-8'?><PoBVersion>"
+        '<Version number="2.68.1" />'
+        '<Source part="program" url="https://raw.githubusercontent.com/PathOfBuildingCommunity/PathOfBuilding/{branch}/src/" />'
+        f'<File name="Modules/Main.lua" part="program" sha1="{hashlib.sha1(b"main").hexdigest()}" />'
+        "</PoBVersion>"
+    )
+    seen: list[str] = []
+    github_up = True
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        seen.append(url)
+        if not url.startswith(mirror) and not github_up:
+            raise httpx.ConnectError("GitHub unreachable")
+        plain = url.removeprefix(mirror + "/")
+        if plain == POBTOOLS_LATEST_URL:
+            return httpx.Response(302, headers={"Location": "https://github.com/x/y/releases/tag/v1.8.12"})
+        if plain == manifest_url:
+            return httpx.Response(200, json={"version": "1.8.12", "assets": []})
+        if plain == POB_MANIFEST_URL:
+            return httpx.Response(200, text=pob_xml)
+        return httpx.Response(200, content=b"not the zip the manifest hashed")
+
+    _patch_updater_http(monkeypatch, handler)
+
+    assert fetch_pobtools_latest_info(mirror=mirror)["version"] == "1.8.12"
+    assert fetch_pob_manifest_remote(mirror=mirror)[0] == "ok"
+    assert seen == [POBTOOLS_LATEST_URL, manifest_url, POB_MANIFEST_URL]
+
+    # Without a route to GitHub the mirror still serves the metadata, so those users can update.
+    seen.clear()
+    github_up = False
+    assert fetch_pobtools_latest_info(mirror=mirror)["version"] == "1.8.12"
+    assert fetch_pob_manifest_remote(mirror=mirror)[0] == "ok"
+    assert [u for u in seen if u.startswith(mirror)] == [
+        f"{mirror}/{POBTOOLS_LATEST_URL}",
+        f"{mirror}/{manifest_url}",
+        f"{mirror}/{POB_MANIFEST_URL}",
+    ]
+
+    # The engine zip itself may come through the mirror, but never without a hash to check it by.
+    for asset in ({"name": "PobTools-1.8.12.zip"}, {"name": "PobTools-1.8.12.zip", "sha256": "00" * 32}):
+        with pytest.raises(UpdateError, match="SHA256 mismatch"):
+            _download_and_stage_release_zip("v1.8.12", asset, tmp_path, mirror=mirror)
+
+
 def test_posix_engine_validation_command_and_manifest_filtering(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
