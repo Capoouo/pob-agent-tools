@@ -166,7 +166,7 @@ Common environment variables:
 | `POB_CACHE_DIR` | Override the local game database and online query cache directory |
 | `POB_SLOT` | Default build slot if `--target` is omitted; defaults to `main` |
 | `POB_PROXY` | HTTP, HTTPS, or SOCKS5 proxy; `HTTPS_PROXY` and `ALL_PROXY` are also supported |
-| `POB_GITHUB_MIRROR` | Mirror prefix for GitHub downloads during `bootstrap` and `update`. Version and hash lists are read straight from GitHub first and through the mirror only when GitHub cannot be reached; the engine files are then only as trustworthy as the mirror |
+| `POB_GITHUB_MIRROR` | Mirror prefix for GitHub downloads during `bootstrap` and `update`. The routine version check goes through the mirror. Before files are replaced, the hash lists are read from GitHub itself, and the mirror's copy is used only when GitHub cannot be reached; the engine files are then only as trustworthy as the mirror |
 | `POB_OFFLINE` | Set to `1` to skip startup and scheduled GitHub update checks; equivalent to global `--offline` |
 | `POB_HOOK_DISABLE_V5` | Set to `1` to disable the Gate 3 V5 web-research verification gate (independent of `POB_OFFLINE`) |
 | `POESESSID` / `POE_COOKIE` | Optional when the official trade API returns 401/403; provide them only as environment variables, never as CLI arguments or log entries |

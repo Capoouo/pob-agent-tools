@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import shutil
 import sys
@@ -43,21 +44,19 @@ def _extract_tag_from_location(location: str) -> str:
     raise UpdateError(f"Could not extract release tag from Location header: {location!r}")
 
 
-def _direct_first(fetch: Any, mirror: str | None) -> Any:
-    """Read version and hash metadata straight from GitHub, through the mirror only when that fails.
+def _github_first(fetch: Any, fallback: Any) -> Any:
+    """Take hash-bearing metadata from GitHub itself; `fallback()` only when GitHub does not answer.
 
     Downloads are checked against these hashes, so a mirror that also served them could swap a
-    file and its hash together. With no route to GitHub the mirror still serves both, and the
-    engine files are then only as trustworthy as that mirror.
+    file and its hash together. With no route to GitHub the mirror's copy is used, and the engine
+    files are then only as trustworthy as that mirror.
     """
-    if not resolve_mirror(mirror):
-        return fetch(lambda url: url)
     import httpx
 
     try:
         return fetch(lambda url: url)
     except (httpx.HTTPError, UpdateError, ValueError):
-        return fetch(lambda url: rewrite_github_url(url, mirror=mirror))
+        return fallback()
 
 
 def fetch_pobtools_latest_info(
@@ -69,9 +68,15 @@ def fetch_pobtools_latest_info(
 ) -> dict[str, Any]:
     """Resolve latest PobTools-zh tag via 302 redirect (NEVER api.github.com) and optional manifest JSON."""
     eff_timeout = _to_httpx_timeout(_CHECK_TIMEOUT_SPEC if timeout is None else timeout)
-    return _direct_first(
-        lambda via: _fetch_pobtools_latest_info(via, proxy, eff_timeout, fetch_manifest), mirror
-    )
+    via_mirror = functools.partial(rewrite_github_url, mirror=mirror)
+
+    def _fetch(via: Any) -> dict[str, Any]:
+        return _fetch_pobtools_latest_info(via, proxy, eff_timeout, fetch_manifest)
+
+    if not fetch_manifest or not resolve_mirror(mirror):
+        # The tag alone gates no download, so the routine check stays on the mirror.
+        return _fetch(via_mirror)
+    return _github_first(_fetch, lambda: _fetch(via_mirror))
 
 
 def _fetch_pobtools_latest_info(
@@ -144,7 +149,11 @@ def fetch_pob_manifest_remote(
             new_etag = resp.headers.get("etag") or etag
             return ("ok", parse_pob_manifest(resp.text), new_etag)
 
-    return _direct_first(_fetch, mirror)
+    result = _fetch(functools.partial(rewrite_github_url, mirror=mirror))
+    if result[0] != "ok" or not resolve_mirror(mirror):
+        return result
+    # The mirror reports a new manifest: it names the files to replace and their hashes.
+    return _github_first(_fetch, lambda: result)
 
 
 def _download_bytes_with_retry(
