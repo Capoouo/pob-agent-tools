@@ -1050,3 +1050,29 @@ def test_call_daemon_offline_tells_a_running_daemon_to_skip_its_update_check(
     monkeypatch.delenv("POB_OFFLINE")
     _call("status")
     assert "skip_periodic_check" not in sent[0]["params"]
+
+
+def test_write_slot_state_keeps_the_previous_file_when_a_write_dies(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The slot file holds the loaded build and its undo history: never leave half of one behind."""
+    from pob_cli import bridge_protocol as bp
+
+    path = tmp_path / "slot_main.json"
+
+    def write(code: str) -> None:
+        bp.write_slot_state(
+            path, slot_name="main", last_good_code=code, undo_stack=["u1"], redo_stack=[], source_label=None, rev=1
+        )
+
+    write("first")
+    assert bp.read_slot_state(path)["last_good_code"] == "first"
+    assert [p.name for p in tmp_path.iterdir()] == ["slot_main.json"]
+
+    def _killed(*_a: object) -> None:
+        raise OSError("daemon killed before the rename")
+
+    monkeypatch.setattr(bp.os, "replace", _killed)
+    write("second")
+    state = bp.read_slot_state(path)
+    assert state is not None and (state["last_good_code"], state["undo_stack"]) == ("first", ["u1"])
