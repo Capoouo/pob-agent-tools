@@ -8,6 +8,7 @@ import pytest
 
 from pob_cli.bridge_client import FORBIDDEN_METHODS, BridgeError, BridgeWorker
 from pob_cli.cli import _prepare_load_source
+from pob_cli.errors import CrossGameHallucinationError
 from pob_cli.external_data import _strip_html, query_price
 from pob_cli.formatters import fmt_delta, sanitize_for_output, strip_pob_escapes, to_json_str
 from pob_cli.importers import POE_NINJA_CHAR_RE, share_code_to_xml, xml_to_share_code
@@ -116,6 +117,22 @@ def test_poe_ninja_character_url_regex() -> None:
     assert m.group("league") == "mirage"
     assert m.group("account") == "ExileAcc-1234"
     assert m.group("name") == "MyNecroChar"
+
+    # A non-English poe.ninja page carries its language first; the link is still a PoE1 one.
+    localized = POE_NINJA_CHAR_RE.match(url.replace("poe.ninja/", "poe.ninja/zh-tw/"))
+    assert localized is not None and localized.groupdict() == m.groupdict()
+
+    from pob_cli.guardrails import validate_url
+    from pob_cli.importers import SHARE_RAW_PATTERNS
+
+    def raw_url(share: str) -> str | None:
+        return next((tpl.format(*mt.groups()) for pat, tpl in SHARE_RAW_PATTERNS if (mt := pat.match(share))), None)
+
+    assert raw_url("https://poe.ninja/poe1/pob/Abc12") == "https://poe.ninja/poe1/pob/Abc12/raw"
+    assert raw_url("https://poe.ninja/zh-tw/poe1/pob/Abc12") == "https://poe.ninja/poe1/pob/Abc12/raw"
+    assert raw_url("https://poe.ninja/ko/pob/Abc12") == "https://poe.ninja/pob/Abc12/raw"
+    with pytest.raises(CrossGameHallucinationError):
+        validate_url(url.replace("poe.ninja/poe1/", "poe.ninja/zh-tw/poe2/"), expected_game="poe1", cli_subcommand="load")
 
 
 def test_fmt_delta() -> None:
