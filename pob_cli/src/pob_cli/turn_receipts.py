@@ -122,6 +122,13 @@ def _extract_command_tokens(args: Sequence[str]) -> list[str]:
     return positionals
 
 
+def _receipt_slot(raw: str) -> str | None:
+    """Canonical slot for a receipt. Folded first, so `頭盔` records as Helmet just like `头盔`."""
+    from .game_data import fold_han
+
+    return normalize_equipment_slot(fold_han(raw))
+
+
 def classify_cli_args(raw_args: Sequence[str]) -> dict[str, Any]:
     """Classify CLI argv into receipt metadata without side effects."""
     args = [str(a) for a in raw_args if a is not None]
@@ -186,13 +193,13 @@ def classify_cli_args(raw_args: Sequence[str]) -> dict[str, Any]:
     inspected_slots: list[str] = []
     if subcommand in ("item inspect", "items"):
         if eq_slot_raw and eq_slot_raw.strip():
-            norm_eq = normalize_equipment_slot(eq_slot_raw)
+            norm_eq = _receipt_slot(eq_slot_raw)
             if norm_eq:
                 inspected_slots.append(norm_eq)
         elif subcommand == "items" and _has_flag(args, "--all"):
             inspected_slots.append("*")
     elif subcommand == "trade search" and _has_flag(args, "--bench-craft") and eq_slot_raw and eq_slot_raw.strip():
-        norm_eq = normalize_equipment_slot(eq_slot_raw)
+        norm_eq = _receipt_slot(eq_slot_raw)
         if norm_eq:
             inspected_slots.append(norm_eq)
 
@@ -246,7 +253,7 @@ def record_daemon_receipt_hint(
                     frame["inspectedSlots"].append("*")
             p_slot = params.get("slot")
             if isinstance(p_slot, str) and p_slot.strip():
-                norm_eq = normalize_equipment_slot(p_slot)
+                norm_eq = _receipt_slot(p_slot)
                 if norm_eq and norm_eq not in frame["inspectedSlots"]:
                     frame["inspectedSlots"].append(norm_eq)
 
