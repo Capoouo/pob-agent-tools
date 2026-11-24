@@ -264,6 +264,8 @@ def test_slot_key_takes_the_chinese_slot_names_other_commands_take() -> None:
         ("左戒指", "ring1"),
         ("Body Armour", "body_armour"),
         ("shield", "shield"),
+        ("盾牌", "shield"),
+        ("箭袋", "quiver"),
         ("no-such-slot", "no_such_slot"),
         ("肢体躯干", "肢体躯干"),
     ):
