@@ -995,7 +995,9 @@ def test_daemon_edge_hardening_pid_bounds_http_handler_and_lua_arg_reset(tmp_pat
     try:
         port = server.server_address[1]
         conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5.0)
-        conn.request("POST", "/rpc", body=b"{}", headers={"X-PoB-Token": "secret-tok", "Content-Length": "not-an-int"})
+        # No body: the server answers before reading one, and closing a socket with unread bytes makes
+        # Windows reset the connection, which now and then beat the 400 to the client (5 in 3000 runs).
+        conn.request("POST", "/rpc", headers={"X-PoB-Token": "secret-tok", "Content-Length": "not-an-int"})
         resp = conn.getresponse()
         body = resp.read().decode("utf-8")
         conn.close()
