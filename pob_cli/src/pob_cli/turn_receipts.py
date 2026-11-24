@@ -132,9 +132,10 @@ def _receipt_slot(raw: str) -> str | None:
 
 def classify_cli_args(raw_args: Sequence[str]) -> dict[str, Any]:
     """Classify CLI argv into receipt metadata without side effects."""
-    args = [str(a) for a in raw_args if a is not None]
     # The ledger is a plain file: a proxy or mirror URL can carry a password (http://user:pass@host).
-    cmd_str = " ".join(_URL_USERINFO_RE.sub(r"\g<1>***@", a) for a in args)[:240]
+    # Masked here, before anything is derived, so no receipt field can carry one.
+    args = [_URL_USERINFO_RE.sub(r"\g<1>***@", str(a)) for a in raw_args if a is not None]
+    cmd_str = " ".join(args)[:240]
 
     if not args or any(tok in _HELP_VERSION_FLAGS for tok in args):
         return {

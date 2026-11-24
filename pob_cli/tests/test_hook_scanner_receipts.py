@@ -225,6 +225,8 @@ class TestTurnReceiptsL1:
             plain = ["wiki", "https://example.test?email=a@b.test"]
             assert classify_cli_args(plain)["cmd"] == " ".join(plain)
             assert c_proxy["cmd"].endswith("price Mageblood")
+        # ... nor through any other field, when the URL lands where a command word belongs.
+        assert "s3cret" not in json.dumps(classify_cli_args(["trade", "http://me:s3cret@host"]))
 
         c_status = classify_cli_args(["status"])
         assert c_status["shouldRecord"] is True
