@@ -994,3 +994,42 @@ def test_daemon_edge_hardening_pid_bounds_http_handler_and_lua_arg_reset(tmp_pat
     arg_reset_pos = lua_src.find("arg = {}")
     launch_pos = lua_src.find('dofile("Launch.lua")')
     assert arg_reset_pos != -1 and launch_pos != -1 and arg_reset_pos < launch_pos
+
+
+def test_call_daemon_offline_tells_a_running_daemon_to_skip_its_update_check(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`--offline` holds for a daemon started without it, which read POB_OFFLINE only at its start."""
+    import json
+    import os
+
+    import pob_cli.daemon as daemon_mod
+
+    rt = tmp_path / "rt"
+    rt.mkdir()
+    (rt / "daemon.json").write_text(
+        json.dumps({"pid": os.getpid(), "port": 51237, "token": "tok"}), encoding="utf-8"
+    )
+    sent: list[dict] = []
+
+    def _rpc(_port: int, _token: str, payload: dict, **_kw: object) -> tuple[int, dict]:
+        sent.append(payload)
+        return 200, {"ok": True, "result": {}}
+
+    monkeypatch.setattr(daemon_mod, "_http_post_rpc", _rpc)
+
+    def _call(action: str) -> None:
+        daemon_mod.call_daemon(
+            action, {"target": "main"}, auto_start=False, runtime_dir=rt, emit_cold_start_alert=False
+        )
+
+    monkeypatch.setenv("POB_OFFLINE", "1")
+    for action in ("status", "load", "summary"):
+        _call(action)
+    assert [p["params"].get("skip_periodic_check") for p in sent] == [True, True, None]
+    assert all(p["params"]["target"] == "main" for p in sent)
+
+    sent.clear()
+    monkeypatch.delenv("POB_OFFLINE")
+    _call("status")
+    assert "skip_periodic_check" not in sent[0]["params"]
