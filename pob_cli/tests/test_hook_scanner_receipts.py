@@ -212,6 +212,12 @@ class TestTurnReceiptsL1:
         assert c_diag["slot"] == "alt1"
         assert c_diag["category"] == "diagnose"
 
+        # A proxy password must not reach the ledger file, in either option spelling.
+        for proxy_args in (["--proxy", "socks5://me:s3cret@10.0.0.1:1080"], ["--proxy=http://me:s3cret@host"]):
+            c_proxy = classify_cli_args([*proxy_args, "price", "Mageblood"])
+            assert "s3cret" not in c_proxy["cmd"] and "://***@" in c_proxy["cmd"]
+            assert c_proxy["cmd"].endswith("price Mageblood")
+
         c_status = classify_cli_args(["status"])
         assert c_status["shouldRecord"] is True
         assert c_status["isCompute"] is False
