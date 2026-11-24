@@ -317,6 +317,30 @@ def test_no_zh_fallback_resolution_and_auto_rebuild(tmp_path: Path, monkeypatch:
         query_local_data("invalid_kind", "foo", runtime_dir=rt)
 
 
+def test_a_new_index_prunes_superseded_ones_but_keeps_the_newest_other(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each engine update names a new 50 MB index; the old ones used to pile up for ever."""
+    monkeypatch.delenv("POB_ROOT", raising=False)
+    monkeypatch.delenv("POB_CACHE_DIR", raising=False)
+    rt = tmp_path / "rt"
+    _create_synthetic_pob_dir(rt / "engine")
+    cache_dir = rt / "cache"
+    cache_dir.mkdir(parents=True)
+    for age, name in enumerate(("gamedata_2.60.0_new.sqlite", "gamedata_2.50.0_old.sqlite", "gamedata_2.40.0_older.sqlite")):
+        stale = cache_dir / name
+        stale.write_bytes(b"old index")
+        os.utime(stale, (1_700_000_000 - age * 86400, 1_700_000_000 - age * 86400))
+    (cache_dir / "trade_stats.json").write_text("{}", encoding="utf-8")
+
+    db_path = ensure_gamedata_index(runtime_dir=rt)
+    assert db_path.parent == cache_dir
+    assert sorted(p.name for p in cache_dir.iterdir() if p.suffix == ".sqlite") == sorted(
+        [db_path.name, "gamedata_2.60.0_new.sqlite"]
+    )
+    assert (cache_dir / "trade_stats.json").is_file()
+
+
 def test_fold_search_text_diacritics_and_punctuation() -> None:
     assert _fold_search_text("Doppelgänger Guise") == "doppelganger guise"
     assert _fold_search_text("Mjölner") == "mjolner"

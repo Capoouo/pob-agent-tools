@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .paths import (
+    _prune_old_indexes,
     _resolve_poe1_data_dirs,
     _shared_cache_dir,
     _sqlite_ro_uri,
@@ -470,6 +471,7 @@ def ensure_treedata_index(
                 if not _is_tree_db_valid():
                     raise
             _VALID_TREE_INDEX_CACHE.add(cache_key)
+            _prune_old_indexes(cache_dir, "treedata_*.sqlite", db_path)
             return db_path, tree_ver
         finally:
             try:

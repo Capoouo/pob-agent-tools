@@ -44,7 +44,7 @@ pob updates itself separately (`updater/self_update.py`, `cli_self_update.py`). 
 
 On macOS and Linux, bootstrap also installs `engine/bin/luajit` and `engine/bin/lua-utf8.so` (`updater/posix_runtime.py`), taking the first that works: the copy inside a standalone build (`_internal/runtime/bin`); `pob4agents-runtime-<version>-<platform>.tar.gz` from this pob's release, then the latest one, trusted only through that release's signed `SHA256SUMS.txt`; or a local compile of LuaJIT and lua-utf8 from source tarballs pinned by SHA-256 (`constants.py`, and `build_posix_runtime.sh`, which a test keeps equal). Each candidate must pass a self-test (`+=`, `..=`, `require("lua-utf8")`) first. pob before 0.9 asked for `pob-runtime-<platform>.tar.gz` without any check; no release publishes that name, so those versions keep compiling.
 
-Runtime state in `<POB_RUNTIME_DIR>/`: `daemon.json`, `update_state.json`, `slot_<slug>.json`, `turn_receipts.jsonl`, `hook_turn_<hash>.json`, and a shared `cache/` with `gamedata_<pobVer>_<dataVer>.sqlite`, `ninja_*.json`, `poedb_*.json`, `trade_ratelimit.json` and `trade_stats*.json`.
+Runtime state in `<POB_RUNTIME_DIR>/`: `daemon.json`, `update_state.json`, `slot_<slug>.json`, `turn_receipts.jsonl`, `hook_turn_<hash>.json`, and a shared `cache/` with `gamedata_<pobVer>_<dataVer>.sqlite`, `ninja_*.json`, `poedb_*.json`, `trade_ratelimit.json` and `trade_stats*.json`. A rebuilt `gamedata_*` or `treedata_*` index deletes the superseded ones, keeping the newest other file for a second engine that shares the cache.
 
 ## Environment variables
 
