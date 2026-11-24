@@ -24,7 +24,7 @@ _EXCLUDED_TOP_COMMANDS = frozenset({"hook", "serve", "_daemon"})
 _HELP_VERSION_FLAGS = frozenset({"--help", "-h", "--version"})
 _GLOBAL_VALUE_FLAGS = frozenset({"--target", "--runtime-dir", "--pob-root", "--cache-dir", "--proxy"})
 # The `user:password@` part of a URL, wherever it appears on the command line.
-_URL_USERINFO_RE = re.compile(r"(://)[^/@\s]+@")
+_URL_USERINFO_RE = re.compile(r"(://)[^/?#@\s]+@")
 
 _COMPUTE_SINGLE_CMDS = frozenset(
     {
