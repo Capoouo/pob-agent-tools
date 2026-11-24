@@ -422,7 +422,8 @@ def _mod_matches_filter(mod: dict[str, Any], mod_filter: str) -> bool:
             " ".join(str(x) for x in (mod.get("tags") or ())),
         ]
     ).lower()
-    return any(t in fold_han(hay) for t in terms)
+    hay = fold_han(hay)
+    return any(t in hay for t in terms)
 
 
 def _extract_mods_from_modsview(
