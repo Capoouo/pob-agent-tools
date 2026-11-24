@@ -285,6 +285,7 @@ pob tree --type Mastery --allocated --masteries
 pob tree --socket-radius 61419
 
 # 查看 PoB「计算」页中的数值和来源；可同时查多个关键词
+# 「计算」页有自己选中的技能：输出会标明是哪个技能，与主技能不同时给出警告
 pob calc "Average Hit" "Spell Suppression" "Mana Regen"
 ```
 

@@ -284,7 +284,8 @@ pob tree --search "最大生命" "法术压制" --unallocated --max-cost 4 --sho
 pob tree --type Mastery --allocated --masteries
 pob tree --socket-radius 61419
 
-# Inspect values and sources on PoB's Calcs tab; multiple terms are accepted
+# Inspect values and sources on PoB's Calcs tab; multiple terms are accepted.
+# The tab keeps its own skill selection: the output names that skill and warns when it is not the main one
 pob calc "Average Hit" "Spell Suppression" "Mana Regen"
 ```
 
