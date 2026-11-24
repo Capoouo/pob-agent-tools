@@ -265,5 +265,6 @@ def test_slot_key_takes_the_chinese_slot_names_other_commands_take() -> None:
         ("Body Armour", "body_armour"),
         ("shield", "shield"),
         ("no-such-slot", "no_such_slot"),
+        ("肢体躯干", "肢体躯干"),
     ):
         assert bench.slot_key(name) == key

@@ -170,6 +170,8 @@ def slot_key(slot: str) -> str:
         return _SLOT_ALIASES[compact]
     # Not a bench key: try the slot names the other commands take (手套, 頭盔, "Body Armour").
     eq = (normalize_equipment_slot(game_data.fold_han(slot)) or "").lower().replace(" ", "_")
+    if eq in ("head", "body"):  # graft slots, not the helmet and body armour that bench calls so
+        return raw
     return _SLOT_ALIASES.get(eq) or _SLOT_ALIASES.get(eq.replace("_", "")) or raw
 
 
