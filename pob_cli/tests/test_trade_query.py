@@ -286,6 +286,15 @@ def test_tiny_entry_does_not_hijack_long_unrelated_query() -> None:
     assert tq.resolve_stat("Unicorn Rainbow Life Explosion", SAMPLE_ENTRIES) is None
 
 
+@pytest.mark.parametrize(
+    ("traditional", "simplified"),
+    [("能量護盾", "能量护盾"), ("暴擊率", "暴击率"), ("火焰傷害", "火焰伤害"), ("閃避", "闪避"), ("護甲", "护甲")],
+)
+def test_translate_stat_query_folds_traditional_names(traditional: str, simplified: str) -> None:
+    """Traditional names reach the Simplified alias table instead of a fuzzy guess at another stat."""
+    assert tq.translate_stat_query(traditional) == tq.ZH_STAT_ALIASES[simplified]
+
+
 def test_translate_stat_query_ignores_partial_matches(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Unaliased Chinese queries must never be rewritten using game_data `match_type == 'partial'` hits."""
     from pob_cli import game_data

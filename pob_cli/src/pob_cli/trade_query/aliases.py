@@ -556,9 +556,14 @@ def translate_stat_query(text: str) -> str:
     """
     import pob_cli.trade_query as _tq
 
-    raw = (text or "").strip()
-    if not raw or not _CJK_RE.search(raw):
-        return raw
+    original = (text or "").strip()
+    if not original or not _CJK_RE.search(original):
+        return original
+    from ..game_data import fold_han
+
+    # The alias table is Simplified, while pob-zh shows Traditional names (能量護盾). Unfolded, such
+    # a query skipped the table and the fuzzy fallback picked another stat ("Has no Energy Shield").
+    raw = fold_han(original)
 
     # Direct exact lookup
     direct = ZH_STAT_ALIASES.get(raw)
@@ -608,4 +613,4 @@ def translate_stat_query(text: str) -> str:
     except Exception:
         pass
 
-    return raw
+    return original
