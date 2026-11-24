@@ -134,7 +134,7 @@ Runtime state in `<POB_RUNTIME_DIR>/`: `daemon.json`, `update_state.json`, `slot
 - PoE2 terms (Table D): `Uncut *`, `Distilled *` / 涂灌, `Waystone` / 引路石, `Soul Core` / `{rune}`, `--slot focus` / `quarterstaff` / `charm1`, `Spirit` / 精魂.
 - CLI traps: `pob rune`, `pob instill`, `pob item charm`, `pob item instill`.
 
-It never blocks PoE1-legal terms: `Elemental Focus`, `Combat Focus`, `while Focused` / 专注, `Titanium Spirit Shield` / 灵盾, `Summon Raging Spirit`, `Spirit Offering`, `Distilled Perfection`, `Ancient Waystones`, and the level 45 staff base `Quarterstaff` outside `SLOT` / `CATEGORY`.
+It never blocks PoE1-legal terms: `Elemental Focus`, `Combat Focus`, `while Focused` / 专注, `Titanium Spirit Shield` / 灵盾, `Summon Raging Spirit`, `Spirit Offering`, `Distilled Perfection`, `Ancient Waystones`, and, outside `SLOT` / `CATEGORY`, the level 45 staff base `Quarterstaff` and the `Buckler` shield bases (`Crusader Buckler`).
 
 ## Adding a command
 
